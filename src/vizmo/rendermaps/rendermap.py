@@ -11,8 +11,7 @@ class RenderMap:
     def __init__(self):
         self.required_datafields = MINIMAL_FIELDS
 
-    @staticmethod
-    def render(pdata: dict, meshoid: Meshoid, mapargs: dict):
+    def render(self, pdata: dict, meshoid: Meshoid, mapargs: dict):
         """
         Method that performs the rendering task provided the particle data, an optional meshoid instantiated with that
         particle data, and a set of mapargs specifying the map size, center, resolution, and orientation.
