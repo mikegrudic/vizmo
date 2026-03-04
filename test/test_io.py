@@ -5,19 +5,19 @@ from vizmo.io import (
     get_snapshot_timeline,
     get_snapdata_at_time,
 )
-from os import mkdir, system
+from os import mkdir
+from os.path import isdir
+from urllib.request import urlretrieve
 
 
 def download_example_data():
     path = "https://users.flatironinstitute.org/~mgrudic/starforge_data/STARFORGE_RT/STARFORGE_v1.2/M2e2_R1/M2e2_R1_Z1_S0_A2_B0.1_I1_Res58_n2_sol0.5_42/output/"
 
-    try:
+    if not isdir("./output"):
         mkdir("output")
-    except:
-        pass
 
     for snapnum in 640, 650, 980:
-        system(f"wget --directory-prefix='output/' {path}snapshot_{snapnum}.hdf5")
+        urlretrieve(path + f"/snapshot_{snapnum}.hdf5", f"output/snapshot_{snapnum}.hdf5")
 
 
 def test_io():
