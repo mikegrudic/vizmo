@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from meshoid import Meshoid
 import numpy as np
+from . import MINIMAL_FIELDS
 
 
 # @dataclass
