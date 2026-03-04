@@ -16,7 +16,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-  "meshoid", "sympy", "numpy", "sphinx_rtd_theme", "astropy", "matplotlib", "scipy", "numba"
+  "meshoid", "sympy", "numpy", "sphinx_rtd_theme", "astropy", "matplotlib", "scipy", "numba","pip-system-certs", "natsort"
 ]
 
 license = "MIT"
