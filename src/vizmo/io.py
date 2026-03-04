@@ -10,7 +10,7 @@ import numpy as np
 from astropy import units as u
 from meshoid import Meshoid
 import astropy
-
+from functools import cache
 
 DEFAULT_UNITS = {
     "Length": u.pc,
@@ -36,6 +36,7 @@ def get_snapshot_for_maps(snapshot_path: str, maps=DEFAULT_MAPS) -> dict:
     return snapdata
 
 
+@cache
 def get_snapshot_data(snapshot_path: str, required_data=MINIMAL_FIELDS, units=True) -> dict:
     """Given a tuple of required datafields, open the snapshot at snapshot_path and put those data into a dict"""
     snapdata = {}
@@ -79,7 +80,7 @@ def assign_units_to_snapdata(snapdata: dict, unitdict: dict, default_units=DEFAU
 
     unitdict = unitdict.copy()
     for k, unit in unitdict.items():
-        unitdict[k] = unit.to(DEFAULT_UNITS[k])
+        unitdict[k] = unit.to(default_units[k])
 
     for field, data in snapdata.items():
         if field == "Header":
@@ -128,7 +129,8 @@ def get_snapshot_units(F: h5py.File, default_starforge_units=True):
     }
 
 
-def get_snapshot_timeline(output_dir, verbose=False, cache_timeline=True, unit=u.Myr) -> True:
+@cache
+def get_snapshot_timeline(output_dir, verbose=False, cache_timeline=True, unit=u.Myr) -> dict:
     """
     Given a simulation directory, does a pass through the present HDF5 snapshots
     and compiles a list of snapshot paths and their associated
