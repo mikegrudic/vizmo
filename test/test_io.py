@@ -5,24 +5,12 @@ from vizmo.io import (
     get_snapshot_timeline,
     get_snapdata_at_time,
 )
-from os import mkdir
-from os.path import isdir
-from urllib.request import urlretrieve
-
-
-def download_example_data():
-    path = "https://users.flatironinstitute.org/~mgrudic/starforge_data/STARFORGE_RT/STARFORGE_v1.2/M2e2_R1/M2e2_R1_Z1_S0_A2_B0.1_I1_Res58_n2_sol0.5_42/output/"
-
-    if not isdir("./output"):
-        mkdir("output")
-
-    for snapnum in 640, 650, 980:
-        urlretrieve(path + f"/snapshot_{snapnum}.hdf5", f"output/snapshot_{snapnum}.hdf5")
+from vizmo.test import download_test_data
 
 
 def test_io():
     """Simple routine that calls the various IO routines just for the sake of coverage"""
-    download_example_data()
+    download_test_data()
     rundir = "output"
     snappath = "output/snapshot_640.hdf5"
     data = get_snapshot_data(snappath)
