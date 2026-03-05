@@ -72,7 +72,7 @@ def get_snapdata_at_time(snapshot_directory: str, time, interpolation_order=1) -
         dt = t_values - time.value
         # dt = snaptimes - time
         t1, t2 = sorted(t_values[np.argsort(np.abs(dt))][:2]) * unit_time
-        return get_snapshot_data(timeline[t1]), get_snapshot_data(timeline[t2])
+        return {}  # interpolated_snapdata(time, t1, t2, timeline)
 
 
 def assign_units_to_snapdata(snapdata: dict, unitdict: dict, default_units=DEFAULT_UNITS):
