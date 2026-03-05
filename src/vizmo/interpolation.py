@@ -49,16 +49,6 @@ class Interpolator:
         else:
             func = getattr(self, "interpolate_" + self.method)  # e.g. self.interpolate_linear()
 
-        # match self.method:
-        #     case None:
-        #         return f1
-        #     case "linear":
-        #         func = self.interpolate_linear
-        #     case "logarithmic":
-        #         func = self.interpolate_log
-        #     case "min":
-        #         func = self.interpolate_min
-
         return func(t, t1, t2, f1, f2)
 
     @staticmethod
@@ -211,53 +201,53 @@ def field_interpolator_method(field):
     #     )  # interpolate logarithmically
     #     fields_to_keep_lowest = ()  # keep the lowest value between snapshots, can be used to remove spikes that exist for only one snapshot that are hard to interpolate
 
-    interpolated_data = snapdata_buffer[t1].copy()
-    idx1, idx2 = {}, {}
-    for ptype in "PartType0", "PartType5":
-        if ptype + "/ParticleIDs" in snapdata_buffer[t1].keys():
-            id1 = np.array(snapdata_buffer[t1][ptype + "/ParticleIDs"])
-        else:
-            id1 = np.array([])
-        if ptype + "/ParticleIDs" in snapdata_buffer[t2].keys():
-            id2 = np.array(snapdata_buffer[t2][ptype + "/ParticleIDs"])
-        else:
-            id2 = np.array([])
-        common_ids = np.intersect1d(id1, id2)
-        idx1[ptype] = np.in1d(np.sort(id1), common_ids)
-        idx2[ptype] = np.in1d(np.sort(id2), common_ids)
+    # interpolated_data = snapdata_buffer[t1].copy()
+    # idx1, idx2 = {}, {}
+    # for ptype in "PartType0", "PartType5":
+    #     if ptype + "/ParticleIDs" in snapdata_buffer[t1].keys():
+    #         id1 = np.array(snapdata_buffer[t1][ptype + "/ParticleIDs"])
+    #     else:
+    #         id1 = np.array([])
+    #     if ptype + "/ParticleIDs" in snapdata_buffer[t2].keys():
+    #         id2 = np.array(snapdata_buffer[t2][ptype + "/ParticleIDs"])
+    #     else:
+    #         id2 = np.array([])
+    #     common_ids = np.intersect1d(id1, id2)
+    #     idx1[ptype] = np.in1d(np.sort(id1), common_ids)
+    #     idx2[ptype] = np.in1d(np.sort(id2), common_ids)
 
-    for field in snapdata_buffer[t1].keys():
-        if not (field in fields_to_skip):
-            ptype = field.split("/")[0]
-            f1, f2 = snapdata_buffer[t1][field][idx1[ptype]], snapdata_buffer[t2][field][idx2[ptype]]
-            wt1 = (
-                (t2 - t) / (t2 - t1) * np.ones_like(f1)
-            )  # relative weights, can be set individually for each cell, for now we just use the same time linear weight for all cells
-            wt2 = 1.0 - wt1
-            if field in fields_to_leave_as_is:
-                interpolated_data[field] = f1.copy()
-            elif field in fields_to_keep_lowest:
-                interpolated_data[field] = f1.copy()
-                ind2 = np.abs(f1) > np.abs(f2)
-                interpolated_data[field][ind2] = f2[ind2]
-            else:
-                if field in fields_to_interp_log:
-                    positive = (f1 > 0) & (f2 > 0)
+    # for field in snapdata_buffer[t1].keys():
+    #     if not (field in fields_to_skip):
+    #         ptype = field.split("/")[0]
+    #         f1, f2 = snapdata_buffer[t1][field][idx1[ptype]], snapdata_buffer[t2][field][idx2[ptype]]
+    #         wt1 = (
+    #             (t2 - t) / (t2 - t1) * np.ones_like(f1)
+    #         )  # relative weights, can be set individually for each cell, for now we just use the same time linear weight for all cells
+    #         wt2 = 1.0 - wt1
+    #         if field in fields_to_leave_as_is:
+    #             interpolated_data[field] = f1.copy()
+    #         elif field in fields_to_keep_lowest:
+    #             interpolated_data[field] = f1.copy()
+    #             ind2 = np.abs(f1) > np.abs(f2)
+    #             interpolated_data[field][ind2] = f2[ind2]
+    #         else:
+    #             if field in fields_to_interp_log:
+    #                 positive = (f1 > 0) & (f2 > 0)
 
-                    # we interpolate linearily for cells where the value in either snapashots is non-positive, log for the rest
-                    if np.any(~positive):
-                        interpolated_data[field] = f1 * wt1 + f2 * wt2
-                        interpolated_data[field][positive] = np.exp(
-                            np.log(f1[positive]) * wt1[positive] + np.log(f2[positive]) * wt2[positive]
-                        )
-                    else:
-                        interpolated_data[field] = np.exp(np.log(f1) * wt1 + np.log(f2) * wt2)
-                else:  # interpolate everything else linearily
-                    if "Coordinates" in field:  # special behaviour to handle periodic BCs
-                        dx = f2 - f1
-                        dx = NearestImage(dx, snapdata_buffer[t1]["Header"]["BoxSize"])
-                        interpolated_data[field] = (f1 + wt2 * dx) % (snapdata_buffer[t1]["Header"]["BoxSize"])
-                    else:
-                        interpolated_data[field] = f1 * wt1 + f2 * wt2
+    #                 # we interpolate linearily for cells where the value in either snapashots is non-positive, log for the rest
+    #                 if np.any(~positive):
+    #                     interpolated_data[field] = f1 * wt1 + f2 * wt2
+    #                     interpolated_data[field][positive] = np.exp(
+    #                         np.log(f1[positive]) * wt1[positive] + np.log(f2[positive]) * wt2[positive]
+    #                     )
+    #                 else:
+    #                     interpolated_data[field] = np.exp(np.log(f1) * wt1 + np.log(f2) * wt2)
+    #             else:  # interpolate everything else linearily
+    #                 if "Coordinates" in field:  # special behaviour to handle periodic BCs
+    #                     dx = f2 - f1
+    #                     dx = NearestImage(dx, snapdata_buffer[t1]["Header"]["BoxSize"])
+    #                     interpolated_data[field] = (f1 + wt2 * dx) % (snapdata_buffer[t1]["Header"]["BoxSize"])
+    #                 else:
+    #                     interpolated_data[field] = f1 * wt1 + f2 * wt2
 
-    return interpolated_data
+    # return interpolated_data
