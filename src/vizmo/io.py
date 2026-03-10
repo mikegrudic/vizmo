@@ -11,6 +11,7 @@ from astropy import units as u
 from meshoid import Meshoid
 import astropy
 from functools import cache
+from warnings import warn
 
 DEFAULT_UNITS = {
     "Length": u.pc,
@@ -59,6 +60,7 @@ def get_snapshot_data(snapshot_path: str, required_data=MINIMAL_FIELDS, units=Tr
 
 def get_snapdata_at_time(snapshot_directory: str, time, interpolation_order=1) -> dict:
     """Gets snapshot data at a given time, performing interpolation if required."""
+    raise NotImplementedError("interpolation not yet implemented")
     timeline = get_snapshot_timeline(snapshot_directory)
     unit_time = list(timeline)[0].unit
     if not isinstance(time, astropy.units.Quantity):
@@ -80,7 +82,10 @@ def assign_units_to_snapdata(snapdata: dict, unitdict: dict, default_units=DEFAU
 
     unitdict = unitdict.copy()
     for k, unit in unitdict.items():
-        unitdict[k] = unit.to(default_units[k])
+        if isinstance(default_units[k], u.Quantity):
+            unitdict[k] = unit.to(default_units[k])
+        # else:
+        # unitdict[k]
 
     for field, data in snapdata.items():
         if field == "Header":
@@ -92,7 +97,7 @@ def assign_units_to_snapdata(snapdata: dict, unitdict: dict, default_units=DEFAU
         if "Coordinates" in field or "SmoothingLength" in field:
             unit = unitdict["Length"]
         elif "Temperature" in field:
-            unit = unitdict["Temperature"]
+            unit = u.K
         elif "Magnetic" in field:
             unit = unitdict["MagneticField"]
         elif "Density" in field:
@@ -102,7 +107,7 @@ def assign_units_to_snapdata(snapdata: dict, unitdict: dict, default_units=DEFAU
         snapdata[field] = data * unit
 
 
-def get_snapshot_units(F: h5py.File, default_starforge_units=True):
+def get_snapshot_units(F: h5py.File, default_starforge_units=False):
     """Given an h5py file instance for a snapshot, returns a dictionary
     whose entries are astropy quantities giving the unit length, speed, mass, and magnetic field for the snapshot.
 
@@ -113,13 +118,20 @@ def get_snapshot_units(F: h5py.File, default_starforge_units=True):
     Returns:
         Dictionary with keys "Length", "Speed", "Mass", and "MagneticField" giving the unit quantities for the simulation.
     """
-    unit_length = F["Header"].attrs["UnitLength_In_CGS"] * u.cm
-    unit_speed = F["Header"].attrs["UnitVelocity_In_CGS"] * u.cm / u.s
-    unit_mass = F["Header"].attrs["UnitMass_In_CGS"] * u.g
+    if "UnitLength_In_CGS" in F["Header"].attrs.keys():
+        unit_length = F["Header"].attrs["UnitLength_In_CGS"] * u.cm
+        unit_speed = F["Header"].attrs["UnitVelocity_In_CGS"] * u.cm / u.s
+        unit_mass = F["Header"].attrs["UnitMass_In_CGS"] * u.g
+    else:
+        warn("vizmo warning: units not found in snapshot.")
+        unit_length = unit_speed = unit_mass = 1
     unit_time = unit_length / unit_speed
     if default_starforge_units:
         unit_magnetic_field = 1e4 * u.gauss  # hardcoded right now, can we actually get this from the header???
-        Warning("Warning: unit magnetic field not specified, assuming unit magnetic field is in T")
+        warn("Warning: unit magnetic field not specified, assuming unit magnetic field is in T")
+    else:
+        unit_magnetic_field = u.gauss  # hardcoded right now, can we actually get this from the header???
+        warn("Warning: unit magnetic field not specified, assuming unit magnetic field is in gauss")
     return {
         "Length": unit_length,
         "Speed": unit_speed,
