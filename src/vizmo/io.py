@@ -52,6 +52,10 @@ def get_snapshot_data(snapshot_path: str, required_data=MINIMAL_FIELDS, units=Tr
                 if s2 in required_data or i == 5:  # always get star data because it doesn't take much space
                     snapdata[s2] = F[s2][:]
 
+            #     if "ID" in k: # make a unique ID that we use for connecting particles between snapshots
+            #         unique_id
+            # snapdata[f"PartType{i}/UniqueID"] =
+
     if units:
         assign_units_to_snapdata(snapdata, unitdict)
     return snapdata
@@ -126,6 +130,7 @@ def get_snapshot_units(F: h5py.File, default_starforge_units=True):
         "Mass": unit_mass,
         "MagneticField": unit_magnetic_field,
         "Time": unit_time,
+        "Temperature": u.K,
     }
 
 
