@@ -4,7 +4,7 @@ import numpy as np
 def coordinate_grid(res: int, size: float, center: np.ndarray) -> tuple:
     """
     Instantiates a coordinate grid encoded as 2 NxN arrays representing the X and Y axis respectively, whose points
-    are the centers of the grid points, which correspond to the abcissa of a rendered map.
+    are the centers of the grid points, which correspond to the abcissa of the pixels of a rendered map.
 
     Initializes a grid from map arguments:
 
