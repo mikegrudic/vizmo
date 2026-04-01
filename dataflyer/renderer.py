@@ -288,10 +288,11 @@ class SpatialGrid:
         has_mass = lv["mass"] > 0
 
         safe_depths = np.maximum(depths, 0.01)
-        cell_pix = (hd * 2) / safe_depths * pix_per_rad
+        # Opening criterion: does the summary h subtend > lod_pixels?
+        h_pix = lv["hsml"] / safe_depths * pix_per_rad
 
-        summary_mask = visible & has_mass & (cell_pix <= lod_pixels)
-        refine_mask = visible & has_mass & (cell_pix > lod_pixels)
+        summary_mask = visible & has_mass & (h_pix <= lod_pixels)
+        refine_mask = visible & has_mass & (h_pix > lod_pixels)
 
         s_idx = np.where(summary_mask)[0]
         if len(s_idx) > 0:
@@ -336,10 +337,10 @@ class SpatialGrid:
             vis = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
 
             safe_depths = np.maximum(depths, 0.01)
-            cell_pix = (hd * 2) / safe_depths * pix_per_rad
+            h_pix = lv["hsml"][child_flat] / safe_depths * pix_per_rad
 
-            small = vis & (cell_pix <= lod_pixels)
-            large = vis & (cell_pix > lod_pixels)
+            small = vis & (h_pix <= lod_pixels)
+            large = vis & (h_pix > lod_pixels)
 
             # Summary splats for small cells
             s_idx = child_flat[small]
