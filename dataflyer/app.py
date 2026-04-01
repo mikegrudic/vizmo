@@ -414,6 +414,7 @@ class DataFlyerApp:
             self.ctx.screen.use()
             t0 = time.perf_counter()
             self.renderer.render(self.camera, fb_width, fb_height)
+            self.ctx.finish()  # wait for GPU to complete for accurate timing
             t_render = time.perf_counter() - t0
 
             # Deferred auto-range: read back actual pixel values after first render
