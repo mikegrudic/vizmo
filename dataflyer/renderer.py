@@ -95,8 +95,9 @@ class SpatialGrid:
             cell_qty[ne_idx] = mq_ne / safe
             cell_mx2[ne_idx] = mp2_ne
             cell_mh2[ne_idx] = mh2_ne
-            h_ne = np.sqrt(np.maximum(var_ne + mh2_ne / safe, 0))
-            cell_hsml[ne_idx] = np.maximum(h_ne, np.linalg.norm(cs))
+            # h set to match mass-weighted spatial variance of cell contents
+            # No artificial floor -- let the variance speak for itself
+            cell_hsml[ne_idx] = np.sqrt(np.maximum(var_ne + mh2_ne / safe, 1e-30))
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
@@ -145,8 +146,7 @@ class SpatialGrid:
         cell_com = cell_mp / safe[:, None]
         cell_qty = cell_mq / safe
         var = (cell_mx2 / safe[:, None] - cell_com ** 2).sum(axis=1)
-        h = np.sqrt(np.maximum(var + cell_mh2 / safe, 0))
-        cell_hsml = np.maximum(h, np.linalg.norm(cs))
+        cell_hsml = np.sqrt(np.maximum(var + cell_mh2 / safe, 1e-30))
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
@@ -162,22 +162,35 @@ class SpatialGrid:
             "half_diag": float(np.linalg.norm(cs) * 0.5),
         }
 
-    def query_frustum(self, camera, positions, hsml, masses, quantity, max_particles):
-        """Frustum cull + subsample. Returns (pos, hsml, mass, qty) arrays.
+    def query_frustum_lod(self, camera, positions, hsml, masses, quantity,
+                          max_particles, lod_pixels=4):
+        """Top-down multi-level LOD query. Returns (pos, hsml, mass, qty) arrays.
 
-        When subsampling, masses are rescaled by N_visible/N_sampled and
-        smoothing lengths by (N_visible/N_sampled)^(1/3) to approximate
-        the correct mass distribution.
+        Traverses coarsest-to-finest. Cells subtending <= lod_pixels emit a
+        summary splat (at CoM with variance-based h). Cells subtending more
+        are refined to children. At the finest level, real particles are emitted.
+
+        When the particle budget is exceeded, real particles are subsampled
+        with mass and h rescaled to conserve the mass distribution.
         """
-        finest = self.levels[0]
         cam_pos = camera.position
         cam_fwd = camera.forward
         cam_right = camera.right
         cam_up = camera.up
-        half_tan = np.tan(np.radians(min(camera.fov, 120)) / 2) * 2.0
+        fov_rad = np.radians(camera.fov)
+        pix_per_rad = 1024.0 / (2.0 * np.tan(fov_rad / 2))
+        half_tan = np.tan(fov_rad / 2) * 2.0  # wide frustum
 
-        hd = finest["half_diag"]
-        centers = finest["centers"]
+        finest = self.levels[0]
+        summary_parts = []
+        all_real = np.array([], dtype=np.intp)
+
+        # Start from coarsest level
+        coarsest = self.levels[-1]
+        lv = coarsest
+        hd = lv["half_diag"]
+        centers = lv["centers"]
+
         depths = centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
         rights = centers @ cam_right - np.dot(cam_pos, cam_right)
         ups = centers @ cam_up - np.dot(cam_pos, cam_up)
@@ -186,50 +199,133 @@ class SpatialGrid:
         lim_h = (depths + hd) * half_tan * camera.aspect + hd
         lim_v = (depths + hd) * half_tan + hd
         visible = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
-        vis_cells = np.where(visible & (finest["mass"] > 0))[0]
+        has_mass = lv["mass"] > 0
 
-        z3 = np.zeros((0, 3), dtype=np.float32)
-        z1 = np.zeros(0, dtype=np.float32)
+        safe_depths = np.maximum(depths, 0.01)
+        cell_pix = (hd * 2) / safe_depths * pix_per_rad
 
-        if len(vis_cells) == 0:
+        summary_mask = visible & has_mass & (cell_pix <= lod_pixels)
+        refine_mask = visible & has_mass & (cell_pix > lod_pixels)
+
+        s_idx = np.where(summary_mask)[0]
+        if len(s_idx) > 0:
+            summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx],
+                                  lv["mass"][s_idx], lv["qty"][s_idx]))
+
+        refine_cells = np.where(refine_mask)[0]
+
+        # Traverse finer levels
+        for li in range(len(self.levels) - 2, -1, -1):
+            if len(refine_cells) == 0:
+                break
+
+            lv = self.levels[li]
+            parent_nc = self.levels[li + 1]["nc"]
+            nc = lv["nc"]
+            hd = lv["half_diag"]
+
+            # Map parent cells to 8 children
+            pix = refine_cells // (parent_nc * parent_nc)
+            piy = (refine_cells // parent_nc) % parent_nc
+            piz = refine_cells % parent_nc
+            offsets = np.array([[dx, dy, dz] for dx in range(2) for dy in range(2) for dz in range(2)])
+            child_ix = (pix[:, None] * 2 + offsets[None, :, 0]).ravel()
+            child_iy = (piy[:, None] * 2 + offsets[None, :, 1]).ravel()
+            child_iz = (piz[:, None] * 2 + offsets[None, :, 2]).ravel()
+            child_flat = child_ix * nc * nc + child_iy * nc + child_iz
+
+            valid = lv["mass"][child_flat] > 0
+            child_flat = child_flat[valid]
+            if len(child_flat) == 0:
+                break
+
+            centers = lv["centers"][child_flat]
+            depths = centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
+            rights = centers @ cam_right - np.dot(cam_pos, cam_right)
+            ups = centers @ cam_up - np.dot(cam_pos, cam_up)
+
+            in_front = depths > -hd
+            lim_h = (depths + hd) * half_tan * camera.aspect + hd
+            lim_v = (depths + hd) * half_tan + hd
+            vis = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
+
+            safe_depths = np.maximum(depths, 0.01)
+            cell_pix = (hd * 2) / safe_depths * pix_per_rad
+
+            small = vis & (cell_pix <= lod_pixels)
+            large = vis & (cell_pix > lod_pixels)
+
+            # Summary splats for small cells
+            s_idx = child_flat[small]
+            if len(s_idx) > 0:
+                summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx],
+                                      lv["mass"][s_idx], lv["qty"][s_idx]))
+
+            if li == 0:
+                # Finest level: real particles for large cells
+                vis_cells = child_flat[large]
+                if len(vis_cells) > 0:
+                    starts = finest["cell_start"][vis_cells]
+                    ends = finest["cell_start"][vis_cells + 1]
+                    counts = (ends - starts).astype(np.intp)
+                    total = int(counts.sum())
+                    if total > 0:
+                        off = np.repeat(starts, counts)
+                        within = np.arange(total, dtype=np.int64) - np.repeat(
+                            np.concatenate([[0], np.cumsum(counts[:-1])]), counts
+                        )
+                        all_real = finest["sort_order"][(off + within).astype(np.intp)]
+            else:
+                refine_cells = child_flat[large]
+
+        # Budget: subsample real particles if needed, with mass/h rescaling
+        n_summaries = sum(p[0].shape[0] for p in summary_parts) if summary_parts else 0
+        n_visible_real = len(all_real)
+        budget = max(max_particles - n_summaries, max_particles // 2)
+
+        mass_scale = 1.0
+        h_scale = 1.0
+        if n_visible_real > budget:
+            step = max(1, n_visible_real // budget)
+            all_real = all_real[::step]
+            ratio = n_visible_real / len(all_real)
+            mass_scale = ratio
+            h_scale = ratio ** (1.0 / 3.0)
+
+        # Assemble output
+        parts_pos = []
+        parts_hsml = []
+        parts_mass = []
+        parts_qty = []
+
+        if len(all_real) > 0:
+            parts_pos.append(positions[all_real])
+            rh = hsml[all_real]
+            rm = masses[all_real]
+            if h_scale != 1.0:
+                rh = rh * h_scale
+                rm = rm * mass_scale
+            parts_hsml.append(rh)
+            parts_mass.append(rm)
+            parts_qty.append(quantity[all_real])
+
+        for sp_com, sp_h, sp_m, sp_q in summary_parts:
+            parts_pos.append(sp_com)
+            parts_hsml.append(sp_h)
+            parts_mass.append(sp_m)
+            parts_qty.append(sp_q)
+
+        if not parts_pos:
+            z3 = np.zeros((0, 3), dtype=np.float32)
+            z1 = np.zeros(0, dtype=np.float32)
             return z3, z1, z1, z1
 
-        # Gather particle indices from visible cells
-        starts = finest["cell_start"][vis_cells]
-        ends = finest["cell_start"][vis_cells + 1]
-        counts = (ends - starts).astype(np.intp)
-        total = int(counts.sum())
-
-        if total == 0:
-            return z3, z1, z1, z1
-
-        offsets = np.repeat(starts, counts)
-        within = np.arange(total, dtype=np.int64) - np.repeat(
-            np.concatenate([[0], np.cumsum(counts[:-1])]), counts
+        return (
+            np.concatenate(parts_pos).astype(np.float32),
+            np.concatenate(parts_hsml).astype(np.float32),
+            np.concatenate(parts_mass).astype(np.float32),
+            np.concatenate(parts_qty).astype(np.float32),
         )
-        all_idx = finest["sort_order"][(offsets + within).astype(np.intp)]
-
-        n_visible = len(all_idx)
-
-        # Subsample if over budget
-        if n_visible > max_particles:
-            step = max(1, n_visible // max_particles)
-            all_idx = all_idx[::step]
-
-        n_sampled = len(all_idx)
-
-        out_pos = positions[all_idx]
-        out_hsml = hsml[all_idx].copy()
-        out_mass = masses[all_idx].copy()
-        out_qty = quantity[all_idx]
-
-        # Rescale to conserve mass distribution when subsampled
-        if n_sampled < n_visible:
-            ratio = n_visible / n_sampled
-            out_mass *= ratio
-            out_hsml *= ratio ** (1.0 / 3.0)
-
-        return out_pos, out_hsml, out_mass, out_qty
 
 
 class SplatRenderer:
@@ -339,9 +435,9 @@ class SplatRenderer:
             return
 
         if self._grid is not None:
-            pos, hsml, mass, qty = self._grid.query_frustum(
+            pos, hsml, mass, qty = self._grid.query_frustum_lod(
                 camera, self._all_pos, self._all_hsml, self._all_mass, self._all_qty,
-                self.max_render_particles,
+                self.max_render_particles, lod_pixels=self.lod_pixels,
             )
             self._upload_arrays(pos, hsml, mass, qty)
         else:

@@ -238,6 +238,24 @@ class DataFlyerApp:
             self.renderer.update_visible(self.camera)
             return
 
+        # </>: adjust max particle budget (subsampling level)
+        if key == glfw.KEY_PERIOD:
+            self.renderer.max_render_particles = min(
+                self.renderer.n_total,
+                int(self.renderer.max_render_particles * 2),
+            )
+            print(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
+            self.renderer.update_visible(self.camera)
+            return
+        if key == glfw.KEY_COMMA:
+            self.renderer.max_render_particles = max(
+                100_000,
+                self.renderer.max_render_particles // 2,
+            )
+            print(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
+            self.renderer.update_visible(self.camera)
+            return
+
         # L: toggle log/linear scale
         if key == glfw.KEY_L:
             self.renderer.log_scale = 1 - self.renderer.log_scale
@@ -298,6 +316,7 @@ class DataFlyerApp:
         print("  C        : Next colormap  |  Shift+C   : Previous")
         print("  +/-      : Contract/expand dynamic range")
         print("  [/]      : More/less LOD detail")
+        print("  </>      : Fewer/more max particles")
         print("  R        : Auto-range dynamic range")
         print("  L        : Toggle log/linear scale")
         print("  P        : Screenshot")
