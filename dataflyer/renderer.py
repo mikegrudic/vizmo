@@ -173,103 +173,132 @@ class SpatialGrid:
         pix_per_rad = 1024.0 / (2.0 * np.tan(fov_rad / 2))
         half_tan = np.tan(fov_rad / 2) * 2.0  # wide frustum
 
-        # Find the coarsest level where cells subtend >= lod_pixels at any depth,
-        # then for each visible cell, use the coarsest level that still subtends >= lod_pixels.
-        # Strategy: iterate levels coarse->fine. Mark cells as "resolved" at each level.
+        # Top-down octree traversal:
+        # Start at coarsest level. For each visible cell:
+        #   - If cell subtends > lod_pixels: refine to children (next finer level)
+        #   - If cell subtends <= lod_pixels: emit as summary splat
+        # At the finest level, emit real particles instead of refining further.
 
-        # Use finest level for frustum test
         finest = self.levels[0]
-        hd = finest["half_diag"]
-        centers = finest["centers"]
+        summary_parts = []
+        all_real = np.array([], dtype=np.intp)
+
+        # Start from coarsest level, traverse down
+        # "refine_cells" tracks which cells at the current level need refinement
+        coarsest = self.levels[-1]
+        lv = coarsest
+        hd = lv["half_diag"]
+        centers = lv["centers"]
+
         depths = centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
         rights = centers @ cam_right - np.dot(cam_pos, cam_right)
         ups = centers @ cam_up - np.dot(cam_pos, cam_up)
 
         in_front = depths > -hd
-        limit_h = (depths + hd) * half_tan * camera.aspect + hd
-        limit_v = (depths + hd) * half_tan + hd
-        visible = in_front & (np.abs(rights) < limit_h) & (np.abs(ups) < limit_v)
+        lim_h = (depths + hd) * half_tan * camera.aspect + hd
+        lim_v = (depths + hd) * half_tan + hd
+        visible = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
+        has_mass = lv["mass"] > 0
 
         safe_depths = np.maximum(depths, 0.01)
-        fine_pixels = (hd * 2) / safe_depths * pix_per_rad
+        cell_pix = (hd * 2) / safe_depths * pix_per_rad
 
-        # Cells that are close enough to render at full particle resolution
-        near_mask = visible & (fine_pixels > lod_pixels) & (finest["mass"] > 0)
-        near_cells = np.where(near_mask)[0]
+        # Cells to summarize vs refine
+        summary_mask = visible & has_mass & (cell_pix <= lod_pixels)
+        refine_mask = visible & has_mass & (cell_pix > lod_pixels)
 
-        # Gather real particles from near cells
-        near_starts = finest["cell_start"][near_cells]
-        near_ends = finest["cell_start"][near_cells + 1]
-        near_counts = (near_ends - near_starts).astype(np.intp)
-        real_count = int(near_counts.sum())
+        s_idx = np.where(summary_mask)[0]
+        if len(s_idx) > 0:
+            summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx],
+                                  lv["mass"][s_idx], lv["qty"][s_idx]))
 
-        if real_count > 0:
-            offsets = np.repeat(near_starts, near_counts)
-            within = np.arange(real_count, dtype=np.int64) - np.repeat(
-                np.concatenate([[0], np.cumsum(near_counts[:-1])]), near_counts
-            )
-            all_real = finest["sort_order"][(offsets + within).astype(np.intp)]
-        else:
-            all_real = np.array([], dtype=np.intp)
+        refine_cells = np.where(refine_mask)[0]
 
-        # For far cells, find the best coarse level
-        far_mask = visible & (~near_mask) & (finest["mass"] > 0)
-        summary_parts = []
+        # Traverse finer levels
+        for li in range(len(self.levels) - 2, -1, -1):  # from second-coarsest to finest
+            if len(refine_cells) == 0:
+                break
 
-        if far_mask.any():
-            # Try each coarser level (skip finest = levels[0])
-            for level in self.levels[1:]:
-                lv_hd = level["half_diag"]
-                lv_centers = level["centers"]
-                lv_depths = lv_centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
-                lv_safe = np.maximum(lv_depths, 0.01)
-                lv_pixels = (lv_hd * 2) / lv_safe * pix_per_rad
+            lv = self.levels[li]
+            parent_nc = self.levels[li + 1]["nc"]
+            nc = lv["nc"]
+            hd = lv["half_diag"]
 
-                # Frustum test at this level
-                lv_rights = lv_centers @ cam_right - np.dot(cam_pos, cam_right)
-                lv_ups = lv_centers @ cam_up - np.dot(cam_pos, cam_up)
-                lv_in_front = lv_depths > -lv_hd
-                lv_lim_h = (lv_depths + lv_hd) * half_tan * camera.aspect + lv_hd
-                lv_lim_v = (lv_depths + lv_hd) * half_tan + lv_hd
-                lv_vis = lv_in_front & (np.abs(lv_rights) < lv_lim_h) & (np.abs(lv_ups) < lv_lim_v)
+            # Map parent cells to children: each parent (ix,iy,iz) maps to
+            # 8 children at (2*ix+dx, 2*iy+dy, 2*iz+dz) for dx,dy,dz in {0,1}
+            pix = refine_cells // (parent_nc * parent_nc)
+            piy = (refine_cells // parent_nc) % parent_nc
+            piz = refine_cells % parent_nc
 
-                # Use this level for cells that subtend [lod_pixels, 2*lod_pixels)
-                use = lv_vis & (lv_pixels >= lod_pixels) & (lv_pixels < lod_pixels * 4) & (level["mass"] > 0)
-                use_idx = np.where(use)[0]
-                if len(use_idx) > 0:
-                    summary_parts.append((
-                        level["com"][use_idx],
-                        level["hsml"][use_idx],
-                        level["mass"][use_idx],
-                        level["qty"][use_idx],
-                    ))
+            # Generate all 8 children per parent
+            offsets = np.array([[dx, dy, dz] for dx in range(2) for dy in range(2) for dz in range(2)])
+            child_ix = (pix[:, None] * 2 + offsets[None, :, 0]).ravel()
+            child_iy = (piy[:, None] * 2 + offsets[None, :, 1]).ravel()
+            child_iz = (piz[:, None] * 2 + offsets[None, :, 2]).ravel()
+            child_flat = child_ix * nc * nc + child_iy * nc + child_iz
 
-            # Catch-all: coarsest level for anything still unresolved
-            coarsest = self.levels[-1]
-            lv_hd = coarsest["half_diag"]
-            lv_centers = coarsest["centers"]
-            lv_depths = lv_centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
-            lv_rights = lv_centers @ cam_right - np.dot(cam_pos, cam_right)
-            lv_ups = lv_centers @ cam_up - np.dot(cam_pos, cam_up)
-            lv_in_front = lv_depths > -lv_hd
-            lv_lim_h = (lv_depths + lv_hd) * half_tan * camera.aspect + lv_hd
-            lv_lim_v = (lv_depths + lv_hd) * half_tan + lv_hd
-            lv_vis = lv_in_front & (np.abs(lv_rights) < lv_lim_h) & (np.abs(lv_ups) < lv_lim_v)
-            use = lv_vis & (coarsest["mass"] > 0)
-            use_idx = np.where(use)[0]
-            if len(use_idx) > 0:
-                summary_parts.append((
-                    coarsest["com"][use_idx],
-                    coarsest["hsml"][use_idx],
-                    coarsest["mass"][use_idx],
-                    coarsest["qty"][use_idx],
-                ))
+            # Filter to valid children with mass
+            valid = lv["mass"][child_flat] > 0
+            child_flat = child_flat[valid]
+
+            if len(child_flat) == 0:
+                break
+
+            # Frustum test + pixel size on children
+            centers = lv["centers"][child_flat]
+            depths = centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
+            rights = centers @ cam_right - np.dot(cam_pos, cam_right)
+            ups = centers @ cam_up - np.dot(cam_pos, cam_up)
+
+            in_front = depths > -hd
+            lim_h = (depths + hd) * half_tan * camera.aspect + hd
+            lim_v = (depths + hd) * half_tan + hd
+            vis = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
+
+            safe_depths = np.maximum(depths, 0.01)
+            cell_pix = (hd * 2) / safe_depths * pix_per_rad
+
+            if li == 0:
+                # Finest level: real particles for large cells, summaries for small
+                small = vis & (cell_pix <= lod_pixels)
+                large = vis & (cell_pix > lod_pixels)
+
+                # Summary splats for small fine cells
+                s_idx = child_flat[small]
+                if len(s_idx) > 0:
+                    summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx],
+                                          lv["mass"][s_idx], lv["qty"][s_idx]))
+
+                # Real particles for large fine cells
+                vis_cells = child_flat[large]
+                if len(vis_cells) > 0:
+                    starts = finest["cell_start"][vis_cells]
+                    ends = finest["cell_start"][vis_cells + 1]
+                    counts = (ends - starts).astype(np.intp)
+                    total = int(counts.sum())
+                    if total > 0:
+                        offsets_arr = np.repeat(starts, counts)
+                        within = np.arange(total, dtype=np.int64) - np.repeat(
+                            np.concatenate([[0], np.cumsum(counts[:-1])]), counts
+                        )
+                        all_real = finest["sort_order"][(offsets_arr + within).astype(np.intp)]
+            else:
+                # Intermediate level: summarize small cells, refine large ones
+                small = vis & (cell_pix <= lod_pixels)
+                large = vis & (cell_pix > lod_pixels)
+
+                s_idx = child_flat[small]
+                if len(s_idx) > 0:
+                    summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx],
+                                          lv["mass"][s_idx], lv["qty"][s_idx]))
+
+                refine_cells = child_flat[large]
 
         # Subsample real particles if over budget
         n_summaries = sum(p[0].shape[0] for p in summary_parts) if summary_parts else 0
         budget = max(max_particles - n_summaries, max_particles // 2)
         if len(all_real) > budget:
-            step = max(1, len(all_real) // budget)
+            step = max(1, len(all_real) // max(budget, 1))
             all_real = all_real[::step]
 
         # Assemble output
