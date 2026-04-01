@@ -72,7 +72,9 @@ class Camera:
         return m
 
     def update(self, dt):
-        """Process input and update position/orientation. Returns True if camera moved."""
+        """Process input and update position/orientation. Returns True if camera moved or rotated."""
+        # Don't reset _moving here -- mouse rotation sets it during poll_events()
+        moved = self._moving
         self._moving = False
         velocity = np.zeros(3, dtype=np.float32)
 
@@ -102,7 +104,8 @@ class Camera:
             self._roll(self.roll_speed * dt)
             self._moving = True
 
-        return self._moving
+        moved = moved or self._moving
+        return moved
 
     @property
     def is_moving(self):

@@ -176,6 +176,9 @@ class SplatRenderer:
         """Upload a subset of particles to GPU."""
         self.n_particles = len(idx)
 
+        if self.n_particles == 0:
+            return
+
         # Release old buffers
         for attr in ("pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo"):
             old = getattr(self, attr, None)
