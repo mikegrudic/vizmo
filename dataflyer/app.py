@@ -52,7 +52,8 @@ class DataFlyerApp:
 
         # Camera
         self.camera = Camera(fov=fov, aspect=width / height)
-        self.camera.auto_scale(self.data.positions, self.data.masses)
+        boxsize = self.data.header.get("BoxSize", None)
+        self.camera.auto_scale(self.data.positions, boxsize=boxsize)
 
         # Renderer
         self.renderer = SplatRenderer(self.ctx)

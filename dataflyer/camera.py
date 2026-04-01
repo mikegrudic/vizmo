@@ -163,18 +163,18 @@ class Camera:
         f = self.forward
         self._up = self._up * c + np.cross(f, self._up) * s + f * np.dot(f, self._up) * (1 - c)
 
-    def auto_scale(self, positions, masses=None):
-        """Set speed and clip planes. Centers on center-of-mass if masses given."""
+    def auto_scale(self, positions, masses=None, boxsize=None):
+        """Set speed and clip planes. Starts at the box center looking along -z."""
         pmin = positions.min(axis=0)
         pmax = positions.max(axis=0)
         extent = np.linalg.norm(pmax - pmin)
 
-        if masses is not None and len(masses) > 0:
-            center = np.average(positions, axis=0, weights=masses)
+        if boxsize is not None:
+            center = np.ones(3, dtype=np.float32) * boxsize / 2
         else:
-            center = (pmin + pmax) / 2
+            center = ((pmin + pmax) / 2).astype(np.float32)
 
-        self.position = center.astype(np.float32) + np.array([0, 0, extent * 0.3], dtype=np.float32)
+        self.position = center + np.array([0, 0, extent * 0.3], dtype=np.float32)
         self.speed = extent / 10
         self.near = extent * 1e-6
         self.far = extent * 10
