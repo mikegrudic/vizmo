@@ -115,8 +115,14 @@ class SpatialGrid:
         com_ne = cell_mp_ne / safe_mass[:, None]
         var_ne = (cell_mp2_ne / safe_mass[:, None] - com_ne ** 2).sum(axis=1)
         mean_h2_ne = cell_mh2_ne / safe_mass
+        # Effective h = max(sqrt(variance + mean(h^2)), cell_half_diag)
+        # The cell_half_diag floor ensures summary splats overlap and don't leave gaps
+        cell_half_diag = float(np.linalg.norm(self.cell_size) * 0.5)
         self.cell_hsml = np.zeros(nc3, dtype=np.float32)
-        self.cell_hsml[ne_idx] = np.sqrt(np.maximum(var_ne + mean_h2_ne, 0))
+        self.cell_hsml[ne_idx] = np.maximum(
+            np.sqrt(np.maximum(var_ne + mean_h2_ne, 0)),
+            cell_half_diag,
+        )
 
         # Precompute cell geometric centers for frustum test
         nc = self.n_cells
@@ -161,13 +167,13 @@ class SpatialGrid:
         limit_v = (depths + hd) * half_tan + hd
         visible = in_front & (np.abs(rights) < limit_h) & (np.abs(ups) < limit_v)
 
-        # Determine angular size of each cell: cell_size / depth (in pixels)
-        # pixels = cell_size / depth * (viewport / (2*tan(fov/2)))
-        # We use a simplified metric: cell_diag / max(depth, epsilon)
+        # Cell angular size in pixels:
+        # pixels = (cell_diag / depth) / (2*tan(fov/2)) * viewport_height
+        # We estimate viewport as 1024 (retina) and use actual FOV
         safe_depths = np.maximum(depths, 0.01)
-        cell_angular_size = (hd * 2) / safe_depths  # in radians
-        # Convert to approximate pixels (assume ~1000px viewport, fov=90 -> 1 rad per half-screen)
-        cell_pixels = cell_angular_size * 500  # rough estimate
+        fov_rad = np.radians(camera.fov)
+        pixels_per_radian = 1024.0 / (2.0 * np.tan(fov_rad / 2))
+        cell_pixels = (hd * 2) / safe_depths * pixels_per_radian
 
         has_mass = self.cell_mass > 0
         near_cells = np.where(visible & (cell_pixels > lod_pixels) & has_mass)[0]
