@@ -117,13 +117,18 @@ class DataFlyerApp:
 
         self._needs_auto_range = True
 
+    def _range_str(self):
+        lo, hi = self.renderer.qty_min, self.renderer.qty_max
+        if self.renderer.log_scale:
+            return f"10^{lo:.2f} .. 10^{hi:.2f}"
+        return f"{lo:.3g} .. {hi:.3g}"
+
     def _auto_range_from_framebuffer(self):
         """Auto-range from actual rendered pixel values (reads back GPU texture)."""
         lo, hi = self.renderer.read_accum_range()
         self.renderer.qty_min = lo
         self.renderer.qty_max = hi
-        scale = "log10" if self.renderer.log_scale else "linear"
-        print(f"Auto-range ({scale}): {lo:.3g} .. {hi:.3g}")
+        print(f"Auto-range: {self._range_str()}")
 
     def _set_colormap(self, name):
         if name not in self._colormap_textures:
@@ -206,7 +211,7 @@ class DataFlyerApp:
             half *= 0.8  # contract = more contrast
             self.renderer.qty_min = mid - half
             self.renderer.qty_max = mid + half
-            print(f"Range: {self.renderer.qty_min:.3g} .. {self.renderer.qty_max:.3g}")
+            print(f"Range: {self._range_str()}")
             return
         if key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
             mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
@@ -214,7 +219,7 @@ class DataFlyerApp:
             half *= 1.25  # expand = less contrast
             self.renderer.qty_min = mid - half
             self.renderer.qty_max = mid + half
-            print(f"Range: {self.renderer.qty_min:.3g} .. {self.renderer.qty_max:.3g}")
+            print(f"Range: {self._range_str()}")
             return
 
         # L: toggle log/linear scale
@@ -289,7 +294,7 @@ class DataFlyerApp:
         print(f"\n  Colormap : {AVAILABLE_COLORMAPS[self._cmap_idx]}")
         print(f"  Opacity  : {self.renderer.alpha_scale:.4f}")
         print(f"  Scale    : {scale}")
-        print(f"  Range    : {self.renderer.qty_min:.3g} .. {self.renderer.qty_max:.3g}")
+        print(f"  Range    : {self._range_str()}")
         print(f"  Gas      : {self.renderer.n_particles:,}")
         if self.renderer.n_stars > 0:
             print(f"  Stars    : {self.renderer.n_stars}")
