@@ -253,8 +253,7 @@ class SpatialGrid:
             # Floor at 1.5 * cell_spacing so adjacent splats overlap smoothly
             # (cubic spline has compact support at r=h, need h > spacing for continuity)
             h_var = np.sqrt(np.maximum(4.22 * var_ne + mh2_ne / safe, 1e-30))
-            h_floor = 1.5 * np.linalg.norm(cs)
-            cell_hsml[ne_idx] = np.maximum(h_var, h_floor)
+            cell_hsml[ne_idx] = h_var
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
@@ -304,8 +303,7 @@ class SpatialGrid:
         cell_qty = cell_mq / safe
         var = (cell_mx2 / safe[:, None] - cell_com ** 2).sum(axis=1)
         h_var = np.sqrt(np.maximum(4.22 * var + cell_mh2 / safe, 1e-30))
-        h_floor = 1.5 * np.linalg.norm(cs)
-        cell_hsml = np.maximum(h_var, h_floor)
+        cell_hsml = h_var
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
