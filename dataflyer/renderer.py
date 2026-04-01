@@ -60,42 +60,37 @@ def _gather_subsampled_direct(cell_start, vis_cells, budget,
     return o_pos, o_hsml, o_mass, o_qty, total
 
 
-@njit(cache=True)
-def _deterministic_hash(idx):
-    """Simple integer hash for deterministic acceptance sampling."""
-    x = np.uint64(idx)
-    x = ((x >> np.uint64(16)) ^ x) * np.uint64(0x45d9f3b)
-    x = ((x >> np.uint64(16)) ^ x) * np.uint64(0x45d9f3b)
-    x = (x >> np.uint64(16)) ^ x
-    return np.float32(x & np.uint64(0xFFFFFF)) / np.float32(0xFFFFFF)
-
-
 @njit(parallel=True, cache=True)
 def _gather_importance_sampled(cell_start, vis_cells, budget,
                                 s_pos, s_hsml, s_mass, s_qty,
-                                cam_pos, cam_fwd):
-    """Gather particles with importance-weighted subsampling.
+                                cell_depths, cell_hsml_summary):
+    """Gather particles with per-cell importance-weighted strides.
 
-    Particles are weighted by angular area w_i = (h_i / depth_i)^2.
-    Keep probability p_i = min(w_i * scale, 1) where scale = budget / sum_w.
-    Kept particles get mass *= 1/p_i, h *= (1/p_i)^(1/3) to conserve mass.
+    Each cell gets a stride based on its angular area weight:
+      w_cell = (h_cell / depth_cell)^2
+    Cells covering more pixels get stride=1, distant small cells get larger strides.
+    Per-cell mass/h rescaling by the cell's stride ratio.
+
+    Uses pre-computed cell depths and summary h (from the tree traversal),
+    so no per-particle dot products needed -- same speed as uniform stride.
     """
     n_cells = len(vis_cells)
 
-    # First pass: compute sum of weights and total particle count
+    # First pass: compute per-cell weights and total weighted budget allocation
+    cell_weights = np.empty(n_cells, dtype=np.float64)
+    cell_counts = np.empty(n_cells, dtype=np.int64)
     sum_w = np.float64(0.0)
     total = np.int64(0)
-    cam_fwd_offset = cam_pos[0] * cam_fwd[0] + cam_pos[1] * cam_fwd[1] + cam_pos[2] * cam_fwd[2]
     for i in range(n_cells):
         c = vis_cells[i]
-        for k in range(cell_start[c], cell_start[c + 1]):
-            depth = (s_pos[k, 0] * cam_fwd[0] + s_pos[k, 1] * cam_fwd[1]
-                     + s_pos[k, 2] * cam_fwd[2]) - cam_fwd_offset
-            if depth < 0.01:
-                depth = 0.01
-            h = s_hsml[k]
-            sum_w += np.float64(h * h) / np.float64(depth * depth)
-            total += 1
+        n = cell_start[c + 1] - cell_start[c]
+        cell_counts[i] = n
+        total += n
+        d = max(cell_depths[i], np.float64(0.01))
+        h = np.float64(cell_hsml_summary[i])
+        w = (h * h) / (d * d)
+        cell_weights[i] = w * n  # total weight for this cell = per-particle weight * count
+        sum_w += w * n
 
     if total == 0 or sum_w == 0:
         return (np.empty((0, 3), dtype=np.float32),
@@ -104,61 +99,54 @@ def _gather_importance_sampled(cell_start, vis_cells, budget,
                 np.empty(0, dtype=np.float32),
                 np.int64(0))
 
-    scale = np.float64(budget) / sum_w
-
-    # Second pass: count how many we'll keep per cell (deterministic)
+    # Per-cell: allocate budget proportional to weight
+    # stride_i = max(1, n_i / allocated_i) where allocated_i = budget * w_i / sum_w
+    cell_strides = np.empty(n_cells, dtype=np.int64)
     out_counts = np.empty(n_cells, dtype=np.int64)
     out_total = np.int64(0)
     for i in range(n_cells):
-        c = vis_cells[i]
-        kept = np.int64(0)
-        for k in range(cell_start[c], cell_start[c + 1]):
-            depth = (s_pos[k, 0] * cam_fwd[0] + s_pos[k, 1] * cam_fwd[1]
-                     + s_pos[k, 2] * cam_fwd[2]) - cam_fwd_offset
-            if depth < 0.01:
-                depth = 0.01
-            h = s_hsml[k]
-            w = np.float64(h * h) / np.float64(depth * depth)
-            p = min(w * scale, 1.0)
-            if p >= 1.0 or _deterministic_hash(k) < np.float32(p):
-                kept += 1
+        n = cell_counts[i]
+        allocated = cell_weights[i] / sum_w * budget
+        if allocated >= n:
+            cell_strides[i] = 1
+        else:
+            cell_strides[i] = max(np.int64(1), np.int64(n / max(allocated, 1.0)))
+        kept = (n + cell_strides[i] - 1) // cell_strides[i]
         out_counts[i] = kept
         out_total += kept
 
-    # Prefix sum
+    # Prefix sum for output offsets
     out_offsets = np.empty(n_cells, dtype=np.int64)
     out_offsets[0] = 0
     for i in range(1, n_cells):
         out_offsets[i] = out_offsets[i - 1] + out_counts[i - 1]
 
-    # Allocate
+    # Allocate output
     o_pos = np.empty((out_total, 3), dtype=np.float32)
     o_hsml = np.empty(out_total, dtype=np.float32)
     o_mass = np.empty(out_total, dtype=np.float32)
     o_qty = np.empty(out_total, dtype=np.float32)
 
-    # Third pass: parallel gather with per-particle rescaling
+    # Parallel gather with per-cell stride and rescaling
     for i in prange(n_cells):
         c = vis_cells[i]
+        start = cell_start[c]
+        end = cell_start[c + 1]
+        stride = cell_strides[i]
         out_start = out_offsets[i]
+        n = end - start
+        # Rescale factor for this cell
+        ratio = np.float32(n) / np.float32(out_counts[i])
+        h_scale = ratio ** np.float32(0.33333333)
         j = 0
-        for k in range(cell_start[c], cell_start[c + 1]):
-            depth = (s_pos[k, 0] * cam_fwd[0] + s_pos[k, 1] * cam_fwd[1]
-                     + s_pos[k, 2] * cam_fwd[2]) - cam_fwd_offset
-            if depth < 0.01:
-                depth = 0.01
-            h = s_hsml[k]
-            w = np.float64(h * h) / np.float64(depth * depth)
-            p = min(w * scale, 1.0)
-            if p >= 1.0 or _deterministic_hash(k) < np.float32(p):
-                inv_p = np.float32(1.0 / p)
-                o_pos[out_start + j, 0] = s_pos[k, 0]
-                o_pos[out_start + j, 1] = s_pos[k, 1]
-                o_pos[out_start + j, 2] = s_pos[k, 2]
-                o_hsml[out_start + j] = h * inv_p ** np.float32(0.33333333)
-                o_mass[out_start + j] = s_mass[k] * inv_p
-                o_qty[out_start + j] = s_qty[k]
-                j += 1
+        for k in range(start, end, stride):
+            o_pos[out_start + j, 0] = s_pos[k, 0]
+            o_pos[out_start + j, 1] = s_pos[k, 1]
+            o_pos[out_start + j, 2] = s_pos[k, 2]
+            o_hsml[out_start + j] = s_hsml[k] * h_scale
+            o_mass[out_start + j] = s_mass[k] * ratio
+            o_qty[out_start + j] = s_qty[k]
+            j += 1
 
     return o_pos, o_hsml, o_mass, o_qty, total
 
@@ -449,12 +437,15 @@ class SpatialGrid:
                     n_summaries = sum(p[0].shape[0] for p in summary_parts) if summary_parts else 0
                     budget = max(max_particles - n_summaries, max_particles // 2)
                     if importance_sampling:
+                        # Use cell depths and summary h for per-cell weighting
+                        vis_depths = safe_depths[large].astype(np.float64)
+                        vis_cell_h = lv["hsml"][child_flat[large]].astype(np.float64)
                         real_pos, real_hsml, real_mass, real_qty, n_visible_real = \
                             _gather_importance_sampled(
                                 finest["cell_start"], vis_cells.astype(np.int64), budget,
                                 self.sorted_pos, self.sorted_hsml,
                                 self.sorted_mass, self.sorted_qty,
-                                cam_pos.astype(np.float32), cam_fwd.astype(np.float32),
+                                vis_depths, vis_cell_h,
                             )
                     else:
                         real_pos, real_hsml, real_mass, real_qty, n_visible_real = \
