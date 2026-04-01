@@ -208,7 +208,6 @@ class SplatRenderer:
         self.prog_resolve["u_colormap"].value = 2
         self.prog_resolve["u_qty_min"].value = self.qty_min
         self.prog_resolve["u_qty_max"].value = self.qty_max
-        self.prog_resolve["u_alpha_scale"].value = self.alpha_scale
         self.prog_resolve["u_mode"].value = self.mode
         self.prog_resolve["u_log_scale"].value = self.log_scale
 

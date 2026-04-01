@@ -199,14 +199,22 @@ class DataFlyerApp:
             self._auto_range_from_framebuffer()
             return
 
-        # +/-: adjust opacity
+        # +/-: expand/contract dynamic range
         if key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
-            self.renderer.alpha_scale *= 1.5
-            print(f"Opacity: {self.renderer.alpha_scale:.4f}")
+            mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
+            half = (self.renderer.qty_max - self.renderer.qty_min) / 2
+            half *= 0.8  # contract = more contrast
+            self.renderer.qty_min = mid - half
+            self.renderer.qty_max = mid + half
+            print(f"Range: {self.renderer.qty_min:.3g} .. {self.renderer.qty_max:.3g}")
             return
         if key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
-            self.renderer.alpha_scale /= 1.5
-            print(f"Opacity: {self.renderer.alpha_scale:.4f}")
+            mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
+            half = (self.renderer.qty_max - self.renderer.qty_min) / 2
+            half *= 1.25  # expand = less contrast
+            self.renderer.qty_min = mid - half
+            self.renderer.qty_max = mid + half
+            print(f"Range: {self.renderer.qty_min:.3g} .. {self.renderer.qty_max:.3g}")
             return
 
         # L: toggle log/linear scale
@@ -267,7 +275,7 @@ class DataFlyerApp:
         print("  1-9      : Select quantity directly")
         print("  Tab      : Next quantity  |  Shift+Tab : Previous")
         print("  C        : Next colormap  |  Shift+C   : Previous")
-        print("  +/-      : Increase/decrease opacity")
+        print("  +/-      : Contract/expand dynamic range")
         print("  R        : Auto-range dynamic range")
         print("  L        : Toggle log/linear scale")
         print("  P        : Screenshot")

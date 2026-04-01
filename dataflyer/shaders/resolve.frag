@@ -21,7 +21,7 @@ void main() {
     float denom = texture(u_denominator, v_uv).r;
 
     if (denom < 1e-30) {
-        frag_color = vec4(0.0, 0.0, 0.0, 0.0);
+        frag_color = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
 
@@ -43,9 +43,5 @@ void main() {
     }
     vec3 color = texture(u_colormap, vec2(t, 0.5)).rgb;
 
-    // Alpha from surface density (always log-mapped for visibility)
-    float log_sigma = log(max(denom, 1e-30)) / log(10.0);
-    float alpha = clamp(denom * u_alpha_scale, 0.0, 1.0);
-
-    frag_color = vec4(color * alpha, alpha);
+    frag_color = vec4(color, 1.0);
 }
