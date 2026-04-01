@@ -15,222 +15,243 @@ def _load_shader(name):
 
 
 class SpatialGrid:
-    """Uniform grid with per-cell summaries for LOD rendering.
+    """Multi-level uniform grid for frustum culling and LOD rendering.
 
-    Distant cells that subtend less than `lod_pixels` are rendered as a single
-    summary splat with the cell's total mass, center-of-mass position, and an
-    effective smoothing length matching the mass-weighted spatial variance.
+    Builds summaries at multiple levels (64, 32, 16, 8, 4, 2 cells per side).
+    At query time, each region is rendered at the coarsest level where cells
+    subtend >= lod_pixels, or at full particle resolution if close enough.
     """
 
     def __init__(self, positions, masses, hsml, quantity, n_cells=64):
         self.n_cells = n_cells
         self.pmin = positions.min(axis=0).astype(np.float32)
         self.pmax = positions.max(axis=0).astype(np.float32)
-        self.cell_size = (self.pmax - self.pmin) / n_cells
-        self.cell_size[self.cell_size == 0] = 1.0
+        box = self.pmax - self.pmin
+        box[box == 0] = 1.0
 
-        # Assign particles to cells
+        # Finest-level cell assignment and sort
+        cs = box / n_cells
         cell_idx = np.clip(
-            ((positions - self.pmin) / self.cell_size).astype(np.int32),
-            0, n_cells - 1
+            ((positions - self.pmin) / cs).astype(np.int32), 0, n_cells - 1
         )
-        self.cell_id = (cell_idx[:, 0] * n_cells * n_cells
-                        + cell_idx[:, 1] * n_cells
-                        + cell_idx[:, 2])
+        cell_id = cell_idx[:, 0] * n_cells * n_cells + cell_idx[:, 1] * n_cells + cell_idx[:, 2]
+        self.sort_order = np.argsort(cell_id)
+        sorted_cell_id = cell_id[self.sort_order]
 
-        # Sort by cell
-        self.sort_order = np.argsort(self.cell_id)
-        sorted_cell_id = self.cell_id[self.sort_order]
-
-        # Cell start/end
-        n_total_cells = n_cells ** 3
-        self.cell_start = np.zeros(n_total_cells + 1, dtype=np.int64)
+        nc3 = n_cells ** 3
+        self.cell_start = np.zeros(nc3 + 1, dtype=np.int64)
         unique_cells, counts = np.unique(sorted_cell_id, return_counts=True)
         self.cell_start[unique_cells + 1] = counts
         np.cumsum(self.cell_start, out=self.cell_start)
 
-        # Precompute per-cell summaries for LOD
-        self._build_summaries(positions, masses, hsml, quantity)
+        # Build multi-level summaries: level n_cells, n_cells/2, ..., 2
+        # Each level stores (mass, com, hsml, qty) per cell
+        self.levels = []  # list of dicts, finest first
+        level_nc = n_cells
+        while level_nc >= 2:
+            level = self._build_level(positions, masses, hsml, quantity, level_nc, box)
+            self.levels.append(level)
+            level_nc //= 2
 
-    def _build_summaries(self, positions, masses, hsml, quantity):
-        """Compute per-cell: total mass, center-of-mass, effective h, avg quantity.
-        Fully vectorized using sorted arrays and np.add.reduceat."""
-        nc3 = self.n_cells ** 3
-        so = self.sort_order
+    def _build_level(self, positions, masses, hsml, quantity, nc, box):
+        """Build summary arrays for a single grid level."""
+        cs = box / nc
+        cell_idx = np.clip(
+            ((positions - self.pmin) / cs).astype(np.int32), 0, nc - 1
+        )
+        cell_id = cell_idx[:, 0] * nc * nc + cell_idx[:, 1] * nc + cell_idx[:, 2]
+        order = np.argsort(cell_id)
+        sorted_id = cell_id[order]
 
-        # Sort all arrays by cell
-        s_mass = masses[so]
-        s_pos = positions[so]
-        s_hsml = hsml[so]
-        s_qty = quantity[so]
+        nc3 = nc ** 3
+        cell_start = np.zeros(nc3 + 1, dtype=np.int64)
+        u, c = np.unique(sorted_id, return_counts=True)
+        cell_start[u + 1] = c
+        np.cumsum(cell_start, out=cell_start)
 
-        # Reduceat boundaries: start of each cell
-        starts = self.cell_start[:-1].astype(np.intp)
-        # Only reduce over non-empty cells
-        nonempty = starts < self.cell_start[1:]
+        # Reduceat for vectorized sums
+        starts = cell_start[:-1].astype(np.intp)
+        nonempty = starts < cell_start[1:]
         reduce_at = starts[nonempty]
-
-        if len(reduce_at) == 0:
-            self.cell_mass = np.zeros(nc3, dtype=np.float32)
-            self.cell_com = np.zeros((nc3, 3), dtype=np.float32)
-            self.cell_hsml = np.zeros(nc3, dtype=np.float32)
-            self.cell_qty = np.zeros(nc3, dtype=np.float32)
-            return
-
-        # Total mass per cell
-        cell_mass_ne = np.add.reduceat(s_mass, reduce_at)
-
-        # Mass-weighted position sums
-        mp = s_pos * s_mass[:, None]
-        cell_mp_ne = np.add.reduceat(mp, reduce_at)  # (n_nonempty, 3)
-
-        # Mass-weighted quantity
-        mq = s_mass * s_qty
-        cell_mq_ne = np.add.reduceat(mq, reduce_at)
-
-        # Mass-weighted h^2
-        mh2 = s_mass * s_hsml ** 2
-        cell_mh2_ne = np.add.reduceat(mh2, reduce_at)
-
-        # Mass-weighted position^2 for variance
-        mp2 = s_pos ** 2 * s_mass[:, None]
-        cell_mp2_ne = np.add.reduceat(mp2, reduce_at)  # (n_nonempty, 3)
-
-        # Scatter into full arrays
         ne_idx = np.where(nonempty)[0]
 
-        self.cell_mass = np.zeros(nc3, dtype=np.float32)
-        self.cell_mass[ne_idx] = cell_mass_ne
+        s_m = masses[order]
+        s_p = positions[order]
+        s_h = hsml[order]
+        s_q = quantity[order]
 
-        safe_mass = np.maximum(cell_mass_ne, 1e-30)
+        cell_mass = np.zeros(nc3, dtype=np.float32)
+        cell_com = np.zeros((nc3, 3), dtype=np.float32)
+        cell_hsml = np.zeros(nc3, dtype=np.float32)
+        cell_qty = np.zeros(nc3, dtype=np.float32)
 
-        self.cell_com = np.zeros((nc3, 3), dtype=np.float32)
-        self.cell_com[ne_idx] = cell_mp_ne / safe_mass[:, None]
+        if len(reduce_at) > 0:
+            mass_ne = np.add.reduceat(s_m, reduce_at)
+            safe = np.maximum(mass_ne, 1e-30)
 
-        self.cell_qty = np.zeros(nc3, dtype=np.float32)
-        self.cell_qty[ne_idx] = cell_mq_ne / safe_mass
+            mp_ne = np.add.reduceat(s_p * s_m[:, None], reduce_at)
+            mq_ne = np.add.reduceat(s_m * s_q, reduce_at)
+            mh2_ne = np.add.reduceat(s_m * s_h ** 2, reduce_at)
+            mp2_ne = np.add.reduceat(s_p ** 2 * s_m[:, None], reduce_at)
 
-        # Effective h = sqrt(variance + mean(h^2))
-        # variance = E[x^2] - E[x]^2 summed over dimensions
-        com_ne = cell_mp_ne / safe_mass[:, None]
-        var_ne = (cell_mp2_ne / safe_mass[:, None] - com_ne ** 2).sum(axis=1)
-        mean_h2_ne = cell_mh2_ne / safe_mass
-        # Effective h = max(sqrt(variance + mean(h^2)), cell_half_diag)
-        # The cell_half_diag floor ensures summary splats overlap and don't leave gaps
-        cell_half_diag = float(np.linalg.norm(self.cell_size) * 0.5)
-        self.cell_hsml = np.zeros(nc3, dtype=np.float32)
-        self.cell_hsml[ne_idx] = np.maximum(
-            np.sqrt(np.maximum(var_ne + mean_h2_ne, 0)),
-            cell_half_diag,
-        )
+            com_ne = mp_ne / safe[:, None]
+            var_ne = (mp2_ne / safe[:, None] - com_ne ** 2).sum(axis=1)
 
-        # Precompute cell geometric centers for frustum test
-        nc = self.n_cells
-        cs = self.cell_size
+            cell_mass[ne_idx] = mass_ne
+            cell_com[ne_idx] = com_ne
+            cell_qty[ne_idx] = mq_ne / safe
+            # h = sqrt(spatial_variance + mean_h^2), floored to cell half-diagonal
+            h_ne = np.sqrt(np.maximum(var_ne + mh2_ne / safe, 0))
+            cell_hsml[ne_idx] = np.maximum(h_ne, np.linalg.norm(cs) * 0.5)
+
+        # Cell centers
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
         cz = np.arange(nc, dtype=np.float32) * cs[2] + self.pmin[2] + cs[2] * 0.5
         gx, gy, gz = np.meshgrid(cx, cy, cz, indexing='ij')
-        self.cell_centers = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
-        self.half_diag = float(np.linalg.norm(cs) * 0.5)
+        centers = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
 
-    def update_quantity(self, quantity):
-        """Re-summarize quantity data without rebuilding the whole grid."""
-        so = self.sort_order
-        masses_sorted_needed = True  # we need access to masses
-        # For simplicity, just zero and recompute qty
-        # (this is fast since we just iterate cells)
-        # But we don't have masses stored... store a reference
-        pass  # TODO: implement if needed
+        return {
+            "nc": nc, "cs": cs,
+            "cell_start": cell_start, "sort_order": order,
+            "mass": cell_mass, "com": cell_com, "hsml": cell_hsml, "qty": cell_qty,
+            "centers": centers,
+            "half_diag": float(np.linalg.norm(cs) * 0.5),
+        }
 
     def query_frustum_lod(self, camera, positions, hsml, masses, quantity,
                           max_particles, lod_pixels=4):
-        """Return (pos, hsml, mass, qty) arrays combining real + summary particles.
-
-        Near cells (subtending > lod_pixels): return real particles.
-        Far cells (subtending <= lod_pixels): return one summary splat per cell.
-        """
+        """Multi-level LOD query. Returns (pos, hsml, mass, qty) arrays."""
         cam_pos = camera.position
         cam_fwd = camera.forward
         cam_right = camera.right
         cam_up = camera.up
+        fov_rad = np.radians(camera.fov)
+        pix_per_rad = 1024.0 / (2.0 * np.tan(fov_rad / 2))
+        half_tan = np.tan(fov_rad / 2) * 2.0  # wide frustum
 
-        # Frustum test on cell centers
-        depths = self.cell_centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
-        rights = self.cell_centers @ cam_right - np.dot(cam_pos, cam_right)
-        ups = self.cell_centers @ cam_up - np.dot(cam_pos, cam_up)
+        # Find the coarsest level where cells subtend >= lod_pixels at any depth,
+        # then for each visible cell, use the coarsest level that still subtends >= lod_pixels.
+        # Strategy: iterate levels coarse->fine. Mark cells as "resolved" at each level.
 
-        hd = self.half_diag
-        half_tan = np.tan(np.radians(min(camera.fov, 120)) / 2) * 2.0
+        # Use finest level for frustum test
+        finest = self.levels[0]
+        hd = finest["half_diag"]
+        centers = finest["centers"]
+        depths = centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
+        rights = centers @ cam_right - np.dot(cam_pos, cam_right)
+        ups = centers @ cam_up - np.dot(cam_pos, cam_up)
+
         in_front = depths > -hd
         limit_h = (depths + hd) * half_tan * camera.aspect + hd
         limit_v = (depths + hd) * half_tan + hd
         visible = in_front & (np.abs(rights) < limit_h) & (np.abs(ups) < limit_v)
 
-        # Cell angular size in pixels:
-        # pixels = (cell_diag / depth) / (2*tan(fov/2)) * viewport_height
-        # We estimate viewport as 1024 (retina) and use actual FOV
         safe_depths = np.maximum(depths, 0.01)
-        fov_rad = np.radians(camera.fov)
-        pixels_per_radian = 1024.0 / (2.0 * np.tan(fov_rad / 2))
-        cell_pixels = (hd * 2) / safe_depths * pixels_per_radian
+        fine_pixels = (hd * 2) / safe_depths * pix_per_rad
 
-        has_mass = self.cell_mass > 0
-        near_cells = np.where(visible & (cell_pixels > lod_pixels) & has_mass)[0]
-        far_cells = np.where(visible & (cell_pixels <= lod_pixels) & has_mass)[0]
+        # Cells that are close enough to render at full particle resolution
+        near_mask = visible & (fine_pixels > lod_pixels) & (finest["mass"] > 0)
+        near_cells = np.where(near_mask)[0]
 
-        # Gather real particle indices from near cells (vectorized)
-        near_starts = self.cell_start[near_cells]
-        near_ends = self.cell_start[near_cells + 1]
-        near_counts = near_ends - near_starts
+        # Gather real particles from near cells
+        near_starts = finest["cell_start"][near_cells]
+        near_ends = finest["cell_start"][near_cells + 1]
+        near_counts = (near_ends - near_starts).astype(np.intp)
         real_count = int(near_counts.sum())
 
-        n_summaries = len(far_cells)
-
-        # Build index array for real particles from near cells
         if real_count > 0:
-            # Vectorized gather: build flat index array from cell ranges
             offsets = np.repeat(near_starts, near_counts)
-            within = np.arange(real_count) - np.repeat(
+            within = np.arange(real_count, dtype=np.int64) - np.repeat(
                 np.concatenate([[0], np.cumsum(near_counts[:-1])]), near_counts
             )
-            all_real_sorted = (offsets + within).astype(np.intp)
-            all_real = self.sort_order[all_real_sorted]
+            all_real = finest["sort_order"][(offsets + within).astype(np.intp)]
         else:
             all_real = np.array([], dtype=np.intp)
 
-        # Subsample if over budget
-        budget = max_particles - n_summaries
+        # For far cells, find the best coarse level
+        far_mask = visible & (~near_mask) & (finest["mass"] > 0)
+        summary_parts = []
+
+        if far_mask.any():
+            # Try each coarser level (skip finest = levels[0])
+            for level in self.levels[1:]:
+                lv_hd = level["half_diag"]
+                lv_centers = level["centers"]
+                lv_depths = lv_centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
+                lv_safe = np.maximum(lv_depths, 0.01)
+                lv_pixels = (lv_hd * 2) / lv_safe * pix_per_rad
+
+                # Frustum test at this level
+                lv_rights = lv_centers @ cam_right - np.dot(cam_pos, cam_right)
+                lv_ups = lv_centers @ cam_up - np.dot(cam_pos, cam_up)
+                lv_in_front = lv_depths > -lv_hd
+                lv_lim_h = (lv_depths + lv_hd) * half_tan * camera.aspect + lv_hd
+                lv_lim_v = (lv_depths + lv_hd) * half_tan + lv_hd
+                lv_vis = lv_in_front & (np.abs(lv_rights) < lv_lim_h) & (np.abs(lv_ups) < lv_lim_v)
+
+                # Use this level for cells that subtend [lod_pixels, 2*lod_pixels)
+                use = lv_vis & (lv_pixels >= lod_pixels) & (lv_pixels < lod_pixels * 4) & (level["mass"] > 0)
+                use_idx = np.where(use)[0]
+                if len(use_idx) > 0:
+                    summary_parts.append((
+                        level["com"][use_idx],
+                        level["hsml"][use_idx],
+                        level["mass"][use_idx],
+                        level["qty"][use_idx],
+                    ))
+
+            # Catch-all: coarsest level for anything still unresolved
+            coarsest = self.levels[-1]
+            lv_hd = coarsest["half_diag"]
+            lv_centers = coarsest["centers"]
+            lv_depths = lv_centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
+            lv_rights = lv_centers @ cam_right - np.dot(cam_pos, cam_right)
+            lv_ups = lv_centers @ cam_up - np.dot(cam_pos, cam_up)
+            lv_in_front = lv_depths > -lv_hd
+            lv_lim_h = (lv_depths + lv_hd) * half_tan * camera.aspect + lv_hd
+            lv_lim_v = (lv_depths + lv_hd) * half_tan + lv_hd
+            lv_vis = lv_in_front & (np.abs(lv_rights) < lv_lim_h) & (np.abs(lv_ups) < lv_lim_v)
+            use = lv_vis & (coarsest["mass"] > 0)
+            use_idx = np.where(use)[0]
+            if len(use_idx) > 0:
+                summary_parts.append((
+                    coarsest["com"][use_idx],
+                    coarsest["hsml"][use_idx],
+                    coarsest["mass"][use_idx],
+                    coarsest["qty"][use_idx],
+                ))
+
+        # Subsample real particles if over budget
+        n_summaries = sum(p[0].shape[0] for p in summary_parts) if summary_parts else 0
+        budget = max(max_particles - n_summaries, max_particles // 2)
         if len(all_real) > budget:
-            step = max(1, len(all_real) // max(budget, 1))
+            step = max(1, len(all_real) // budget)
             all_real = all_real[::step]
 
-        n_real = len(all_real)
-        n_out = n_real + n_summaries
+        # Assemble output
+        parts_pos = [positions[all_real]] if len(all_real) > 0 else []
+        parts_hsml = [hsml[all_real]] if len(all_real) > 0 else []
+        parts_mass = [masses[all_real]] if len(all_real) > 0 else []
+        parts_qty = [quantity[all_real]] if len(all_real) > 0 else []
 
-        if n_out == 0:
+        for sp_com, sp_h, sp_m, sp_q in summary_parts:
+            parts_pos.append(sp_com)
+            parts_hsml.append(sp_h)
+            parts_mass.append(sp_m)
+            parts_qty.append(sp_q)
+
+        if not parts_pos:
             z3 = np.zeros((0, 3), dtype=np.float32)
             z1 = np.zeros(0, dtype=np.float32)
             return z3, z1, z1, z1
 
-        out_pos = np.empty((n_out, 3), dtype=np.float32)
-        out_hsml = np.empty(n_out, dtype=np.float32)
-        out_mass = np.empty(n_out, dtype=np.float32)
-        out_qty = np.empty(n_out, dtype=np.float32)
-
-        if n_real > 0:
-            out_pos[:n_real] = positions[all_real]
-            out_hsml[:n_real] = hsml[all_real]
-            out_mass[:n_real] = masses[all_real]
-            out_qty[:n_real] = quantity[all_real]
-
-        if n_summaries > 0:
-            out_pos[n_real:] = self.cell_com[far_cells]
-            out_hsml[n_real:] = self.cell_hsml[far_cells]
-            out_mass[n_real:] = self.cell_mass[far_cells]
-            out_qty[n_real:] = self.cell_qty[far_cells]
-
-        return out_pos, out_hsml, out_mass, out_qty
+        return (
+            np.concatenate(parts_pos).astype(np.float32),
+            np.concatenate(parts_hsml).astype(np.float32),
+            np.concatenate(parts_mass).astype(np.float32),
+            np.concatenate(parts_qty).astype(np.float32),
+        )
 
 
 class SplatRenderer:
