@@ -226,6 +226,18 @@ class DataFlyerApp:
             print(f"Range: {self._range_str()}")
             return
 
+        # [/]: adjust LOD pixel threshold (more/less detail)
+        if key == glfw.KEY_RIGHT_BRACKET:
+            self.renderer.lod_pixels = max(1, self.renderer.lod_pixels // 2)
+            print(f"LOD: {self.renderer.lod_pixels}px (more detail)")
+            self.renderer.update_visible(self.camera)
+            return
+        if key == glfw.KEY_LEFT_BRACKET:
+            self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
+            print(f"LOD: {self.renderer.lod_pixels}px (faster)")
+            self.renderer.update_visible(self.camera)
+            return
+
         # L: toggle log/linear scale
         if key == glfw.KEY_L:
             self.renderer.log_scale = 1 - self.renderer.log_scale
@@ -285,6 +297,7 @@ class DataFlyerApp:
         print("  Tab      : Next quantity  |  Shift+Tab : Previous")
         print("  C        : Next colormap  |  Shift+C   : Previous")
         print("  +/-      : Contract/expand dynamic range")
+        print("  [/]      : More/less LOD detail")
         print("  R        : Auto-range dynamic range")
         print("  L        : Toggle log/linear scale")
         print("  P        : Screenshot")

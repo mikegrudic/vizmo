@@ -303,6 +303,7 @@ class SplatRenderer:
         self.qty_min = -1.0
         self.qty_max = 3.0
         self.mode = 0       # 0: surface density, 1: weighted quantity
+        self.lod_pixels = 4  # cells subtending fewer pixels than this get summarized
         self.log_scale = 1  # 1: log10, 0: linear
         self.max_render_particles = MAX_RENDER_PARTICLES
 
@@ -335,7 +336,7 @@ class SplatRenderer:
         if self._grid is not None:
             pos, hsml, mass, qty = self._grid.query_frustum_lod(
                 camera, self._all_pos, self._all_hsml, self._all_mass, self._all_qty,
-                self.max_render_particles,
+                self.max_render_particles, lod_pixels=self.lod_pixels,
             )
             self._upload_arrays(pos, hsml, mass, qty)
         else:
