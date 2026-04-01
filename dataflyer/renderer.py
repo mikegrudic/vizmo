@@ -44,51 +44,44 @@ class SpatialGrid:
         self.cell_start[unique_cells + 1] = counts
         np.cumsum(self.cell_start, out=self.cell_start)
 
-        # Build multi-level summaries: level n_cells, n_cells/2, ..., 2
-        # Each level stores (mass, com, hsml, qty) per cell
-        self.levels = []  # list of dicts, finest first
-        level_nc = n_cells
-        while level_nc >= 2:
-            level = self._build_level(positions, masses, hsml, quantity, level_nc, box)
-            self.levels.append(level)
-            level_nc //= 2
+        # Build finest level from particles
+        finest = self._build_finest(positions, masses, hsml, quantity, n_cells, box)
+        self.levels = [finest]
 
-    def _build_level(self, positions, masses, hsml, quantity, nc, box):
-        """Build summary arrays for a single grid level."""
+        # Build coarser levels by merging 2x2x2 groups of children
+        prev = finest
+        while prev["nc"] > 2:
+            coarser = self._coarsen(prev)
+            self.levels.append(coarser)
+            prev = coarser
+
+    def _build_finest(self, positions, masses, hsml, quantity, nc, box):
+        """Build the finest level directly from particles."""
         cs = box / nc
-        cell_idx = np.clip(
-            ((positions - self.pmin) / cs).astype(np.int32), 0, nc - 1
-        )
-        cell_id = cell_idx[:, 0] * nc * nc + cell_idx[:, 1] * nc + cell_idx[:, 2]
-        order = np.argsort(cell_id)
-        sorted_id = cell_id[order]
+        so = self.sort_order
+
+        s_m = masses[so]
+        s_p = positions[so]
+        s_h = hsml[so]
+        s_q = quantity[so]
 
         nc3 = nc ** 3
-        cell_start = np.zeros(nc3 + 1, dtype=np.int64)
-        u, c = np.unique(sorted_id, return_counts=True)
-        cell_start[u + 1] = c
-        np.cumsum(cell_start, out=cell_start)
-
-        # Reduceat for vectorized sums
-        starts = cell_start[:-1].astype(np.intp)
-        nonempty = starts < cell_start[1:]
+        starts = self.cell_start[:-1].astype(np.intp)
+        nonempty = starts < self.cell_start[1:]
         reduce_at = starts[nonempty]
         ne_idx = np.where(nonempty)[0]
-
-        s_m = masses[order]
-        s_p = positions[order]
-        s_h = hsml[order]
-        s_q = quantity[order]
 
         cell_mass = np.zeros(nc3, dtype=np.float32)
         cell_com = np.zeros((nc3, 3), dtype=np.float32)
         cell_hsml = np.zeros(nc3, dtype=np.float32)
         cell_qty = np.zeros(nc3, dtype=np.float32)
+        # Also store mass-weighted x^2 sums for variance computation at coarser levels
+        cell_mx2 = np.zeros((nc3, 3), dtype=np.float32)
+        cell_mh2 = np.zeros(nc3, dtype=np.float32)
 
         if len(reduce_at) > 0:
             mass_ne = np.add.reduceat(s_m, reduce_at)
             safe = np.maximum(mass_ne, 1e-30)
-
             mp_ne = np.add.reduceat(s_p * s_m[:, None], reduce_at)
             mq_ne = np.add.reduceat(s_m * s_q, reduce_at)
             mh2_ne = np.add.reduceat(s_m * s_h ** 2, reduce_at)
@@ -100,11 +93,11 @@ class SpatialGrid:
             cell_mass[ne_idx] = mass_ne
             cell_com[ne_idx] = com_ne
             cell_qty[ne_idx] = mq_ne / safe
-            # h = sqrt(spatial_variance + mean_h^2), floored to cell half-diagonal
+            cell_mx2[ne_idx] = mp2_ne
+            cell_mh2[ne_idx] = mh2_ne
             h_ne = np.sqrt(np.maximum(var_ne + mh2_ne / safe, 0))
             cell_hsml[ne_idx] = np.maximum(h_ne, np.linalg.norm(cs) * 0.5)
 
-        # Cell centers
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
         cz = np.arange(nc, dtype=np.float32) * cs[2] + self.pmin[2] + cs[2] * 0.5
@@ -113,8 +106,58 @@ class SpatialGrid:
 
         return {
             "nc": nc, "cs": cs,
-            "cell_start": cell_start, "sort_order": order,
             "mass": cell_mass, "com": cell_com, "hsml": cell_hsml, "qty": cell_qty,
+            "mx2": cell_mx2, "mh2": cell_mh2,  # for coarsening
+            "cell_start": self.cell_start, "sort_order": self.sort_order,
+            "centers": centers,
+            "half_diag": float(np.linalg.norm(cs) * 0.5),
+        }
+
+    def _coarsen(self, child):
+        """Build a coarser level by merging 2x2x2 groups of child cells."""
+        cnc = child["nc"]
+        nc = cnc // 2
+        cs = child["cs"] * 2
+        nc3 = nc ** 3
+
+        # Map child cell (ix, iy, iz) -> parent cell (ix//2, iy//2, iz//2)
+        cix = np.arange(cnc)
+        ciy = np.arange(cnc)
+        ciz = np.arange(cnc)
+        gx, gy, gz = np.meshgrid(cix, ciy, ciz, indexing='ij')
+        parent_id = (gx.ravel() // 2) * nc * nc + (gy.ravel() // 2) * nc + (gz.ravel() // 2)
+
+        # Sum child properties into parent cells
+        cell_mass = np.zeros(nc3, dtype=np.float32)
+        cell_mp = np.zeros((nc3, 3), dtype=np.float32)
+        cell_mq = np.zeros(nc3, dtype=np.float32)
+        cell_mx2 = np.zeros((nc3, 3), dtype=np.float32)
+        cell_mh2 = np.zeros(nc3, dtype=np.float32)
+
+        np.add.at(cell_mass, parent_id, child["mass"])
+        for d in range(3):
+            np.add.at(cell_mp[:, d], parent_id, child["mass"] * child["com"][:, d])
+            np.add.at(cell_mx2[:, d], parent_id, child["mx2"][:, d])
+        np.add.at(cell_mq, parent_id, child["mass"] * child["qty"])
+        np.add.at(cell_mh2, parent_id, child["mh2"])
+
+        safe = np.maximum(cell_mass, 1e-30)
+        cell_com = cell_mp / safe[:, None]
+        cell_qty = cell_mq / safe
+        var = (cell_mx2 / safe[:, None] - cell_com ** 2).sum(axis=1)
+        h = np.sqrt(np.maximum(var + cell_mh2 / safe, 0))
+        cell_hsml = np.maximum(h, np.linalg.norm(cs) * 0.5)
+
+        cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
+        cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
+        cz = np.arange(nc, dtype=np.float32) * cs[2] + self.pmin[2] + cs[2] * 0.5
+        gx2, gy2, gz2 = np.meshgrid(cx, cy, cz, indexing='ij')
+        centers = np.stack([gx2.ravel(), gy2.ravel(), gz2.ravel()], axis=1)
+
+        return {
+            "nc": nc, "cs": cs,
+            "mass": cell_mass, "com": cell_com, "hsml": cell_hsml, "qty": cell_qty,
+            "mx2": cell_mx2, "mh2": cell_mh2,
             "centers": centers,
             "half_diag": float(np.linalg.norm(cs) * 0.5),
         }
