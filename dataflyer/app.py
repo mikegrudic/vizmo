@@ -227,7 +227,7 @@ class DataFlyerApp:
             self.renderer.log_scale = 1 - self.renderer.log_scale
             scale_name = "log" if self.renderer.log_scale else "linear"
             print(f"Scale: {scale_name}")
-            self._auto_range_from_framebuffer()
+            self._needs_auto_range = True
             return
 
         # P: screenshot
