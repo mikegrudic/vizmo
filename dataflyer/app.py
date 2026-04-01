@@ -169,7 +169,7 @@ class DataFlyerApp:
 
         # Tab: cycle quantity
         if key == glfw.KEY_TAB:
-            self._cycle_quantity(1 if not (mods & glfw.MOD_SHIFT) else -1)
+            self._cycle_quantity(1)
             return
 
         # 1-9: direct quantity selection
@@ -188,17 +188,17 @@ class DataFlyerApp:
 
         # C: cycle colormap
         if key == glfw.KEY_C:
-            self._cycle_colormap(1 if not (mods & glfw.MOD_SHIFT) else -1)
+            self._cycle_colormap(1)
             return
 
         # Left/Right: navigate snapshots
         if key == glfw.KEY_RIGHT and len(self._snap_list) > 1:
-            step = 10 if (mods & glfw.MOD_SHIFT) else 1
+            step = 1
             self._snap_idx = min(self._snap_idx + step, len(self._snap_list) - 1)
             self._load_snapshot(self._snap_list[self._snap_idx])
             return
         if key == glfw.KEY_LEFT and len(self._snap_list) > 1:
-            step = 10 if (mods & glfw.MOD_SHIFT) else 1
+            step = 1
             self._snap_idx = max(self._snap_idx - step, 0)
             self._load_snapshot(self._snap_list[self._snap_idx])
             return
@@ -307,13 +307,13 @@ class DataFlyerApp:
         print("\n--- DataFlyer Controls ---")
         print("  LMB+drag : Look around")
         print("  WASD     : Move")
-        print("  Space    : Up  |  Shift : Down")
+        print("  Z/X      : Up / Down")
         print("  Q/E      : Roll")
         print("  Scroll   : Adjust fly speed")
-        print("  Left/Right: Previous/next snapshot (Shift: skip 10)")
+        print("  Left/Right: Previous/next snapshot")
         print("  1-9      : Select quantity directly")
-        print("  Tab      : Next quantity  |  Shift+Tab : Previous")
-        print("  C        : Next colormap  |  Shift+C   : Previous")
+        print("  Tab      : Next quantity")
+        print("  C        : Next colormap")
         print("  +/-      : Contract/expand dynamic range")
         print("  [/]      : More/less LOD detail")
         print("  </>      : Fewer/more max particles")

@@ -86,9 +86,9 @@ class Camera:
             velocity -= self.right
         if glfw.KEY_D in self._keys:
             velocity += self.right
-        if glfw.KEY_SPACE in self._keys:
+        if glfw.KEY_Z in self._keys:
             velocity += self.up
-        if glfw.KEY_LEFT_SHIFT in self._keys:
+        if glfw.KEY_X in self._keys:
             velocity -= self.up
 
         if np.dot(velocity, velocity) > 0:
