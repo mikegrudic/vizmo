@@ -9,12 +9,13 @@ SHADER_DIR = Path(__file__).parent / "shaders"
 
 
 @njit(parallel=True, cache=True)
-def _gather_subsampled(cell_start, sort_order, vis_cells, budget):
-    """Gather particle indices from visible cells, subsampling within each cell.
+def _gather_subsampled_direct(cell_start, vis_cells, budget,
+                               s_pos, s_hsml, s_mass, s_qty):
+    """Gather particle data from visible cells directly from pre-sorted arrays.
 
-    Instead of gathering all visible particles then striding, we compute
-    the stride per-cell and only gather the particles we'll keep.
-    Returns (indices, n_visible_total) where indices are into the original arrays.
+    Subsamples within each cell to stay within budget. Reads are sequential
+    within each cell (cache-friendly). No visit to the full particle array.
+    Returns (pos, hsml, mass, qty, n_visible_total).
     """
     n_cells = len(vis_cells)
 
@@ -25,28 +26,33 @@ def _gather_subsampled(cell_start, sort_order, vis_cells, budget):
         total += cell_start[c + 1] - cell_start[c]
 
     # Compute global stride
-    if total <= budget:
-        stride = 1
-    else:
-        stride = max(1, total // budget)
+    stride = np.int64(1)
+    if total > budget:
+        stride = max(np.int64(1), total // budget)
 
-    # Second pass: count how many we'll keep per cell
+    # Second pass: count output per cell and total
     out_counts = np.empty(n_cells, dtype=np.int64)
     out_total = np.int64(0)
     for i in range(n_cells):
         c = vis_cells[i]
         n = cell_start[c + 1] - cell_start[c]
-        kept = (n + stride - 1) // stride  # ceil division
+        kept = (n + stride - 1) // stride
         out_counts[i] = kept
         out_total += kept
 
-    # Third pass: parallel gather with stride
+    # Prefix sum for output offsets
     out_offsets = np.empty(n_cells, dtype=np.int64)
     out_offsets[0] = 0
     for i in range(1, n_cells):
         out_offsets[i] = out_offsets[i - 1] + out_counts[i - 1]
 
-    result = np.empty(out_total, dtype=np.int64)
+    # Allocate output
+    o_pos = np.empty((out_total, 3), dtype=np.float32)
+    o_hsml = np.empty(out_total, dtype=np.float32)
+    o_mass = np.empty(out_total, dtype=np.float32)
+    o_qty = np.empty(out_total, dtype=np.float32)
+
+    # Parallel gather: each cell copies its strided particles sequentially
     for i in prange(n_cells):
         c = vis_cells[i]
         start = cell_start[c]
@@ -54,10 +60,15 @@ def _gather_subsampled(cell_start, sort_order, vis_cells, budget):
         out_start = out_offsets[i]
         j = 0
         for k in range(start, end, stride):
-            result[out_start + j] = sort_order[k]
+            o_pos[out_start + j, 0] = s_pos[k, 0]
+            o_pos[out_start + j, 1] = s_pos[k, 1]
+            o_pos[out_start + j, 2] = s_pos[k, 2]
+            o_hsml[out_start + j] = s_hsml[k]
+            o_mass[out_start + j] = s_mass[k]
+            o_qty[out_start + j] = s_qty[k]
             j += 1
 
-    return result, total
+    return o_pos, o_hsml, o_mass, o_qty, total
 
 # Maximum particles to render per frame for interactive performance
 MAX_RENDER_PARTICLES = 4_000_000
@@ -96,6 +107,15 @@ class SpatialGrid:
         unique_cells, counts = np.unique(sorted_cell_id, return_counts=True)
         self.cell_start[unique_cells + 1] = counts
         np.cumsum(self.cell_start, out=self.cell_start)
+
+        # Store particle data in cell-sorted order for cache-friendly access.
+        # After this, cell_start indices point directly into these arrays
+        # with no indirection through sort_order.
+        so = self.sort_order
+        self.sorted_pos = positions[so].astype(np.float32)
+        self.sorted_hsml = hsml[so].astype(np.float32)
+        self.sorted_mass = masses[so].astype(np.float32)
+        self.sorted_qty = quantity[so].astype(np.float32)
 
         # Build finest level from particles
         finest = self._build_finest(positions, masses, hsml, quantity, n_cells, box)
@@ -221,13 +241,16 @@ class SpatialGrid:
             "half_diag": float(np.linalg.norm(cs) * 0.5),
         }
 
-    def query_frustum_lod(self, camera, positions, hsml, masses, quantity,
-                          max_particles, lod_pixels=4):
+    def query_frustum_lod(self, camera, max_particles, lod_pixels=4):
         """Top-down multi-level LOD query. Returns (pos, hsml, mass, qty) arrays.
+
+        All data comes from pre-sorted arrays built at grid construction time.
+        No per-query access to the full particle arrays.
 
         Traverses coarsest-to-finest. Cells subtending <= lod_pixels emit a
         summary splat (at CoM with variance-based h). Cells subtending more
-        are refined to children. At the finest level, real particles are emitted.
+        are refined to children. At the finest level, real particles are emitted
+        via numba parallel gather from the pre-sorted arrays.
 
         When the particle budget is exceeded, real particles are subsampled
         with mass and h rescaled to conserve the mass distribution.
@@ -242,7 +265,10 @@ class SpatialGrid:
 
         finest = self.levels[0]
         summary_parts = []
-        all_real = np.array([], dtype=np.int64)
+        real_pos = None
+        real_hsml = None
+        real_mass = None
+        real_qty = None
         n_visible_real = 0
 
         # Start from coarsest level
@@ -327,22 +353,23 @@ class SpatialGrid:
                 if len(vis_cells) > 0:
                     n_summaries = sum(p[0].shape[0] for p in summary_parts) if summary_parts else 0
                     budget = max(max_particles - n_summaries, max_particles // 2)
-                    all_real, n_visible_real = _gather_subsampled(
-                        finest["cell_start"], finest["sort_order"],
-                        vis_cells.astype(np.int64), budget,
-                    )
+                    real_pos, real_hsml, real_mass, real_qty, n_visible_real = \
+                        _gather_subsampled_direct(
+                            finest["cell_start"], vis_cells.astype(np.int64), budget,
+                            self.sorted_pos, self.sorted_hsml,
+                            self.sorted_mass, self.sorted_qty,
+                        )
             else:
                 refine_cells = child_flat[large]
 
         # Compute mass/h rescaling from subsampling ratio
         n_visible_real = int(n_visible_real)
+        n_sampled = len(real_pos) if real_pos is not None else 0
 
-        mass_scale = 1.0
-        h_scale = 1.0
-        if len(all_real) > 0 and n_visible_real > len(all_real):
-            ratio = n_visible_real / len(all_real)
-            mass_scale = ratio
-            h_scale = ratio ** (1.0 / 3.0)
+        if n_sampled > 0 and n_visible_real > n_sampled:
+            ratio = n_visible_real / n_sampled
+            real_mass = real_mass * ratio
+            real_hsml = real_hsml * (ratio ** (1.0 / 3.0))
 
         # Assemble output
         parts_pos = []
@@ -350,16 +377,11 @@ class SpatialGrid:
         parts_mass = []
         parts_qty = []
 
-        if len(all_real) > 0:
-            parts_pos.append(positions[all_real])
-            rh = hsml[all_real]
-            rm = masses[all_real]
-            if h_scale != 1.0:
-                rh = rh * h_scale
-                rm = rm * mass_scale
-            parts_hsml.append(rh)
-            parts_mass.append(rm)
-            parts_qty.append(quantity[all_real])
+        if n_sampled > 0:
+            parts_pos.append(real_pos)
+            parts_hsml.append(real_hsml)
+            parts_mass.append(real_mass)
+            parts_qty.append(real_qty)
 
         for sp_com, sp_h, sp_m, sp_q in summary_parts:
             parts_pos.append(sp_com)
@@ -488,8 +510,7 @@ class SplatRenderer:
 
         if self._grid is not None:
             pos, hsml, mass, qty = self._grid.query_frustum_lod(
-                camera, self._all_pos, self._all_hsml, self._all_mass, self._all_qty,
-                self.max_render_particles, lod_pixels=self.lod_pixels,
+                camera, self.max_render_particles, lod_pixels=self.lod_pixels,
             )
             self._upload_arrays(pos, hsml, mass, qty)
         else:
