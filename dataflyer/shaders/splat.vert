@@ -22,16 +22,12 @@ void main() {
     // Transform particle center to view space
     vec4 view_center = u_view * vec4(in_position, 1.0);
 
-    // Project center to clip space to determine pixel scale
+    // Clamp billboard to at least 2 pixels in screen space
     vec4 clip_center = u_proj * view_center;
-
-    // Compute the effective h: clamp to at least 2 pixels in screen space.
-    // A displacement of h in view space maps to (h / |clip.w|) * proj[0][0] * viewport/2 pixels.
-    // So min_h_view = 2.0 * |clip.w| / (proj[0][0] * viewport.x / 2)
     float min_h = 2.0 * abs(clip_center.w) / (u_proj[0][0] * u_viewport_size.x * 0.5);
     float h = max(in_hsml, min_h);
 
-    // Billboard: offset in camera-aligned x/y
+    // Billboard: offset in camera-aligned x/y (view space)
     vec4 view_pos = view_center;
     view_pos.xy += in_corner * h;
 
@@ -39,6 +35,6 @@ void main() {
 
     v_offset = in_corner;
     v_mass = in_mass;
-    v_hsml = h;  // pass the clamped h so fragment shader normalizes correctly
+    v_hsml = h;
     v_quantity = in_quantity;
 }

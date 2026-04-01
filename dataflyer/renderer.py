@@ -248,28 +248,26 @@ class SplatRenderer:
         if len(vals) == 0:
             return self.qty_min, self.qty_max
 
-        if self.log_scale:
-            # Filter to positive values for log scale
-            pos = vals[vals > 0]
-            if len(pos) == 0:
-                # All values non-positive: fall back to linear
-                self.log_scale = 0
-                lo = float(np.percentile(vals, 0.5))
-                hi = float(np.percentile(vals, 99.5))
-            else:
-                log_vals = np.log10(pos)
-                lo = float(np.percentile(log_vals, 0.5))
-                hi = float(np.percentile(log_vals, 99.5))
-                if hi - lo < 0.1:
-                    mid = (hi + lo) / 2
-                    lo, hi = mid - 1, mid + 1
-        else:
-            lo = float(np.percentile(vals, 0.5))
-            hi = float(np.percentile(vals, 99.5))
+        # Mass-weighted CDF limits (matches SinkVis):
+        # find values that enclose 1% and 99% of total integrated signal
+        sorted_vals = np.sort(vals)
+        cdf = sorted_vals.cumsum() / sorted_vals.sum()
+        lim_lo = float(np.interp(0.01, cdf, sorted_vals))
+        lim_hi = float(np.interp(0.99, cdf, sorted_vals))
 
-        if hi - lo < 1e-30:
-            mid = (hi + lo) / 2
-            lo, hi = mid - 1, mid + 1
+        if self.log_scale:
+            if lim_lo <= 0:
+                lim_lo = float(sorted_vals[sorted_vals > 0].min()) if (sorted_vals > 0).any() else 1e-10
+            lo = float(np.log10(max(lim_lo, 1e-30)))
+            hi = float(np.log10(max(lim_hi, 1e-30)))
+            if hi - lo < 0.1:
+                mid = (hi + lo) / 2
+                lo, hi = mid - 1, mid + 1
+        else:
+            lo, hi = lim_lo, lim_hi
+            if hi - lo < 1e-30:
+                mid = (hi + lo) / 2
+                lo, hi = mid - 1, mid + 1
 
         return lo, hi
 
