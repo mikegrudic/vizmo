@@ -597,7 +597,7 @@ class SplatRenderer:
         self.max_render_particles = MAX_RENDER_PARTICLES
         self.use_tree = True
         self.use_importance_sampling = False
-        self.KERNELS = ["cubic_spline", "wendland_c2", "gaussian", "quartic"]
+        self.KERNELS = ["cubic_spline", "wendland_c2", "gaussian", "quartic", "sphere"]
         self.kernel = "cubic_spline"
 
     def set_particles(self, positions, hsml, masses, quantity=None):

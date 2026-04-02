@@ -8,7 +8,7 @@ in float v_quantity;
 layout(location = 0) out float out_numerator;
 layout(location = 1) out float out_denominator;
 
-uniform int u_kernel;  // 0: cubic spline, 1: Wendland C2, 2: Gaussian, 3: quartic
+uniform int u_kernel;  // 0: cubic spline, 1: Wendland C2, 2: Gaussian, 3: quartic, 4: sphere
 
 float eval_kernel(float r) {
     if (r > 1.0) return 0.0;
@@ -22,6 +22,9 @@ float eval_kernel(float r) {
     if (u_kernel == 3) {
         float a = 1.0 - r * r;
         return a * a * 0.9549296586;
+    }
+    if (u_kernel == 4) {
+        return sqrt(1.0 - r * r) * 0.4774648293;
     }
     // 0: cubic spline (default)
     float k;
