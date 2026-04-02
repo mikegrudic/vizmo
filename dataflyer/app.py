@@ -577,6 +577,116 @@ class DataFlyerApp:
         glfw.swap_buffers(self.window)
         self._cleanup()
 
+    def run_benchmark(self, n_frames=100):
+        """Scripted benchmark: fly a camera path, measure real frame times, print stats."""
+        import numpy as np
+
+        boxsize = self.data.header.get("BoxSize", None)
+        if boxsize is None:
+            extent = np.linalg.norm(
+                self.data.positions.max(axis=0) - self.data.positions.min(axis=0)
+            )
+        else:
+            extent = float(boxsize)
+        center = self.camera.position.copy()
+
+        # Build a camera path: orbit around the data center
+        angles = np.linspace(0, 2 * np.pi, n_frames, endpoint=False)
+        radius = extent * 0.6
+        orbit_center = center.copy()
+        orbit_center[2] -= radius  # start looking at center from current position
+
+        # Auto-range first
+        fb_width, fb_height = glfw.get_framebuffer_size(self.window)
+        self.ctx.viewport = (0, 0, fb_width, fb_height)
+        self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+        self.ctx.screen.use()
+        self.renderer.render(self.camera, fb_width, fb_height)
+        self._auto_range_from_framebuffer()
+
+        # Warmup: 10 frames
+        for i in range(10):
+            theta = angles[i % len(angles)]
+            self.camera.position = np.array([
+                orbit_center[0] + radius * np.sin(theta),
+                orbit_center[1],
+                orbit_center[2] + radius * np.cos(theta),
+            ], dtype=np.float32)
+            self.camera._forward = (orbit_center - self.camera.position)
+            self.camera._forward /= np.linalg.norm(self.camera._forward)
+            self.camera._dirty = True
+
+            self.renderer.update_visible(self.camera)
+            self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+            self.ctx.screen.use()
+            self.renderer.render(self.camera, fb_width, fb_height)
+            glfw.swap_buffers(self.window)
+            glfw.poll_events()
+
+        # Timed run
+        frame_times = []
+        cull_times = []
+        t_prev = time.perf_counter()
+
+        for i in range(n_frames):
+            if glfw.window_should_close(self.window):
+                break
+
+            theta = angles[i]
+            self.camera.position = np.array([
+                orbit_center[0] + radius * np.sin(theta),
+                orbit_center[1],
+                orbit_center[2] + radius * np.cos(theta),
+            ], dtype=np.float32)
+            self.camera._forward = (orbit_center - self.camera.position)
+            self.camera._forward /= np.linalg.norm(self.camera._forward)
+            self.camera._dirty = True
+
+            t0 = time.perf_counter()
+            self.renderer.update_visible(self.camera)
+            cull_times.append((time.perf_counter() - t0) * 1000)
+
+            fb_width, fb_height = glfw.get_framebuffer_size(self.window)
+            self.ctx.viewport = (0, 0, fb_width, fb_height)
+            self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+            self.ctx.screen.use()
+            self.renderer.render(self.camera, fb_width, fb_height)
+
+            # Overlays
+            self.user_menu.set_framebuffer_size(fb_width, fb_height)
+            self.user_menu.update(
+                self.renderer,
+                AVAILABLE_COLORMAPS[self._cmap_idx], AVAILABLE_COLORMAPS,
+                sd_fields=self._sd_fields, sd_field=self._sd_field,
+                sd_field2=self._sd_field2, sd_op=self._sd_op, sd_ops=self._SD_OPS,
+            )
+            self.user_menu.render()
+
+            glfw.swap_buffers(self.window)
+            glfw.poll_events()
+
+            now = time.perf_counter()
+            frame_times.append((now - t_prev) * 1000)
+            t_prev = now
+
+        frame_times = np.array(frame_times)
+        cull_times = np.array(cull_times)
+        fps = 1000.0 / frame_times
+
+        print(f"\n--- Benchmark Results ({len(frame_times)} frames) ---")
+        print(f"  Frame time:  median={np.median(frame_times):.1f}ms  "
+              f"p5={np.percentile(frame_times, 5):.1f}ms  "
+              f"p95={np.percentile(frame_times, 95):.1f}ms")
+        print(f"  FPS:         median={np.median(fps):.0f}  "
+              f"p5={np.percentile(fps, 5):.0f}  "
+              f"p95={np.percentile(fps, 95):.0f}")
+        print(f"  Cull time:   median={np.median(cull_times):.1f}ms  "
+              f"p95={np.percentile(cull_times, 95):.1f}ms")
+        print(f"  Particles:   {self.renderer.n_total:,} total")
+        print("-----------------------------------\n")
+
+        self._cleanup()
+
     def _cleanup(self):
         self.overlay.release()
         self.user_menu.release()
@@ -595,11 +705,15 @@ def main():
     parser.add_argument("--fov", type=float, default=90.0, help="Field of view in degrees")
     parser.add_argument("--screenshot", type=str, default=None,
                         help="Render one frame to this file and exit")
+    parser.add_argument("--benchmark", type=int, default=None, metavar="N",
+                        help="Run N-frame scripted benchmark and exit")
     args = parser.parse_args()
 
     app = DataFlyerApp(args.snapshot, width=args.width, height=args.height, fov=args.fov)
     if args.screenshot:
         app.render_one_frame(args.screenshot)
+    elif args.benchmark is not None:
+        app.run_benchmark(n_frames=args.benchmark)
     else:
         app.run()
 
