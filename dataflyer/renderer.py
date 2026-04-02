@@ -368,11 +368,18 @@ class SpatialGrid:
         rights = centers @ cam_right - np.dot(cam_pos, cam_right)
         ups = centers @ cam_up - np.dot(cam_pos, cam_up)
 
-        # No frustum culling -- render everything. GPU clips off-screen
-        # fragments. Culling was dropping visible particles at edges and
-        # behind camera when inside the data volume.
+        hd = lv["half_diag"]
+        half_tan = np.tan(fov_rad / 2)
         has_mass = lv["mass"] > 0
-        visible = has_mass
+        # Frustum test: a cell is visible if any part of it *could* be on screen.
+        # The cell extends ±hd from its center. The visible half-width at depth d
+        # is d*tan(fov/2). Account for cell extent on both sides.
+        front_depth = np.maximum(depths + hd, 0)  # nearest front face of cell
+        lim_h = front_depth * half_tan * camera.aspect + hd
+        lim_v = front_depth * half_tan + hd
+        # Cell must have at least some part in front of camera
+        in_front = depths > -(hd + lv["hsml"])  # include kernel radius
+        visible = has_mass & in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
 
         dist = np.sqrt(depths**2 + rights**2 + ups**2)
         safe_dist = np.maximum(dist, 0.01)
@@ -418,7 +425,9 @@ class SpatialGrid:
             rights = centers @ cam_right - np.dot(cam_pos, cam_right)
             ups = centers @ cam_up - np.dot(cam_pos, cam_up)
 
-            vis = np.ones(len(depths), dtype=bool)  # no culling
+            # No frustum culling at child levels -- parent was already visible.
+            # Only use opening criterion (h_pix) for LOD decisions.
+            vis = np.ones(len(depths), dtype=bool)
 
             dist = np.sqrt(depths**2 + rights**2 + ups**2)
             safe_dist = np.maximum(dist, 0.01)
