@@ -70,6 +70,77 @@ def _load_shader(name):
 from .spatial_grid import SpatialGrid  # noqa: E402
 
 
+class ParticleLayer:
+    """A renderable particle type with its own shader, buffers, and render method.
+
+    Decouples particle types from the main renderer. New types (dark matter,
+    sinks, dust) can be added by creating a ParticleLayer without modifying
+    SplatRenderer.
+    """
+
+    def __init__(self, ctx, program, uniforms=None):
+        """
+        Args:
+            ctx: ModernGL context
+            program: Compiled shader program
+            uniforms: Dict of uniform name -> value to set before rendering
+        """
+        self.ctx = ctx
+        self.program = program
+        self.uniforms = uniforms or {}
+        self.bufs = BufferSet(ctx)
+        self.vao = None
+        self.n_particles = 0
+        self.visible = True
+        self.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.render_mode = moderngl.POINTS
+        self.point_size = True  # enable PROGRAM_POINT_SIZE
+
+    def upload(self, vao_spec, n_particles):
+        """Upload buffers and build VAO.
+
+        Args:
+            vao_spec: List of (buffer_name, format, *attrib_names) for vertex_array
+            n_particles: Number of particles
+        """
+        if self.vao is not None:
+            self.vao.release()
+        self.n_particles = n_particles
+        if n_particles == 0:
+            self.vao = None
+            return
+        content = []
+        for spec in vao_spec:
+            buf_name = spec[0]
+            fmt = spec[1]
+            attribs = spec[2:]
+            content.append((self.bufs.get(buf_name), fmt, *attribs))
+        self.vao = self.ctx.vertex_array(self.program, content)
+
+    def render(self, view_bytes, proj_bytes):
+        """Render this layer. view_bytes and proj_bytes are column-major mat4."""
+        if not self.visible or self.vao is None or self.n_particles == 0:
+            return
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = self.blend_func
+        if self.point_size:
+            self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+
+        self.program["u_view"].write(view_bytes)
+        self.program["u_proj"].write(proj_bytes)
+        for name, value in self.uniforms.items():
+            self.program[name].value = value
+
+        self.vao.render(self.render_mode)
+        self.ctx.disable(moderngl.BLEND)
+
+    def release(self):
+        if self.vao is not None:
+            self.vao.release()
+            self.vao = None
+        self.bufs.release_all()
+
+
 class BufferSet:
     """Manages a named group of GPU buffers with automatic lifecycle."""
 
@@ -181,12 +252,9 @@ class SplatRenderer:
             [(self.fs_quad_vbo, "2f", "in_position")],
         )
 
-        # Star particle buffers
-        self.star_pos_vbo = None
-        self.star_mass_vbo = None
-        self.vao_star = None
+        # Star particle layer
+        self.star_layer = ParticleLayer(ctx, self.prog_star, {"u_point_size": 50.0})
         self.n_stars = 0
-        self.star_point_size = 50.0
 
         # Colormap texture (set externally)
         self.colormap_tex = None
@@ -230,6 +298,24 @@ class SplatRenderer:
             print(f"  Spatial grid built in {time.perf_counter()-t0:.1f}s")
         else:
             self._grid = None
+
+    def update_weights(self, masses, quantity=None):
+        """Update weight/quantity arrays without rebuilding grid structure.
+
+        Much faster than set_particles() when only the weight field changes
+        (skips argsort + cell assignment). Positions and hsml are unchanged.
+        """
+        self._all_mass = masses.astype(np.float32)
+        if quantity is None:
+            quantity = masses
+        self._all_qty = quantity.astype(np.float32)
+
+        if self._grid is not None:
+            import time
+            t0 = time.perf_counter()
+            self._grid.update_weights(masses, quantity)
+            print(f"  Grid re-weighted in {time.perf_counter()-t0:.1f}s")
+        # No need to rebuild _grid from scratch — structure is position-only
 
     def update_visible(self, camera):
         """Cull and upload only visible particles for this frame."""
@@ -414,23 +500,11 @@ class SplatRenderer:
         self.n_stars = len(masses)
         if self.n_stars == 0:
             return
-
-        for attr in ("star_pos_vbo", "star_mass_vbo"):
-            old = getattr(self, attr, None)
-            if old is not None:
-                old.release()
-
-        self.star_pos_vbo = self.ctx.buffer(positions.astype(np.float32).tobytes())
-        self.star_mass_vbo = self.ctx.buffer(masses.astype(np.float32).tobytes())
-
-        if self.vao_star is not None:
-            self.vao_star.release()
-        self.vao_star = self.ctx.vertex_array(
-            self.prog_star,
-            [
-                (self.star_pos_vbo, "3f", "in_position"),
-                (self.star_mass_vbo, "f", "in_mass"),
-            ],
+        self.star_layer.bufs.upload("pos", positions.astype(np.float32))
+        self.star_layer.bufs.upload("mass", masses.astype(np.float32))
+        self.star_layer.upload(
+            [("pos", "3f", "in_position"), ("mass", "f", "in_mass")],
+            self.n_stars,
         )
 
     def _build_vao(self):
@@ -544,17 +618,7 @@ class SplatRenderer:
         self.vao_resolve.render(moderngl.TRIANGLE_STRIP, vertices=4)
 
         # Pass 3: render star particles on top
-        if self.n_stars > 0 and self.vao_star is not None:
-            self.ctx.enable(moderngl.BLEND)
-            self.ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
-            self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
-
-            self.prog_star["u_view"].write(view.tobytes())
-            self.prog_star["u_proj"].write(proj.tobytes())
-            self.prog_star["u_point_size"].value = self.star_point_size
-
-            self.vao_star.render(moderngl.POINTS)
-            self.ctx.disable(moderngl.BLEND)
+        self.star_layer.render(view.tobytes(), proj.tobytes())
 
     def read_accum_range(self):
         """Read back the accumulation textures and compute percentile range."""
@@ -600,9 +664,8 @@ class SplatRenderer:
             "pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo",
             "big_pos_vbo", "big_hsml_vbo", "big_mass_vbo", "big_qty_vbo",
             "quad_vbo", "quad_ibo", "fs_quad_vbo",
-            "star_pos_vbo", "star_mass_vbo",
             "aniso_pos_vbo", "aniso_mass_vbo", "aniso_qty_vbo", "aniso_cov_vbo",
-            "vao_additive", "vao_quad", "vao_aniso", "vao_resolve", "vao_star",
+            "vao_additive", "vao_quad", "vao_aniso", "vao_resolve",
             "prog_additive", "prog_quad", "prog_aniso", "prog_resolve", "prog_star",
             "_accum_fbo", "_accum_tex_num", "_accum_tex_den",
         ):
@@ -612,3 +675,4 @@ class SplatRenderer:
                     obj.release()
                 except Exception:
                     pass
+        self.star_layer.release()

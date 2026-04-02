@@ -187,13 +187,11 @@ class DataFlyerApp:
         return w
 
     def _rebuild_sd_weights(self):
-        """Recompute weights from current field settings and rebuild."""
+        """Recompute weights from current field settings, re-weight grid (fast)."""
         weights = self._compute_weights()
         self._render_mode = RenderMode.surface_density(self._sd_field)
         self.renderer.resolve_mode = self._render_mode.resolve_mode
-        self.renderer.set_particles(
-            self.data.positions, self.data.hsml, weights,
-        )
+        self.renderer.update_weights(weights)
         self.renderer.update_visible(self.camera)
         self._needs_auto_range = True
 
