@@ -79,13 +79,35 @@ class DataFlyerApp:
         self._sd_field2 = "None"  # optional second field
         self._sd_op = "*"  # operation between field1 and field2
         self._SD_OPS = ["*", "+", "-", "/", "min", "max"]
-        self._RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance"]
+        self._RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance", "Composite"]
         self._render_mode_name = "SurfaceDensity"
         self._wa_data_field = "Masses"  # data field for WeightedAverage
         self._VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
         self._vector_projection = "LOS"  # active projection for vector data fields
         self._los_camera_fwd = None  # camera forward at last LOS recompute
         self._render_mode = RenderMode.surface_density("Masses")
+
+        # Composite mode: slot 0 = lightness, slot 1 = color
+        # Defaults match CrunchSnaps CoolMap: lightness=SurfaceDensity(Masses),
+        # color=WeightedVariance(Velocities LOS) i.e. 1D velocity dispersion
+        self._composite = False
+        _has_vel = "Velocities" in self._vector_fields
+        self._slot = [
+            {  # slot 0: lightness — surface density of Masses (log)
+                "mode": "SurfaceDensity", "weight": "Masses", "data": "Masses",
+                "weight2": "None", "op": "*", "proj": "LOS",
+                "min": -1.0, "max": 3.0, "log": 1, "resolve": 0,
+            },
+            {  # slot 1: color — 1D velocity dispersion (log)
+                "mode": "WeightedVariance" if _has_vel else "SurfaceDensity",
+                "weight": "Masses",
+                "data": "Velocities" if _has_vel else "Masses",
+                "weight2": "None", "op": "*",
+                "proj": "LOS",
+                "min": -1.0, "max": 3.0, "log": 1,
+                "resolve": 2 if _has_vel else 0,
+            },
+        ]
 
         # Store particles and upload (with culling for large datasets)
         weights = self._compute_weights()
@@ -241,6 +263,13 @@ class DataFlyerApp:
 
     def _apply_render_mode(self, auto_range=True):
         """Rebuild render mode from current settings and re-weight the grid."""
+        self._composite = (self._render_mode_name == "Composite")
+        if self._composite:
+            self._render_mode = RenderMode(
+                name="Composite", weight_field="", qty_field="", resolve_mode=-1)
+            # Don't update weights here — composite renders do it per-slot
+            return
+
         if self._render_mode_name in ("WeightedAverage", "WeightedVariance"):
             weights = self._project_field(self._sd_field)
             qty = self._project_field(self._wa_data_field)
@@ -260,6 +289,90 @@ class DataFlyerApp:
         self.renderer.update_visible(self.camera)
         if auto_range:
             self._needs_auto_range = True
+
+    def _compute_slot(self, slot):
+        """Compute weights and qty arrays for a composite slot dict."""
+        import numpy as np
+        s = slot
+        w_name = s["weight"]
+        if w_name in self._vector_fields:
+            vec = self.data.get_vector_field(w_name)
+            proj = s["proj"]
+            if proj == "LOS":
+                weights = (vec @ self.camera.forward).astype(np.float32)
+            elif proj == "|v|":
+                weights = np.linalg.norm(vec, axis=1).astype(np.float32)
+            else:
+                weights = (vec * vec).sum(axis=1).astype(np.float32)
+        else:
+            weights = self.data.get_field(w_name)
+            if s["weight2"] != "None":
+                w2_name = s["weight2"]
+                if w2_name in self._vector_fields:
+                    vec = self.data.get_vector_field(w2_name)
+                    proj = s["proj"]
+                    if proj == "LOS":
+                        w2 = (vec @ self.camera.forward).astype(np.float32)
+                    elif proj == "|v|":
+                        w2 = np.linalg.norm(vec, axis=1).astype(np.float32)
+                    else:
+                        w2 = (vec * vec).sum(axis=1).astype(np.float32)
+                else:
+                    w2 = self.data.get_field(w2_name)
+                op = s["op"]
+                if op == "*": weights = weights * w2
+                elif op == "+": weights = weights + w2
+                elif op == "-": weights = weights - w2
+                elif op == "/": weights = weights / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
+                elif op == "min": weights = np.minimum(weights, w2)
+                elif op == "max": weights = np.maximum(weights, w2)
+
+        if s["mode"] in ("WeightedAverage", "WeightedVariance"):
+            d_name = s["data"]
+            if d_name in self._vector_fields:
+                vec = self.data.get_vector_field(d_name)
+                proj = s["proj"]
+                if proj == "LOS":
+                    qty = (vec @ self.camera.forward).astype(np.float32)
+                elif proj == "|v|":
+                    qty = np.linalg.norm(vec, axis=1).astype(np.float32)
+                else:
+                    qty = (vec * vec).sum(axis=1).astype(np.float32)
+            else:
+                qty = self.data.get_field(d_name)
+        else:
+            qty = None
+
+        resolve = {"SurfaceDensity": 0, "WeightedAverage": 1, "WeightedVariance": 2}[s["mode"]]
+        s["resolve"] = resolve
+        return weights, qty
+
+    def _render_composite_frame(self, fb_width, fb_height):
+        """Render two fields into separate FBOs and composite."""
+        r = self.renderer
+        r._ensure_fbo(fb_width, fb_height, which=1)
+        r._ensure_fbo(fb_width, fb_height, which=2)
+
+        # Slot 0 (lightness): load weights/qty, cull, render into FBO1
+        s0 = self._slot[0]
+        w0, q0 = self._compute_slot(s0)
+        r.update_weights(w0, q0)
+        r.update_visible(self.camera)
+        r._render_accum(self.camera, fb_width, fb_height, r._accum_fbo)
+
+        # Slot 1 (color): load weights/qty, cull, render into FBO2
+        s1 = self._slot[1]
+        w1, q1 = self._compute_slot(s1)
+        r.update_weights(w1, q1)
+        r.update_visible(self.camera)
+        r._render_accum(self.camera, fb_width, fb_height, r._accum_fbo2)
+
+        # Composite resolve
+        r.render_composite(
+            self.camera, fb_width, fb_height,
+            s0["resolve"], s0["min"], s0["max"], s0["log"],
+            s1["resolve"], s1["min"], s1["max"], s1["log"],
+        )
 
     def _set_sd_field(self, field_name):
         """Change the primary surface density weight field."""
@@ -566,19 +679,21 @@ class DataFlyerApp:
             # Read previous frame's GPU timer (1-frame lag, no stall)
             t_render_gpu = self._gpu_query.elapsed * 1e-9  # ns -> seconds
 
-            # Clear and render with async GPU timer
+            # Clear and render
             self.ctx.clear(0.0, 0.0, 0.0, 1.0)
             self.ctx.screen.use()
-            with self._gpu_query:
-                self.renderer.render(self.camera, fb_width, fb_height)
-
-            # Deferred auto-range: read back actual pixel values after first render
-            if self._needs_auto_range:
-                self._auto_range_from_framebuffer()
-                self.ctx.clear(0.0, 0.0, 0.0, 1.0)
-                self.ctx.screen.use()
-                self.renderer.render(self.camera, fb_width, fb_height)
-                self._needs_auto_range = False
+            if self._composite:
+                with self._gpu_query:
+                    self._render_composite_frame(fb_width, fb_height)
+            else:
+                with self._gpu_query:
+                    self.renderer.render(self.camera, fb_width, fb_height)
+                if self._needs_auto_range:
+                    self._auto_range_from_framebuffer()
+                    self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+                    self.ctx.screen.use()
+                    self.renderer.render(self.camera, fb_width, fb_height)
+                    self._needs_auto_range = False
 
             # Update timing stats (exponential moving average)
             alpha = 0.2
@@ -598,6 +713,7 @@ class DataFlyerApp:
                 vector_fields=self._vector_fields,
                 vector_projection=self._vector_projection,
                 vector_projections=self._VECTOR_PROJECTIONS,
+                composite_slots=self._slot if self._composite else None,
             )
             self.user_menu.render()
 
@@ -719,6 +835,7 @@ class DataFlyerApp:
                 vector_fields=self._vector_fields,
                 vector_projection=self._vector_projection,
                 vector_projections=self._VECTOR_PROJECTIONS,
+                composite_slots=self._slot if self._composite else None,
             )
             self.user_menu.render()
 

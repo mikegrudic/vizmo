@@ -498,11 +498,44 @@ class UserMenu(Panel):
             return True
         return False
 
+    def _slot_index(self, key):
+        """Return 0 for L: prefix, 1 for C: prefix, None otherwise."""
+        if key.startswith("L:"):
+            return 0
+        if key.startswith("C:"):
+            return 1
+        return None
+
+    def _handle_slot_dropdown(self, app, slot_idx, field_key, value):
+        """Handle a dropdown selection for a composite slot."""
+        s = app._slot[slot_idx]
+        if field_key == "mode":
+            s["mode"] = value
+        elif field_key == "weight":
+            s["weight"] = value
+        elif field_key == "weight2":
+            s["weight2"] = value
+        elif field_key == "op":
+            s["op"] = value
+        elif field_key == "data":
+            s["data"] = value
+        elif field_key == "proj":
+            s["proj"] = value
+
     def _commit_edit(self, app):
         if self._editing and self._edit_buffer:
             try:
                 val = float(self._edit_buffer)
-                if self._editing == "min":
+                slot_idx = self._slot_index(self._editing)
+                if slot_idx is not None:
+                    field_key = self._editing[2:]
+                    if field_key.startswith("log "):
+                        field_key = field_key[4:]
+                    if "Min" in field_key or "min" in field_key:
+                        app._slot[slot_idx]["min"] = val
+                    elif "Max" in field_key or "max" in field_key:
+                        app._slot[slot_idx]["max"] = val
+                elif self._editing == "min":
                     app.renderer.qty_min = val
                 elif self._editing == "max":
                     app.renderer.qty_max = val
@@ -511,12 +544,44 @@ class UserMenu(Panel):
         self._editing = None
         self._edit_buffer = ""
 
+    def _build_slot_items(self, slot, prefix, all_fields, vf_set, slot_modes, vprojs):
+        """Build widget items for a composite slot."""
+        items = []
+        s = slot
+        items.append(("dropdown", f"{prefix}Mode", s["mode"], slot_modes, f"{prefix}mode"))
+        items.append(("dropdown", f"{prefix}Weight", s["weight"], all_fields, f"{prefix}weight"))
+        if s["mode"] == "SurfaceDensity":
+            items.append(("dropdown", f"{prefix}Op", s["op"], self._SD_OPS, f"{prefix}op"))
+            items.append(("dropdown", f"{prefix}Field2", s["weight2"], ["None"] + all_fields, f"{prefix}weight2"))
+        else:
+            items.append(("dropdown", f"{prefix}Data", s["data"], all_fields, f"{prefix}data"))
+        # Vector projection
+        uses_vec = (s["weight"] in vf_set
+                    or (s["mode"] == "SurfaceDensity" and s["weight2"] in vf_set)
+                    or (s["mode"] != "SurfaceDensity" and s["data"] in vf_set))
+        if uses_vec:
+            items.append(("dropdown", f"{prefix}Proj", s["proj"], vprojs, f"{prefix}proj"))
+        # Limits
+        lo = f"{s['min']:.2f}" if s["log"] else f"{s['min']:.3g}"
+        hi = f"{s['max']:.2f}" if s["log"] else f"{s['max']:.3g}"
+        if self._editing == f"{prefix}min":
+            lo = self._edit_buffer + "_"
+        if self._editing == f"{prefix}max":
+            hi = self._edit_buffer + "_"
+        lbl = "log " if s["log"] else ""
+        items.append(("field", f"{prefix}{lbl}Min", lo, f"{prefix}min"))
+        items.append(("field", f"{prefix}{lbl}Max", hi, f"{prefix}max"))
+        items.append(("toggle", f"{prefix}Log", s["log"], f"{prefix}log"))
+        return items
+
     def update(self, renderer, cmap_name, colormaps,
                sd_fields=None, sd_field="Masses",
                sd_field2="None", sd_op="*", sd_ops=None,
                render_modes=None, render_mode_name="SurfaceDensity",
                wa_data_field="Masses",
-               vector_fields=None, vector_projection="LOS", vector_projections=None):
+               vector_fields=None, vector_projection="LOS", vector_projections=None,
+               composite_slots=None):
+        self._SD_OPS = sd_ops or ["*"]
         items = []
 
         # All field dropdowns include vector field names
@@ -525,49 +590,66 @@ class UserMenu(Panel):
         for vf in (vector_fields or []):
             if vf not in all_fields:
                 all_fields.append(vf)
+        vprojs = vector_projections or ["LOS", "|v|", "|v|^2"]
 
         if render_modes and len(render_modes) > 1:
             items.append(("dropdown", "Mode", render_mode_name, render_modes, "render_mode"))
-        if all_fields and len(all_fields) > 1:
-            items.append(("dropdown", "Weight", sd_field, all_fields, "sd_field"))
-            if render_mode_name == "SurfaceDensity":
-                items.append(("dropdown", "Op", sd_op, sd_ops or ["*"], "sd_op"))
-                items.append(("dropdown", "Field 2", sd_field2, ["None"] + all_fields, "sd_field2"))
+
+        if render_mode_name == "Composite" and composite_slots:
+            # Two stacked slot panels
+            slot_modes = ["SurfaceDensity", "WeightedAverage", "WeightedVariance"]
+            items.append(("text", "--- Lightness ---"))
+            items.extend(self._build_slot_items(composite_slots[0], "L:", all_fields, vf_set, slot_modes, vprojs))
+            items.append(("text", "--- Color ---"))
+            items.extend(self._build_slot_items(composite_slots[1], "C:", all_fields, vf_set, slot_modes, vprojs))
+            items.append(("dropdown", "Cmap", cmap_name, colormaps, "colormap"))
+            items.append(("toggle", "Colorbar", self.show_colorbar, "colorbar"))
+        else:
+            # Single-field mode
+            if all_fields and len(all_fields) > 1:
+                items.append(("dropdown", "Weight", sd_field, all_fields, "sd_field"))
+                if render_mode_name == "SurfaceDensity":
+                    items.append(("dropdown", "Op", sd_op, sd_ops or ["*"], "sd_op"))
+                    items.append(("dropdown", "Field 2", sd_field2, ["None"] + all_fields, "sd_field2"))
+                else:
+                    items.append(("dropdown", "Data", wa_data_field, all_fields, "wa_data_field"))
+
+            uses_vector = (sd_field in vf_set
+                           or (render_mode_name == "SurfaceDensity" and sd_field2 in vf_set)
+                           or (render_mode_name != "SurfaceDensity" and wa_data_field in vf_set))
+            if uses_vector:
+                items.append(("dropdown", "Proj", vector_projection, vprojs, "vector_projection"))
+            items.append(("dropdown", "Cmap", cmap_name, colormaps, "colormap"))
+
+            if self._editing == "min":
+                lo_display = self._edit_buffer + "_"
+            elif renderer.log_scale:
+                lo_display = f"{renderer.qty_min:.2f}"
             else:
-                items.append(("dropdown", "Data", wa_data_field, all_fields, "wa_data_field"))
+                lo_display = f"{renderer.qty_min:.3g}"
 
-        # Show projection dropdown if any active field is a vector
-        uses_vector = (sd_field in vf_set
-                       or (render_mode_name == "SurfaceDensity" and sd_field2 in vf_set)
-                       or (render_mode_name != "SurfaceDensity" and wa_data_field in vf_set))
-        if uses_vector:
-            items.append(("dropdown", "Proj", vector_projection,
-                          vector_projections or ["LOS", "|v|", "|v|^2"], "vector_projection"))
-        items.append(("dropdown", "Cmap", cmap_name, colormaps, "colormap"))
+            if self._editing == "max":
+                hi_display = self._edit_buffer + "_"
+            elif renderer.log_scale:
+                hi_display = f"{renderer.qty_max:.2f}"
+            else:
+                hi_display = f"{renderer.qty_max:.3g}"
 
-        if self._editing == "min":
-            lo_display = self._edit_buffer + "_"
-        elif renderer.log_scale:
-            lo_display = f"{renderer.qty_min:.2f}"
-        else:
-            lo_display = f"{renderer.qty_min:.3g}"
-
-        if self._editing == "max":
-            hi_display = self._edit_buffer + "_"
-        elif renderer.log_scale:
-            hi_display = f"{renderer.qty_max:.2f}"
-        else:
-            hi_display = f"{renderer.qty_max:.3g}"
-
-        prefix = "log " if renderer.log_scale else ""
-        items.append(("field", f"{prefix}Min", lo_display, "min"))
-        items.append(("field", f"{prefix}Max", hi_display, "max"))
-        items.append(("toggle", "Log scale", renderer.log_scale, "log_scale"))
-        items.append(("toggle", "Colorbar", self.show_colorbar, "colorbar"))
+            prefix = "log " if renderer.log_scale else ""
+            items.append(("field", f"{prefix}Min", lo_display, "min"))
+            items.append(("field", f"{prefix}Max", hi_display, "max"))
+            items.append(("toggle", "Log scale", renderer.log_scale, "log_scale"))
+            items.append(("toggle", "Colorbar", self.show_colorbar, "colorbar"))
 
         self._cmap_name = cmap_name
-        self._lo_str = lo_display.rstrip("_")
-        self._hi_str = hi_display.rstrip("_")
+        if render_mode_name == "Composite" and composite_slots:
+            # Colorbar uses slot 1 (color channel) limits
+            s1 = composite_slots[1]
+            self._lo_str = f"{s1['min']:.2f}" if s1["log"] else f"{s1['min']:.3g}"
+            self._hi_str = f"{s1['max']:.2f}" if s1["log"] else f"{s1['max']:.3g}"
+        else:
+            self._lo_str = lo_display.rstrip("_")
+            self._hi_str = hi_display.rstrip("_")
         self._renderer = renderer
         self.render_panel(items)
 
@@ -648,16 +730,32 @@ class UserMenu(Panel):
         if wtype == "field":
             key = widget[3]
             self._editing = key
-            r = app.renderer
-            if key == "min":
-                self._edit_buffer = f"{r.qty_min:.4g}"
-            elif key == "max":
-                self._edit_buffer = f"{r.qty_max:.4g}"
+            # Pre-fill edit buffer from the right source
+            slot_idx = self._slot_index(key)
+            if slot_idx is not None:
+                s = app._slot[slot_idx]
+                field_key = key[2:]  # strip "L:" or "C:" prefix
+                # strip "log " prefix from field key if present
+                if field_key.startswith("log "):
+                    field_key = field_key[4:]
+                if field_key.endswith("Min") or field_key.endswith("min"):
+                    self._edit_buffer = f"{s['min']:.4g}"
+                elif field_key.endswith("Max") or field_key.endswith("max"):
+                    self._edit_buffer = f"{s['max']:.4g}"
+            else:
+                r = app.renderer
+                if key == "min":
+                    self._edit_buffer = f"{r.qty_min:.4g}"
+                elif key == "max":
+                    self._edit_buffer = f"{r.qty_max:.4g}"
             return True
 
         if wtype == "toggle":
             key = widget[3]
-            if key == "log_scale":
+            slot_idx = self._slot_index(key)
+            if slot_idx is not None:
+                app._slot[slot_idx]["log"] = 1 - app._slot[slot_idx]["log"]
+            elif key == "log_scale":
                 app.renderer.log_scale = 1 - app.renderer.log_scale
                 app._needs_auto_range = True
             elif key == "colorbar":
@@ -666,7 +764,11 @@ class UserMenu(Panel):
 
         if wtype == "dropdown_item":
             key, value = widget[3], widget[4]
-            if key == "render_mode":
+            # Composite slot dropdowns
+            slot_idx = self._slot_index(key)
+            if slot_idx is not None:
+                self._handle_slot_dropdown(app, slot_idx, key[2:], value)
+            elif key == "render_mode":
                 app._render_mode_name = value
                 app._apply_render_mode()
             elif key == "sd_field":
@@ -680,7 +782,7 @@ class UserMenu(Panel):
                     app._apply_render_mode()
             elif key == "wa_data_field":
                 app._wa_data_field = value
-                app._los_camera_fwd = None  # force LOS recompute
+                app._los_camera_fwd = None
                 app._apply_render_mode()
             elif key == "vector_projection":
                 app._vector_projection = value

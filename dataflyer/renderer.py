@@ -211,6 +211,10 @@ class SplatRenderer:
             vertex_shader=_load_shader("splat_aniso.vert"),
             fragment_shader=_load_shader("splat_aniso.frag"),
         )
+        self.prog_composite = ctx.program(
+            vertex_shader=_load_shader("resolve.vert"),
+            fragment_shader=_load_shader("composite.frag"),
+        )
 
         # Billboard quad for instanced rendering of large particles
         quad_corners = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype=np.float32)
@@ -257,9 +261,20 @@ class SplatRenderer:
         self._fbo_size = (0, 0)
         self._viewport_width = 1024  # updated each frame in render()
 
-        # Resolve VAO
+        # Second FBO for composite mode (field 2)
+        self._accum_fbo2 = None
+        self._accum_tex_num2 = None
+        self._accum_tex_den2 = None
+        self._accum_tex_sq2 = None
+        self._fbo_size2 = (0, 0)
+
+        # Resolve VAOs
         self.vao_resolve = ctx.vertex_array(
             self.prog_resolve,
+            [(self.fs_quad_vbo, "2f", "in_position")],
+        )
+        self.vao_composite = ctx.vertex_array(
+            self.prog_composite,
             [(self.fs_quad_vbo, "2f", "in_position")],
         )
 
@@ -551,38 +566,44 @@ class SplatRenderer:
                 index_buffer=self.quad_ibo,
             )
 
-    def _ensure_accum_fbo(self, width, height):
-        """Create or resize the accumulation FBO."""
-        if self._fbo_size == (width, height) and self._accum_fbo is not None:
-            return
+    def _ensure_fbo(self, width, height, which=1):
+        """Create or resize an accumulation FBO (1=primary, 2=composite second)."""
+        if which == 1:
+            if self._fbo_size == (width, height) and self._accum_fbo is not None:
+                return
+            for attr in ("_accum_fbo", "_accum_tex_num", "_accum_tex_den", "_accum_tex_sq"):
+                old = getattr(self, attr, None)
+                if old is not None:
+                    old.release()
+            self._accum_tex_num = self.ctx.texture((width, height), 1, dtype="f4")
+            self._accum_tex_den = self.ctx.texture((width, height), 1, dtype="f4")
+            self._accum_tex_sq = self.ctx.texture((width, height), 1, dtype="f4")
+            self._accum_fbo = self.ctx.framebuffer(
+                color_attachments=[self._accum_tex_num, self._accum_tex_den, self._accum_tex_sq],
+            )
+            self._fbo_size = (width, height)
+        else:
+            if self._fbo_size2 == (width, height) and self._accum_fbo2 is not None:
+                return
+            for attr in ("_accum_fbo2", "_accum_tex_num2", "_accum_tex_den2", "_accum_tex_sq2"):
+                old = getattr(self, attr, None)
+                if old is not None:
+                    old.release()
+            self._accum_tex_num2 = self.ctx.texture((width, height), 1, dtype="f4")
+            self._accum_tex_den2 = self.ctx.texture((width, height), 1, dtype="f4")
+            self._accum_tex_sq2 = self.ctx.texture((width, height), 1, dtype="f4")
+            self._accum_fbo2 = self.ctx.framebuffer(
+                color_attachments=[self._accum_tex_num2, self._accum_tex_den2, self._accum_tex_sq2],
+            )
+            self._fbo_size2 = (width, height)
 
-        for attr in ("_accum_fbo", "_accum_tex_num", "_accum_tex_den", "_accum_tex_sq"):
-            old = getattr(self, attr, None)
-            if old is not None:
-                old.release()
-
-        self._accum_tex_num = self.ctx.texture((width, height), 1, dtype="f4")
-        self._accum_tex_den = self.ctx.texture((width, height), 1, dtype="f4")
-        self._accum_tex_sq = self.ctx.texture((width, height), 1, dtype="f4")
-        self._accum_fbo = self.ctx.framebuffer(
-            color_attachments=[self._accum_tex_num, self._accum_tex_den, self._accum_tex_sq],
-        )
-        self._fbo_size = (width, height)
-
-    def render(self, camera, width, height):
-        """Render particle splats via additive accumulation + resolve."""
-        self._viewport_width = width
-        if (self.n_particles == 0 and self.n_big == 0) or self.colormap_tex is None:
-            return
-
+    def _render_accum(self, camera, width, height, fbo):
+        """Render the additive accumulation pass into the given FBO."""
         view = np.ascontiguousarray(camera.view_matrix().T)
         proj = np.ascontiguousarray(camera.projection_matrix().T)
 
-        self._ensure_accum_fbo(width, height)
-
-        # Pass 1: additive accumulation into float FBO
-        self._accum_fbo.use()
-        self._accum_fbo.clear(0.0, 0.0, 0.0, 0.0)
+        fbo.use()
+        fbo.clear(0.0, 0.0, 0.0, 0.0)
 
         kernel_id = self.KERNELS.index(self.kernel)
 
@@ -611,7 +632,16 @@ class SplatRenderer:
             self.prog_aniso["u_cov_scale"].value = self.summary_scale
             self.vao_aniso.render(moderngl.TRIANGLES, instances=self.n_aniso)
 
-        # Pass 2: resolve to screen
+    def render(self, camera, width, height):
+        """Render particle splats via additive accumulation + resolve."""
+        self._viewport_width = width
+        if (self.n_particles == 0 and self.n_big == 0) or self.colormap_tex is None:
+            return
+
+        self._ensure_fbo(width, height, which=1)
+        self._render_accum(camera, width, height, self._accum_fbo)
+
+        # Resolve to screen
         self.ctx.screen.use()
         self.ctx.disable(moderngl.BLEND)
 
@@ -631,7 +661,67 @@ class SplatRenderer:
 
         self.vao_resolve.render(moderngl.TRIANGLE_STRIP, vertices=4)
 
-        # Pass 3: render star particles on top
+        # Star particles on top
+        view = np.ascontiguousarray(camera.view_matrix().T)
+        proj = np.ascontiguousarray(camera.projection_matrix().T)
+        self.star_layer.render(view.tobytes(), proj.tobytes())
+
+    def render_composite(self, camera, width, height,
+                         mode1, min1, max1, log1,
+                         mode2, min2, max2, log2):
+        """Render two fields and composite: field1=lightness, field2=color.
+
+        Call update_weights() with field1 data, then render_composite() which:
+        1. Renders field1 into FBO1
+        2. Swaps in field2 data via update_weights()
+        3. Renders field2 into FBO2
+        4. Composites with HSV blend
+
+        Instead, the caller should:
+        1. Set up field1 weights/qty → call update_visible → render_composite stores FBO1
+        2. field2 weights/qty and FBO2 are passed as parameters
+
+        Actually, the simplest approach: the caller renders twice externally.
+        This method just does the composite resolve from two pre-filled FBOs.
+        """
+        self._viewport_width = width
+        self._ensure_fbo(width, height, which=1)
+        self._ensure_fbo(width, height, which=2)
+
+        # Composite resolve
+        self.ctx.screen.use()
+        self.ctx.disable(moderngl.BLEND)
+
+        self._accum_tex_num.use(location=0)
+        self._accum_tex_den.use(location=1)
+        self._accum_tex_sq.use(location=2)
+        self._accum_tex_num2.use(location=3)
+        self._accum_tex_den2.use(location=4)
+        self._accum_tex_sq2.use(location=5)
+        self.colormap_tex.use(location=6)
+
+        p = self.prog_composite
+        p["u_num1"].value = 0
+        p["u_den1"].value = 1
+        p["u_sq1"].value = 2
+        p["u_num2"].value = 3
+        p["u_den2"].value = 4
+        p["u_sq2"].value = 5
+        p["u_colormap"].value = 6
+        p["u_mode1"].value = mode1
+        p["u_min1"].value = min1
+        p["u_max1"].value = max1
+        p["u_log1"].value = log1
+        p["u_mode2"].value = mode2
+        p["u_min2"].value = min2
+        p["u_max2"].value = max2
+        p["u_log2"].value = log2
+
+        self.vao_composite.render(moderngl.TRIANGLE_STRIP, vertices=4)
+
+        # Stars on top
+        view = np.ascontiguousarray(camera.view_matrix().T)
+        proj = np.ascontiguousarray(camera.projection_matrix().T)
         self.star_layer.render(view.tobytes(), proj.tobytes())
 
     def read_accum_range(self):
@@ -700,9 +790,10 @@ class SplatRenderer:
             "big_pos_vbo", "big_hsml_vbo", "big_mass_vbo", "big_qty_vbo",
             "quad_vbo", "quad_ibo", "fs_quad_vbo",
             "aniso_pos_vbo", "aniso_mass_vbo", "aniso_qty_vbo", "aniso_cov_vbo",
-            "vao_additive", "vao_quad", "vao_aniso", "vao_resolve",
-            "prog_additive", "prog_quad", "prog_aniso", "prog_resolve", "prog_star",
+            "vao_additive", "vao_quad", "vao_aniso", "vao_resolve", "vao_composite",
+            "prog_additive", "prog_quad", "prog_aniso", "prog_resolve", "prog_composite", "prog_star",
             "_accum_fbo", "_accum_tex_num", "_accum_tex_den", "_accum_tex_sq",
+            "_accum_fbo2", "_accum_tex_num2", "_accum_tex_den2", "_accum_tex_sq2",
         ):
             obj = getattr(self, attr, None)
             if obj is not None:
