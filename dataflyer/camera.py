@@ -16,6 +16,12 @@ class Camera:
         self._forward = np.array([0, 0, -1], dtype=np.float32)
         self._up = np.array([0, 1, 0], dtype=np.float32)
 
+        # Cached basis vectors (recomputed when _dirty is set)
+        self._cached_forward = None
+        self._cached_right = None
+        self._cached_up = None
+        self._dirty = True
+
         # Movement
         self.speed = 1.0  # units/sec, will be auto-scaled from data
         self.mouse_sensitivity = 0.002
@@ -27,19 +33,35 @@ class Camera:
         self._mouse_captured = False
         self._moving = False
 
+    def _recompute_basis(self):
+        """Recompute and cache the orthonormal basis vectors."""
+        f = self._forward / np.linalg.norm(self._forward)
+        r = np.cross(f, self._up)
+        r = r / np.linalg.norm(r)
+        u = np.cross(r, f)
+        # u is already unit length since r and f are orthonormal
+        self._cached_forward = f
+        self._cached_right = r
+        self._cached_up = u
+        self._dirty = False
+
     @property
     def forward(self):
-        return self._forward / np.linalg.norm(self._forward)
+        if self._dirty:
+            self._recompute_basis()
+        return self._cached_forward
 
     @property
     def right(self):
-        r = np.cross(self.forward, self._up)
-        return r / np.linalg.norm(r)
+        if self._dirty:
+            self._recompute_basis()
+        return self._cached_right
 
     @property
     def up(self):
-        u = np.cross(self.right, self.forward)
-        return u / np.linalg.norm(u)
+        if self._dirty:
+            self._recompute_basis()
+        return self._cached_up
 
     def view_matrix(self):
         """Returns 4x4 view matrix (world -> camera)."""
@@ -145,10 +167,10 @@ class Camera:
     def _yaw(self, angle):
         c, s = np.cos(angle), np.sin(angle)
         u = self.up
-        # Rodrigues rotation of forward around up
         self._forward = (
             self._forward * c + np.cross(u, self._forward) * s + u * np.dot(u, self._forward) * (1 - c)
         )
+        self._dirty = True
 
     def _pitch(self, angle):
         c, s = np.cos(angle), np.sin(angle)
@@ -157,11 +179,13 @@ class Camera:
             self._forward * c + np.cross(r, self._forward) * s + r * np.dot(r, self._forward) * (1 - c)
         )
         self._up = (self._up * c + np.cross(r, self._up) * s + r * np.dot(r, self._up) * (1 - c))
+        self._dirty = True
 
     def _roll(self, angle):
         c, s = np.cos(angle), np.sin(angle)
         f = self.forward
         self._up = self._up * c + np.cross(f, self._up) * s + f * np.dot(f, self._up) * (1 - c)
+        self._dirty = True
 
     def auto_scale(self, positions, masses=None, boxsize=None):
         """Set speed and clip planes. Starts at the box center looking along -z."""
@@ -178,6 +202,7 @@ class Camera:
         self.position = np.array([center[0], center[1], pmax[2]], dtype=np.float32)
         self._forward = np.array([0, 0, -1], dtype=np.float32)
         self._up = np.array([0, 1, 0], dtype=np.float32)
+        self._dirty = True
         self.speed = extent / 10
         self.near = extent * 1e-6
         self.far = extent * 10

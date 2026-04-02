@@ -208,6 +208,69 @@ def _gather_importance_sampled(
     return o_pos, o_hsml, o_mass, o_qty, total
 
 
+@njit(parallel=True, cache=True)
+def _accumulate_cell_moments(cell_start, s_pos, s_mass, s_hsml, s_qty,
+                             cell_mass, cell_mp, cell_mq, cell_mh2, cell_mxx):
+    """Single-pass accumulation of all moments from sorted particles into cells.
+
+    Replaces 12 separate np.add.reduceat calls with one loop touching each
+    particle exactly once. Much more cache-friendly for large datasets.
+    """
+    nc3 = len(cell_mass)
+    for c in prange(nc3):
+        start = cell_start[c]
+        end = cell_start[c + 1]
+        if start == end:
+            continue
+
+        m_sum = np.float64(0.0)
+        mpx = np.float64(0.0)
+        mpy = np.float64(0.0)
+        mpz = np.float64(0.0)
+        mq_sum = np.float64(0.0)
+        mh2_sum = np.float64(0.0)
+        mxx = np.float64(0.0)
+        mxy = np.float64(0.0)
+        mxz = np.float64(0.0)
+        myy = np.float64(0.0)
+        myz = np.float64(0.0)
+        mzz = np.float64(0.0)
+
+        for k in range(start, end):
+            m = np.float64(s_mass[k])
+            px = np.float64(s_pos[k, 0])
+            py = np.float64(s_pos[k, 1])
+            pz = np.float64(s_pos[k, 2])
+            h = np.float64(s_hsml[k])
+            q = np.float64(s_qty[k])
+
+            m_sum += m
+            mpx += m * px
+            mpy += m * py
+            mpz += m * pz
+            mq_sum += m * q
+            mh2_sum += m * h * h
+            mxx += m * px * px
+            mxy += m * px * py
+            mxz += m * px * pz
+            myy += m * py * py
+            myz += m * py * pz
+            mzz += m * pz * pz
+
+        cell_mass[c] = np.float32(m_sum)
+        cell_mp[c, 0] = np.float32(mpx)
+        cell_mp[c, 1] = np.float32(mpy)
+        cell_mp[c, 2] = np.float32(mpz)
+        cell_mq[c] = np.float32(mq_sum)
+        cell_mh2[c] = np.float32(mh2_sum)
+        cell_mxx[c, 0] = np.float32(mxx)
+        cell_mxx[c, 1] = np.float32(mxy)
+        cell_mxx[c, 2] = np.float32(mxz)
+        cell_mxx[c, 3] = np.float32(myy)
+        cell_mxx[c, 4] = np.float32(myz)
+        cell_mxx[c, 5] = np.float32(mzz)
+
+
 # Maximum particles to render per frame for interactive performance
 MAX_RENDER_PARTICLES = 4_000_000
 
@@ -264,73 +327,46 @@ class SpatialGrid:
             self.levels.append(coarser)
             prev = coarser
 
+        # Precompute static child expansion offsets (used in query_frustum_lod)
+        self._child_offsets = np.array(
+            [[dx, dy, dz] for dx in range(2) for dy in range(2) for dz in range(2)],
+            dtype=np.int64,
+        )
+
     def _build_finest(self, positions, masses, hsml, quantity, nc, box):
         """Build the finest level directly from particles."""
         cs = box / nc
-        so = self.sort_order
-
-        s_m = masses[so]
-        s_p = positions[so]
-        s_h = hsml[so]
-        s_q = quantity[so]
-
         nc3 = nc**3
-        starts = self.cell_start[:-1].astype(np.intp)
-        nonempty = starts < self.cell_start[1:]
-        reduce_at = starts[nonempty]
-        ne_idx = np.where(nonempty)[0]
 
+        # Accumulate all moments in a single parallel pass over sorted particles
         cell_mass = np.zeros(nc3, dtype=np.float32)
-        cell_com = np.zeros((nc3, 3), dtype=np.float32)
-        cell_hsml = np.zeros(nc3, dtype=np.float32)
-        cell_qty = np.zeros(nc3, dtype=np.float32)
-        # Mass-weighted second moments for variance/covariance at coarser levels
-        # mxx[i] stores: (xx, xy, xz, yy, yz, zz) = upper triangle of m*x*x^T
-        cell_mxx = np.zeros((nc3, 6), dtype=np.float32)
+        cell_mp = np.zeros((nc3, 3), dtype=np.float32)
+        cell_mq = np.zeros(nc3, dtype=np.float32)
         cell_mh2 = np.zeros(nc3, dtype=np.float32)
-        # 3D covariance upper triangle: (cov_xx, cov_xy, cov_xz, cov_yy, cov_yz, cov_zz)
-        cell_cov = np.zeros((nc3, 6), dtype=np.float32)
+        cell_mxx = np.zeros((nc3, 6), dtype=np.float32)
 
-        if len(reduce_at) > 0:
-            mass_ne = np.add.reduceat(s_m, reduce_at)
-            safe = np.maximum(mass_ne, 1e-30)
-            mp_ne = np.add.reduceat(s_p * s_m[:, None], reduce_at)
-            mq_ne = np.add.reduceat(s_m * s_q, reduce_at)
-            mh2_ne = np.add.reduceat(s_m * s_h**2, reduce_at)
+        _accumulate_cell_moments(
+            self.cell_start,
+            self.sorted_pos, self.sorted_mass, self.sorted_hsml, self.sorted_qty,
+            cell_mass, cell_mp, cell_mq, cell_mh2, cell_mxx,
+        )
 
-            # Mass-weighted outer products: xx, xy, xz, yy, yz, zz
-            mxx_ne = np.column_stack([
-                np.add.reduceat(s_m * s_p[:, 0] * s_p[:, 0], reduce_at),
-                np.add.reduceat(s_m * s_p[:, 0] * s_p[:, 1], reduce_at),
-                np.add.reduceat(s_m * s_p[:, 0] * s_p[:, 2], reduce_at),
-                np.add.reduceat(s_m * s_p[:, 1] * s_p[:, 1], reduce_at),
-                np.add.reduceat(s_m * s_p[:, 1] * s_p[:, 2], reduce_at),
-                np.add.reduceat(s_m * s_p[:, 2] * s_p[:, 2], reduce_at),
-            ])
+        # Derive intensive quantities from extensive moments
+        safe = np.maximum(cell_mass, 1e-30)
+        cell_com = cell_mp / safe[:, None]
+        cell_qty = cell_mq / safe
 
-            com_ne = mp_ne / safe[:, None]
+        # Covariance = <xx> - <x><x>
+        cell_cov = np.empty((nc3, 6), dtype=np.float32)
+        cell_cov[:, 0] = cell_mxx[:, 0] / safe - cell_com[:, 0] * cell_com[:, 0]
+        cell_cov[:, 1] = cell_mxx[:, 1] / safe - cell_com[:, 0] * cell_com[:, 1]
+        cell_cov[:, 2] = cell_mxx[:, 2] / safe - cell_com[:, 0] * cell_com[:, 2]
+        cell_cov[:, 3] = cell_mxx[:, 3] / safe - cell_com[:, 1] * cell_com[:, 1]
+        cell_cov[:, 4] = cell_mxx[:, 4] / safe - cell_com[:, 1] * cell_com[:, 2]
+        cell_cov[:, 5] = cell_mxx[:, 5] / safe - cell_com[:, 2] * cell_com[:, 2]
 
-            # Covariance = <xx> - <x><x>, etc.
-            cov_ne = np.column_stack([
-                mxx_ne[:, 0] / safe - com_ne[:, 0] * com_ne[:, 0],  # xx
-                mxx_ne[:, 1] / safe - com_ne[:, 0] * com_ne[:, 1],  # xy
-                mxx_ne[:, 2] / safe - com_ne[:, 0] * com_ne[:, 2],  # xz
-                mxx_ne[:, 3] / safe - com_ne[:, 1] * com_ne[:, 1],  # yy
-                mxx_ne[:, 4] / safe - com_ne[:, 1] * com_ne[:, 2],  # yz
-                mxx_ne[:, 5] / safe - com_ne[:, 2] * com_ne[:, 2],  # zz
-            ])
-
-            var_ne = cov_ne[:, 0] + cov_ne[:, 3] + cov_ne[:, 5]  # trace = total variance
-
-            cell_mass[ne_idx] = mass_ne
-            cell_com[ne_idx] = com_ne
-            cell_qty[ne_idx] = mq_ne / safe
-            cell_mxx[ne_idx] = mxx_ne
-            cell_mh2[ne_idx] = mh2_ne
-            cell_cov[ne_idx] = cov_ne
-            # Isotropic h from 3D variance matching (still used for LOD opening criterion)
-            h_var = np.sqrt(np.maximum((1.0 / 0.225) * var_ne + mh2_ne / safe, 1e-30))
-            cell_hsml[ne_idx] = h_var
+        var = cell_cov[:, 0] + cell_cov[:, 3] + cell_cov[:, 5]
+        cell_hsml = np.sqrt(np.maximum((1.0 / 0.225) * var + cell_mh2 / safe, 1e-30))
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
@@ -346,7 +382,7 @@ class SpatialGrid:
             "hsml": cell_hsml,
             "qty": cell_qty,
             "mxx": cell_mxx,
-            "mh2": cell_mh2,  # for coarsening
+            "mh2": cell_mh2,
             "cov": cell_cov,
             "cell_start": self.cell_start,
             "sort_order": self.sort_order,
@@ -359,29 +395,25 @@ class SpatialGrid:
         cnc = child["nc"]
         nc = cnc // 2
         cs = child["cs"] * 2
-        nc3 = nc**3
 
-        # Map child cell (ix, iy, iz) -> parent cell (ix//2, iy//2, iz//2)
-        cix = np.arange(cnc)
-        ciy = np.arange(cnc)
-        ciz = np.arange(cnc)
-        gx, gy, gz = np.meshgrid(cix, ciy, ciz, indexing="ij")
-        parent_id = (gx.ravel() // 2) * nc * nc + (gy.ravel() // 2) * nc + (gz.ravel() // 2)
+        # Reshape from flat (cnc³,) to (cnc, cnc, cnc) then sum 2x2x2 blocks.
+        # reshape to (nc, 2, nc, 2, nc, 2) and sum axes (1, 3, 5) -> (nc, nc, nc)
+        def _sum_222(flat):
+            return flat.reshape(cnc, cnc, cnc).reshape(nc, 2, nc, 2, nc, 2).sum(axis=(1, 3, 5)).ravel()
 
-        # Sum child properties into parent cells
-        cell_mass = np.zeros(nc3, dtype=np.float32)
-        cell_mp = np.zeros((nc3, 3), dtype=np.float32)
-        cell_mq = np.zeros(nc3, dtype=np.float32)
-        cell_mxx = np.zeros((nc3, 6), dtype=np.float32)
-        cell_mh2 = np.zeros(nc3, dtype=np.float32)
+        def _sum_222_cols(flat_2d, ncols):
+            shaped = flat_2d.reshape(cnc, cnc, cnc, ncols).reshape(nc, 2, nc, 2, nc, 2, ncols)
+            return shaped.sum(axis=(1, 3, 5)).reshape(-1, ncols)
 
-        np.add.at(cell_mass, parent_id, child["mass"])
-        for d in range(3):
-            np.add.at(cell_mp[:, d], parent_id, child["mass"] * child["com"][:, d])
-        for d in range(6):
-            np.add.at(cell_mxx[:, d], parent_id, child["mxx"][:, d])
-        np.add.at(cell_mq, parent_id, child["mass"] * child["qty"])
-        np.add.at(cell_mh2, parent_id, child["mh2"])
+        # Compute extensive quantities that need to be summed before coarsening
+        child_mp = child["mass"][:, None] * child["com"]  # (cnc³, 3)
+        child_mq = child["mass"] * child["qty"]           # (cnc³,)
+
+        cell_mass = _sum_222(child["mass"])
+        cell_mp = _sum_222_cols(child_mp, 3)
+        cell_mq = _sum_222(child_mq)
+        cell_mxx = _sum_222_cols(child["mxx"], 6)
+        cell_mh2 = _sum_222(child["mh2"])
 
         safe = np.maximum(cell_mass, 1e-30)
         cell_com = cell_mp / safe[:, None]
@@ -557,11 +589,11 @@ class SpatialGrid:
             nc = lv["nc"]
             hd = lv["half_diag"]
 
-            # Map parent cells to 8 children
+            # Map parent cells to 8 children using precomputed offsets
             pix = refine_cells // (parent_nc * parent_nc)
             piy = (refine_cells // parent_nc) % parent_nc
             piz = refine_cells % parent_nc
-            offsets = np.array([[dx, dy, dz] for dx in range(2) for dy in range(2) for dz in range(2)])
+            offsets = self._child_offsets
             child_ix = (pix[:, None] * 2 + offsets[None, :, 0]).ravel()
             child_iy = (piy[:, None] * 2 + offsets[None, :, 1]).ravel()
             child_iz = (piz[:, None] * 2 + offsets[None, :, 2]).ravel()
@@ -572,21 +604,15 @@ class SpatialGrid:
             if len(child_flat) == 0:
                 break
 
+            # Parent was already frustum-tested; only need distance for opening criterion
             centers = lv["centers"][child_flat]
-            depths = centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
-            rights = centers @ cam_right - np.dot(cam_pos, cam_right)
-            ups = centers @ cam_up - np.dot(cam_pos, cam_up)
-
-            # No frustum culling at child levels -- parent was already visible.
-            # Only use opening criterion (h_pix) for LOD decisions.
-            vis = np.ones(len(depths), dtype=bool)
-
-            dist = np.sqrt(depths**2 + rights**2 + ups**2)
+            diff = centers - cam_pos
+            dist = np.sqrt((diff * diff).sum(axis=1))
             safe_dist = np.maximum(dist, 0.01)
             h_pix = lv["hsml"][child_flat] / safe_dist * pix_per_rad
 
-            small = vis & (h_pix <= lod_pixels)
-            large = vis & (h_pix > lod_pixels)
+            small = h_pix <= lod_pixels
+            large = ~small
 
             # Summary splats for small cells
             s_idx = child_flat[small]

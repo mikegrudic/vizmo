@@ -110,7 +110,9 @@ class DataFlyerApp:
         self._frame_count = 0
         self._fps_time = time.perf_counter()
         self._fps = 0.0
-        # cull_interval is on renderer so the dev overlay slider can access it
+        # Async GPU timer query (read previous frame's result to avoid stalling)
+        self._gpu_query = self.ctx.query(time=True)
+        self._gpu_render_ns = 0  # last completed query result in nanoseconds
 
     def _load_snapshot(self, path):
         """Load a new snapshot, keeping the current camera position."""
@@ -511,13 +513,14 @@ class DataFlyerApp:
             fb_width, fb_height = glfw.get_framebuffer_size(self.window)
             self.ctx.viewport = (0, 0, fb_width, fb_height)
 
-            # Clear and render
+            # Read previous frame's GPU timer (1-frame lag, no stall)
+            t_render_gpu = self._gpu_query.elapsed * 1e-9  # ns -> seconds
+
+            # Clear and render with async GPU timer
             self.ctx.clear(0.0, 0.0, 0.0, 1.0)
             self.ctx.screen.use()
-            t0 = time.perf_counter()
-            self.renderer.render(self.camera, fb_width, fb_height)
-            self.ctx.finish()  # wait for GPU to complete for accurate timing
-            t_render = time.perf_counter() - t0
+            with self._gpu_query:
+                self.renderer.render(self.camera, fb_width, fb_height)
 
             # Deferred auto-range: read back actual pixel values after first render
             if self._needs_auto_range:
@@ -531,7 +534,7 @@ class DataFlyerApp:
             alpha = 0.2
             if t_cull > 0:
                 self._timings["cull"] = self._timings["cull"] * (1 - alpha) + t_cull * alpha
-            self._timings["render"] = self._timings["render"] * (1 - alpha) + t_render * alpha
+            self._timings["render"] = self._timings["render"] * (1 - alpha) + t_render_gpu * alpha
 
             # User menu (always visible)
             self.user_menu.set_framebuffer_size(fb_width, fb_height)
