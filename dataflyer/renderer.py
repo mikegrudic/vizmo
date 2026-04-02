@@ -722,6 +722,7 @@ class SplatRenderer:
         self.use_quad_rendering = False  # True = all quads (pre-optimization path)
         self.summary_scale = 1.0  # scaling factor applied to summary splats
         self.use_aniso_summaries = True  # False = isotropic spherical summaries
+        self.cull_interval = 0.5  # seconds between culls while moving
 
     def set_particles(self, positions, hsml, masses, quantity=None):
         """Store particle data on CPU. Call update_visible() to upload a subset."""

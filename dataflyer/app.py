@@ -9,7 +9,7 @@ from .camera import Camera
 from .data_manager import SnapshotData, find_snapshots
 from .renderer import SplatRenderer
 from .colormaps import create_colormap_texture_safe, AVAILABLE_COLORMAPS
-from .overlay import DevOverlay
+from .overlay import DevOverlay, UserMenu
 
 
 class DataFlyerApp:
@@ -63,6 +63,7 @@ class DataFlyerApp:
 
         # Dev overlay
         self.overlay = DevOverlay(self.ctx)
+        self.user_menu = UserMenu(self.ctx)
         self._last_message = ""
         self._timings = {"cull": 0, "upload": 0, "render": 0}
 
@@ -96,6 +97,7 @@ class DataFlyerApp:
         glfw.set_key_callback(self.window, self._key_callback)
         glfw.set_mouse_button_callback(self.window, self._mouse_button_callback)
         glfw.set_cursor_pos_callback(self.window, self._cursor_callback)
+        glfw.set_char_callback(self.window, self._char_callback)
         glfw.set_scroll_callback(self.window, self._scroll_callback)
         glfw.set_framebuffer_size_callback(self.window, self._resize_callback)
 
@@ -104,6 +106,7 @@ class DataFlyerApp:
         self._frame_count = 0
         self._fps_time = time.perf_counter()
         self._fps = 0.0
+        # cull_interval is on renderer so the dev overlay slider can access it
 
     def _load_snapshot(self, path):
         """Load a new snapshot, keeping the current camera position."""
@@ -171,8 +174,11 @@ class DataFlyerApp:
         self._set_colormap(name)
 
     def _key_callback(self, window, key, scancode, action, mods):
+        # User menu editable fields consume keys first
+        if self.user_menu.on_key(key, action):
+            return
+
         if action != glfw.PRESS:
-            # Still forward to camera for key release
             self.camera.on_key(key, action)
             return
 
@@ -331,20 +337,27 @@ class DataFlyerApp:
         self.camera.on_key(key, action)
 
     def _mouse_button_callback(self, window, button, action, mods):
-        if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS and self.overlay.enabled:
+        if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
             xpos, ypos = glfw.get_cursor_pos(window)
-            # Convert window coords to framebuffer coords (retina scaling)
             fb_w, fb_h = glfw.get_framebuffer_size(window)
             win_w, win_h = glfw.get_window_size(window)
             fx = xpos * fb_w / win_w
             fy = ypos * fb_h / win_h
-            if self.overlay.on_click(fx, fy, self.renderer):
+            # User menu (always active)
+            if self.user_menu.on_click(fx, fy, self):
+                return
+            # Dev overlay
+            if self.overlay.enabled and self.overlay.on_click(fx, fy, self.renderer):
                 self.renderer.update_visible(self.camera)
                 return
         self.camera.on_mouse_button(button, action)
 
     def _cursor_callback(self, window, xpos, ypos):
         self.camera.on_cursor(xpos, ypos)
+
+    def _char_callback(self, window, codepoint):
+        if self.user_menu.on_char(codepoint, self):
+            return
 
     def _scroll_callback(self, window, xoffset, yoffset):
         self.camera.on_scroll(yoffset)
@@ -447,13 +460,17 @@ class DataFlyerApp:
                 self._was_moving = False
                 self._still_frames = 0
                 self._refinement_level = 0  # 0=moving, 1=stopped, 2=refined, 3=full
+                self._last_cull_time = 0.0
             if moved:
                 self._still_frames = 0
                 if self._refinement_level != 0:
                     self._refinement_level = 0
-                t0 = time.perf_counter()
-                self.renderer.update_visible(self.camera)
-                t_cull = time.perf_counter() - t0
+                # Throttle culls: skip if less than cull_interval since last cull
+                if now - self._last_cull_time >= self.renderer.cull_interval:
+                    t0 = time.perf_counter()
+                    self.renderer.update_visible(self.camera)
+                    t_cull = time.perf_counter() - t0
+                    self._last_cull_time = now
             elif self._was_moving or self._refinement_level < 3:
                 self._still_frames += 1
                 # Progressive refinement: relax LOD and budget when stationary
@@ -509,13 +526,21 @@ class DataFlyerApp:
                 self._timings["cull"] = self._timings["cull"] * (1 - alpha) + t_cull * alpha
             self._timings["render"] = self._timings["render"] * (1 - alpha) + t_render * alpha
 
+            # User menu (always visible)
+            self.user_menu.set_framebuffer_size(fb_width, fb_height)
+            self.user_menu.update(
+                self.renderer, self._quantities, self._current_qty,
+                AVAILABLE_COLORMAPS[self._cmap_idx], AVAILABLE_COLORMAPS,
+            )
+            self.user_menu.render()
+
             # Dev overlay
             if self.overlay.enabled:
                 self.overlay.set_framebuffer_size(fb_width, fb_height)
                 self.overlay.update(
                     self.renderer, self.camera, self._fps,
                     self._current_qty, AVAILABLE_COLORMAPS[self._cmap_idx],
-                    self._timings, self._last_message,
+                    self._timings, self._last_message, self.renderer.cull_interval,
                 )
                 self.overlay.render()
 
@@ -542,6 +567,7 @@ class DataFlyerApp:
 
     def _cleanup(self):
         self.overlay.release()
+        self.user_menu.release()
         self.renderer.release()
         self.data.close()
         glfw.terminate()
