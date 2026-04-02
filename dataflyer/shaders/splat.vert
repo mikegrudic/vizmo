@@ -13,6 +13,7 @@ uniform vec2 u_viewport_size;  // (width, height) in pixels
 out float v_mass;
 out float v_hsml;
 out float v_quantity;
+out float v_coord_scale;  // ratio of desired/actual point size for PointCoord rescaling
 
 void main() {
     vec4 view_pos = u_view * vec4(in_position, 1.0);
@@ -20,19 +21,19 @@ void main() {
 
     // Point size in pixels: h in view space -> pixels
     float h_clip = in_hsml * u_proj[0][0] / max(abs(clip_pos.w), 1e-10);
-    float point_pixels = h_clip * u_viewport_size.x * 0.5;
+    float desired_pixels = h_clip * u_viewport_size.x * 0.5;
 
-    // Clamp to [2, 64] pixels (macOS Metal limit is 64)
-    float clamped = clamp(point_pixels, 2.0, 64.0);
-    gl_PointSize = clamped;
+    // Hardware clamps to [1, 64] on macOS Metal
+    float actual_pixels = clamp(desired_pixels, 2.0, 64.0);
+    gl_PointSize = actual_pixels;
     gl_Position = clip_pos;
 
-    // If point was clamped smaller, the kernel covers fewer pixels but
-    // the same mass should be deposited. Pass the effective h that matches
-    // the clamped point size so kernel normalization stays correct.
-    float effective_h = in_hsml * (clamped / max(point_pixels, 1e-10));
+    // If clamped, the fragment shader needs to rescale gl_PointCoord
+    // so the kernel maps correctly over the full desired size.
+    // coord_scale > 1 means the point is smaller than desired.
+    v_coord_scale = desired_pixels / actual_pixels;
 
     v_mass = in_mass;
-    v_hsml = effective_h;
+    v_hsml = in_hsml;
     v_quantity = in_quantity;
 }
