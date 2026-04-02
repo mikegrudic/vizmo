@@ -422,7 +422,7 @@ class DataFlyerApp:
             if moved and self.renderer.n_total > self.renderer.max_render_particles:
                 if not hasattr(self, '_last_cull_time'):
                     self._last_cull_time = 0.0
-                if now - self._last_cull_time > 0.5:
+                if now - self._last_cull_time > 0.1:
                     t0 = time.perf_counter()
                     self.renderer.update_visible(self.camera)
                     t_cull = time.perf_counter() - t0
