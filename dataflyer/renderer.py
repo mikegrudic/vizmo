@@ -519,9 +519,13 @@ class SplatRenderer:
         self.n_total = 0  # total particles in dataset
 
         # Compile shader programs
-        self.prog_additive = ctx.program(
+        self.prog_additive = ctx.program(  # point sprites
             vertex_shader=_load_shader("splat.vert"),
             fragment_shader=_load_shader("splat_additive.frag"),
+        )
+        self.prog_quad = ctx.program(  # instanced quads for large particles
+            vertex_shader=_load_shader("splat_quad.vert"),
+            fragment_shader=_load_shader("splat_quad.frag"),
         )
         self.prog_resolve = ctx.program(
             vertex_shader=_load_shader("resolve.vert"),
@@ -532,16 +536,28 @@ class SplatRenderer:
             fragment_shader=_load_shader("star.frag"),
         )
 
+        # Billboard quad for instanced rendering of large particles
+        quad_corners = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype=np.float32)
+        self.quad_vbo = ctx.buffer(quad_corners.tobytes())
+        self.quad_ibo = ctx.buffer(np.array([0, 1, 2, 2, 1, 3], dtype=np.int32).tobytes())
+
         # Fullscreen quad for resolve pass
         fs_quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype=np.float32)
         self.fs_quad_vbo = ctx.buffer(fs_quad.tobytes())
 
-        # Particle buffers (set by upload_visible)
+        # Particle buffers -- separate sets for points (small) and quads (large)
         self.pos_vbo = None
         self.hsml_vbo = None
         self.mass_vbo = None
         self.qty_vbo = None
-        self.vao_additive = None
+        self.vao_additive = None  # point sprites
+
+        self.big_pos_vbo = None
+        self.big_hsml_vbo = None
+        self.big_mass_vbo = None
+        self.big_qty_vbo = None
+        self.vao_quad = None  # instanced quads
+        self.n_big = 0
 
         # Full dataset stored on CPU for culling
         self._all_pos = None
@@ -614,7 +630,7 @@ class SplatRenderer:
                 lod_pixels=self.lod_pixels,
                 importance_sampling=self.use_importance_sampling,
             )
-            self._upload_arrays(pos, hsml, mass, qty)
+            self._upload_arrays(pos, hsml, mass, qty, camera)
         else:
             # No tree: simple numpy frustum cull + subsample
             cam_fwd = camera.forward
@@ -630,27 +646,68 @@ class SplatRenderer:
                 hsml = self._all_hsml[idx] * ratio ** (1.0 / 3.0)
                 mass = self._all_mass[idx] * ratio
                 qty = self._all_qty[idx]
-                self._upload_arrays(pos, hsml.astype(np.float32), mass.astype(np.float32), qty)
+                self._upload_arrays(pos, hsml.astype(np.float32), mass.astype(np.float32), qty, camera)
             else:
-                self._upload_subset(idx)
+                self._upload_arrays(self._all_pos[idx], self._all_hsml[idx],
+                                    self._all_mass[idx], self._all_qty[idx], camera)
 
-    def _upload_arrays(self, pos, hsml, mass, qty):
-        """Upload pre-built arrays to GPU."""
+    def _upload_arrays(self, pos, hsml, mass, qty, camera=None):
+        """Upload pre-built arrays to GPU, splitting into points and quads."""
         self.n_particles = len(mass)
+        self.n_big = 0
 
         if self.n_particles == 0:
             return
 
-        for attr in ("pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo"):
+        # Release old buffers
+        for attr in ("pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo",
+                     "big_pos_vbo", "big_hsml_vbo", "big_mass_vbo", "big_qty_vbo"):
             old = getattr(self, attr, None)
             if old is not None:
                 old.release()
 
-        self.pos_vbo = self.ctx.buffer(pos.tobytes())
-        self.hsml_vbo = self.ctx.buffer(hsml.tobytes())
-        self.mass_vbo = self.ctx.buffer(mass.tobytes())
-        self.qty_vbo = self.ctx.buffer(qty.tobytes())
+        # Split into small (point sprites) and big (instanced quads)
+        MAX_POINT_PX = 64.0
+        if camera is not None and len(pos) > 0:
+            depths = (pos - camera.position) @ camera.forward
+            safe_depths = np.maximum(np.abs(depths), 0.01)
+            # Approximate pixel size: h / depth * proj[0][0] * viewport/2
+            # Use 512 as a conservative viewport half-width
+            point_px = hsml / safe_depths * 512
+            big_mask = point_px > MAX_POINT_PX
+        else:
+            big_mask = np.zeros(len(mass), dtype=bool)
 
+        small_mask = ~big_mask
+        n_small = int(small_mask.sum())
+        n_big = int(big_mask.sum())
+        self.n_big = n_big
+
+        # Upload small particles (point sprites)
+        if n_small > 0:
+            self.pos_vbo = self.ctx.buffer(pos[small_mask].tobytes())
+            self.hsml_vbo = self.ctx.buffer(hsml[small_mask].tobytes())
+            self.mass_vbo = self.ctx.buffer(mass[small_mask].tobytes())
+            self.qty_vbo = self.ctx.buffer(qty[small_mask].tobytes())
+        else:
+            self.pos_vbo = None
+            self.hsml_vbo = None
+            self.mass_vbo = None
+            self.qty_vbo = None
+
+        # Upload big particles (instanced quads)
+        if n_big > 0:
+            self.big_pos_vbo = self.ctx.buffer(pos[big_mask].tobytes())
+            self.big_hsml_vbo = self.ctx.buffer(hsml[big_mask].tobytes())
+            self.big_mass_vbo = self.ctx.buffer(mass[big_mask].tobytes())
+            self.big_qty_vbo = self.ctx.buffer(qty[big_mask].tobytes())
+        else:
+            self.big_pos_vbo = None
+            self.big_hsml_vbo = None
+            self.big_mass_vbo = None
+            self.big_qty_vbo = None
+
+        self.n_particles = n_small  # points count
         self._build_vao()
 
     def _upload_subset(self, idx):
@@ -714,24 +771,37 @@ class SplatRenderer:
         )
 
     def _build_vao(self):
-        """(Re)build vertex array object after buffer changes."""
+        """(Re)build vertex array objects for points and quads."""
         if self.vao_additive is not None:
             self.vao_additive.release()
+            self.vao_additive = None
+        if self.vao_quad is not None:
+            self.vao_quad.release()
+            self.vao_quad = None
 
-        if self.pos_vbo is None:
-            return
+        # Point sprites VAO
+        if self.pos_vbo is not None:
+            self.vao_additive = self.ctx.vertex_array(
+                self.prog_additive, [
+                    (self.pos_vbo, "3f", "in_position"),
+                    (self.hsml_vbo, "f", "in_hsml"),
+                    (self.mass_vbo, "f", "in_mass"),
+                    (self.qty_vbo, "f", "in_quantity"),
+                ],
+            )
 
-        content = [
-            (self.pos_vbo, "3f", "in_position"),
-            (self.hsml_vbo, "f", "in_hsml"),
-            (self.mass_vbo, "f", "in_mass"),
-            (self.qty_vbo, "f", "in_quantity"),
-        ]
-
-        self.vao_additive = self.ctx.vertex_array(
-            self.prog_additive,
-            content,
-        )
+        # Instanced quads VAO for large particles
+        if self.big_pos_vbo is not None:
+            self.vao_quad = self.ctx.vertex_array(
+                self.prog_quad, [
+                    (self.quad_vbo, "2f", "in_corner"),
+                    (self.big_pos_vbo, "3f/i", "in_position"),
+                    (self.big_hsml_vbo, "f/i", "in_hsml"),
+                    (self.big_mass_vbo, "f/i", "in_mass"),
+                    (self.big_qty_vbo, "f/i", "in_quantity"),
+                ],
+                index_buffer=self.quad_ibo,
+            )
 
     def _ensure_accum_fbo(self, width, height):
         """Create or resize the accumulation FBO."""
@@ -772,9 +842,17 @@ class SplatRenderer:
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.ONE, moderngl.ONE)  # pure additive
         self.ctx.disable(moderngl.DEPTH_TEST)
-        self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
 
-        self.vao_additive.render(moderngl.POINTS)
+        # Draw small particles as point sprites
+        if self.vao_additive is not None and self.n_particles > 0:
+            self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+            self.vao_additive.render(moderngl.POINTS)
+
+        # Draw large particles as instanced quads (no point size limit)
+        if self.vao_quad is not None and self.n_big > 0:
+            self.prog_quad["u_view"].write(view.tobytes())
+            self.prog_quad["u_proj"].write(proj.tobytes())
+            self.vao_quad.render(moderngl.TRIANGLES, instances=self.n_big)
 
         # Pass 2: resolve to screen
         self.ctx.screen.use()
@@ -855,22 +933,13 @@ class SplatRenderer:
     def release(self):
         """Clean up GPU resources."""
         for attr in (
-            "pos_vbo",
-            "hsml_vbo",
-            "mass_vbo",
-            "qty_vbo",
-            "fs_quad_vbo",
-            "star_pos_vbo",
-            "star_mass_vbo",
-            "vao_additive",
-            "vao_resolve",
-            "vao_star",
-            "prog_additive",
-            "prog_resolve",
-            "prog_star",
-            "_accum_fbo",
-            "_accum_tex_num",
-            "_accum_tex_den",
+            "pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo",
+            "big_pos_vbo", "big_hsml_vbo", "big_mass_vbo", "big_qty_vbo",
+            "quad_vbo", "quad_ibo", "fs_quad_vbo",
+            "star_pos_vbo", "star_mass_vbo",
+            "vao_additive", "vao_quad", "vao_resolve", "vao_star",
+            "prog_additive", "prog_quad", "prog_resolve", "prog_star",
+            "_accum_fbo", "_accum_tex_num", "_accum_tex_den",
         ):
             obj = getattr(self, attr, None)
             if obj is not None:
