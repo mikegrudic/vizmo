@@ -267,7 +267,21 @@ class DataFlyerApp:
         if self._composite:
             self._render_mode = RenderMode(
                 name="Composite", weight_field="", qty_field="", resolve_mode=-1)
-            # Don't update weights here — composite renders do it per-slot
+            # Auto-range each slot by doing a quick render + readback
+            if auto_range:
+                for i, s in enumerate(self._slot):
+                    w, q = self._compute_slot(s)
+                    self.renderer.resolve_mode = s["resolve"]
+                    self.renderer.log_scale = s["log"]
+                    self.renderer.update_weights(w, q)
+                    self.renderer.update_visible(self.camera)
+                    fb_w, fb_h = self.width, self.height
+                    self.renderer._ensure_fbo(fb_w, fb_h, which=1)
+                    self.renderer._render_accum(self.camera, fb_w, fb_h, self.renderer._accum_fbo)
+                    lo, hi = self.renderer.read_accum_range()
+                    s["min"] = lo
+                    s["max"] = hi
+                    self._msg(f"Slot {i} range: {lo:.3g} .. {hi:.3g}")
             return
 
         if self._render_mode_name in ("WeightedAverage", "WeightedVariance"):
