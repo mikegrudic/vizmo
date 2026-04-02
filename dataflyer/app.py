@@ -263,23 +263,24 @@ class DataFlyerApp:
 
     def _apply_render_mode(self, auto_range=True):
         """Rebuild render mode from current settings and re-weight the grid."""
+        # Reset progressive refinement so it restarts from the new data
+        self._refinement_level = 0
+        self._saved_lod = None
+        self._saved_budget = None
         self._composite = (self._render_mode_name == "Composite")
-        self._composite_cache = None  # invalidate on any mode/field change
         if self._composite:
             self._render_mode = RenderMode(
                 name="Composite", weight_field="", qty_field="", resolve_mode=-1)
-            self._build_composite_cache()
-            # Auto-range each slot using cached tree state
-            if auto_range and self._composite_cache:
-                grid = self.renderer._grid
+            # Only auto-range if slot limits are at defaults (never been set)
+            needs_range = auto_range and any(
+                s["min"] == -1.0 and s["max"] == 3.0 for s in self._slot
+            )
+            if needs_range:
                 for i, s in enumerate(self._slot):
-                    c = self._composite_cache[i]
-                    if grid is not None:
-                        grid.sorted_mass = c["sorted_mass"]
-                        grid.sorted_qty = c["sorted_qty"]
-                        grid.levels = c["levels"]
+                    w, q = self._compute_slot(s)
                     self.renderer.resolve_mode = s["resolve"]
                     self.renderer.log_scale = s["log"]
+                    self.renderer.update_weights(w, q)
                     self.renderer.update_visible(self.camera)
                     fb_w, fb_h = self.width, self.height
                     self.renderer._ensure_fbo(fb_w, fb_h, which=1)
@@ -367,50 +368,24 @@ class DataFlyerApp:
         s["resolve"] = resolve
         return weights, qty
 
-    def _build_composite_cache(self):
-        """Precompute and cache full tree state for both composite slots.
-
-        Caches sorted arrays + all tree levels (moments, derived quantities)
-        so per-frame rendering only swaps pointers — no moment recomputation.
-        """
-        grid = self.renderer._grid
-        if grid is None:
-            self._composite_cache = None
-            return
-        cache = []
-        for s in self._slot:
-            w, q = self._compute_slot(s)
-            self.renderer.update_weights(w, q)
-            # Save the full tree state (update_weights creates fresh arrays)
-            cache.append({
-                "sorted_mass": grid.sorted_mass,
-                "sorted_qty": grid.sorted_qty,
-                "levels": grid.levels,
-            })
-        self._composite_cache = cache
-
     def _render_composite_frame(self, fb_width, fb_height):
-        """Render two fields into separate FBOs and composite."""
+        """Render two fields into separate FBOs and composite.
+
+        Calls update_weights + update_visible per slot per frame.
+        Cost: ~2x update_weights + 2x cull. Correct because tree moments
+        are fully rebuilt for each slot.
+        """
         r = self.renderer
         r._ensure_fbo(fb_width, fb_height, which=1)
         r._ensure_fbo(fb_width, fb_height, which=2)
-        grid = r._grid
-
-        if self._composite_cache is None:
-            self._build_composite_cache()
 
         fbos = [r._accum_fbo, r._accum_fbo2]
         for i in range(2):
-            c = self._composite_cache[i]
-            if grid is not None:
-                # Swap cached tree state — no moment recomputation
-                grid.sorted_mass = c["sorted_mass"]
-                grid.sorted_qty = c["sorted_qty"]
-                grid.levels = c["levels"]
+            w, q = self._compute_slot(self._slot[i])
+            r.update_weights(w, q)
             r.update_visible(self.camera)
             r._render_accum(self.camera, fb_width, fb_height, fbos[i])
 
-        # Composite resolve
         s0, s1 = self._slot[0], self._slot[1]
         r.render_composite(
             self.camera, fb_width, fb_height,
@@ -478,6 +453,9 @@ class DataFlyerApp:
         self.overlay.enabled = not self.overlay.enabled
         self._msg(f"Dev overlay: {'on' if self.overlay.enabled else 'off'}")
 
+    def _toggle_ui(self):
+        self._ui_hidden = not getattr(self, '_ui_hidden', False)
+
     def _toggle_importance_sampling(self):
         self.renderer.use_importance_sampling = not self.renderer.use_importance_sampling
         self._msg(f"Importance sampling: {'on' if self.renderer.use_importance_sampling else 'off'}")
@@ -527,6 +505,7 @@ class DataFlyerApp:
             glfw.KEY_L:             (self._toggle_log_scale,        "Toggle log/linear"),
             glfw.KEY_P:             (self._screenshot,              "Screenshot"),
             glfw.KEY_BACKSLASH:     (self._toggle_overlay,          "Toggle dev overlay"),
+            glfw.KEY_TAB:           (self._toggle_ui,               "Hide/show all UI"),
             glfw.KEY_I:             (self._toggle_importance_sampling, "Toggle importance sampling"),
             glfw.KEY_K:             (self._cycle_kernel,            "Cycle kernel"),
             glfw.KEY_T:             (self._toggle_tree,             "Toggle tree"),
@@ -560,6 +539,9 @@ class DataFlyerApp:
                 return
             # Dev overlay
             if self.overlay.enabled and self.overlay.on_click(fx, fy, self.renderer):
+                self._refinement_level = 0
+                self._saved_lod = None
+                self._saved_budget = None
                 self.renderer.update_visible(self.camera)
                 return
         self.camera.on_mouse_button(button, action)
@@ -674,15 +656,35 @@ class DataFlyerApp:
                 self._still_frames = 0
                 self._refinement_level = 0  # 0=moving, 1=stopped, 2=refined, 3=full
                 self._last_cull_time = 0.0
+                self._saved_lod = None
+                self._saved_budget = None
             if moved:
                 self._still_frames = 0
                 if self._refinement_level != 0:
                     self._refinement_level = 0
+                # Auto-LOD: adjust lod_pixels/budget to target 5 FPS (200ms) while moving
+                if self.renderer.auto_lod and dt > 0:
+                    target_ms = 1000.0 / max(self.renderer.target_fps, 1.0)
+                    frame_ms = dt * 1000
+                    if frame_ms > target_ms * 1.5:
+                        # Too slow: coarsen LOD or reduce budget
+                        self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
+                        self.renderer.max_render_particles = max(
+                            100_000, self.renderer.max_render_particles // 2)
+                    elif frame_ms > target_ms:
+                        self.renderer.lod_pixels = min(256, self.renderer.lod_pixels + 1)
+                    elif frame_ms < target_ms * 0.5 and self.renderer.lod_pixels > 1:
+                        # Fast enough: increase quality
+                        self.renderer.lod_pixels = max(1, self.renderer.lod_pixels - 1)
+                        self.renderer.max_render_particles = min(
+                            self.renderer.n_total,
+                            int(self.renderer.max_render_particles * 1.5))
                 # Throttle culls: skip if less than cull_interval since last cull
                 if now - self._last_cull_time >= self.renderer.cull_interval:
-                    t0 = time.perf_counter()
-                    self.renderer.update_visible(self.camera)
-                    t_cull = time.perf_counter() - t0
+                    if not self._composite:
+                        t0 = time.perf_counter()
+                        self.renderer.update_visible(self.camera)
+                        t_cull = time.perf_counter() - t0
                     self._last_cull_time = now
             elif self._was_moving or self._refinement_level < 3:
                 self._still_frames += 1
@@ -691,29 +693,35 @@ class DataFlyerApp:
                     # Recompute LOS projection if camera rotated since last compute
                     if self._refinement_level == 0 and self._is_los_stale():
                         self._apply_render_mode(auto_range=False)
-                    saved_lod = self.renderer.lod_pixels
-                    saved_budget = self.renderer.max_render_particles
+                    if self._saved_lod is None:
+                        self._saved_lod = self.renderer.lod_pixels
+                        self._saved_budget = self.renderer.max_render_particles
                     if self._refinement_level == 0:
-                        # First refinement: halve LOD threshold
-                        self.renderer.lod_pixels = max(1, saved_lod // 2)
-                        self.renderer.max_render_particles = min(saved_budget * 2, self.renderer.n_total)
+                        self.renderer.lod_pixels = max(1, self._saved_lod // 2)
+                        self.renderer.max_render_particles = min(self._saved_budget * 2, self.renderer.n_total)
                         self._refinement_level = 1
                     elif self._refinement_level == 1:
-                        # Second: minimize LOD, double budget again
                         self.renderer.lod_pixels = 1
-                        self.renderer.max_render_particles = min(saved_budget * 2, self.renderer.n_total)
+                        self.renderer.max_render_particles = min(self._saved_budget * 2, self.renderer.n_total)
                         self._refinement_level = 2
                     elif self._refinement_level == 2:
-                        # Final: full quality (LOD off, max budget)
                         self.renderer.lod_pixels = 1
                         self.renderer.max_render_particles = self.renderer.n_total
                         self._refinement_level = 3
-                    t0 = time.perf_counter()
-                    self.renderer.update_visible(self.camera)
-                    t_cull = time.perf_counter() - t0
-                    # Restore user settings (renderer uses them next time camera moves)
-                    self.renderer.lod_pixels = saved_lod
-                    self.renderer.max_render_particles = saved_budget
+                    if not self._composite:
+                        # Non-composite: cull now with refined settings, then restore
+                        t0 = time.perf_counter()
+                        self.renderer.update_visible(self.camera)
+                        t_cull = time.perf_counter() - t0
+                        self.renderer.lod_pixels = self._saved_lod
+                        self.renderer.max_render_particles = self._saved_budget
+                    # Composite: leave refined settings active for _render_composite_frame
+            if moved and self._saved_lod is not None:
+                # Camera started moving again — restore user settings
+                self.renderer.lod_pixels = self._saved_lod
+                self.renderer.max_render_particles = self._saved_budget
+                self._saved_lod = None
+                self._saved_budget = None
             self._was_moving = moved
 
             # Get framebuffer size (may differ from window size on retina)
@@ -745,31 +753,31 @@ class DataFlyerApp:
                 self._timings["cull"] = self._timings["cull"] * (1 - alpha) + t_cull * alpha
             self._timings["render"] = self._timings["render"] * (1 - alpha) + t_render_gpu * alpha
 
-            # User menu (always visible)
-            self.user_menu.set_framebuffer_size(fb_width, fb_height)
-            self.user_menu.update(
-                self.renderer,
-                AVAILABLE_COLORMAPS[self._cmap_idx], AVAILABLE_COLORMAPS,
-                sd_fields=self._sd_fields, sd_field=self._sd_field,
-                sd_field2=self._sd_field2, sd_op=self._sd_op, sd_ops=self._SD_OPS,
-                render_modes=self._RENDER_MODES, render_mode_name=self._render_mode_name,
-                wa_data_field=self._wa_data_field,
-                vector_fields=self._vector_fields,
-                vector_projection=self._vector_projection,
-                vector_projections=self._VECTOR_PROJECTIONS,
-                composite_slots=self._slot if self._composite else None,
-            )
-            self.user_menu.render()
-
-            # Dev overlay
-            if self.overlay.enabled:
-                self.overlay.set_framebuffer_size(fb_width, fb_height)
-                self.overlay.update(
-                    self.renderer, self.camera, self._fps,
-                    self._render_mode.name, AVAILABLE_COLORMAPS[self._cmap_idx],
-                    self._timings, self._last_message, self.renderer.cull_interval,
+            # UI overlays
+            if not getattr(self, '_ui_hidden', False):
+                self.user_menu.set_framebuffer_size(fb_width, fb_height)
+                self.user_menu.update(
+                    self.renderer,
+                    AVAILABLE_COLORMAPS[self._cmap_idx], AVAILABLE_COLORMAPS,
+                    sd_fields=self._sd_fields, sd_field=self._sd_field,
+                    sd_field2=self._sd_field2, sd_op=self._sd_op, sd_ops=self._SD_OPS,
+                    render_modes=self._RENDER_MODES, render_mode_name=self._render_mode_name,
+                    wa_data_field=self._wa_data_field,
+                    vector_fields=self._vector_fields,
+                    vector_projection=self._vector_projection,
+                    vector_projections=self._VECTOR_PROJECTIONS,
+                    composite_slots=self._slot if self._composite else None,
                 )
-                self.overlay.render()
+                self.user_menu.render()
+
+                if self.overlay.enabled:
+                    self.overlay.set_framebuffer_size(fb_width, fb_height)
+                    self.overlay.update(
+                        self.renderer, self.camera, self._fps,
+                        self._render_mode.name, AVAILABLE_COLORMAPS[self._cmap_idx],
+                        self._timings, self._last_message, self.renderer.cull_interval,
+                    )
+                    self.overlay.render()
 
             glfw.swap_buffers(self.window)
 

@@ -306,14 +306,13 @@ class Panel:
             key, delta = widget[3], widget[4]
             self._dropdown_scroll[key] = self._dropdown_scroll.get(key, 0) + delta
             return True
-        if wtype == "slider_dec":
+        if wtype in ("slider_dec", "slider_inc"):
+            key, vmin, vmax = widget[3], widget[4], widget[5]
             if lx < self._panel_w // 3:
-                key, vmin, vmax = widget[3], widget[4], widget[5]
                 return ("slider_dec", key, vmin, vmax)
-        if wtype == "slider_inc":
-            if lx > self._panel_w * 2 // 3:
-                key, vmin, vmax = widget[3], widget[4], widget[5]
+            elif lx > self._panel_w * 2 // 3:
                 return ("slider_inc", key, vmin, vmax)
+            return True  # clicked in middle of slider, consume but do nothing
         return None
 
     def render(self):
@@ -383,11 +382,15 @@ class DevOverlay(Panel):
         items.append(("toggle", "Hybrid Rendering", renderer.use_hybrid_rendering, "use_hybrid_rendering"))
         items.append(("toggle", "Quad Rendering", renderer.use_quad_rendering, "use_quad_rendering"))
         items.append(("toggle", "Aniso Summaries", renderer.use_aniso_summaries, "use_aniso_summaries"))
+        items.append(("toggle", "Auto LOD", renderer.auto_lod, "auto_lod"))
+        if renderer.auto_lod:
+            items.append(("slider", "Target FPS", renderer.target_fps, 1.0, 60.0, "target_fps"))
         items.append(("text", ""))
 
         items.append(("dropdown", "Kernel", renderer.kernel, renderer.KERNELS, "kernel"))
         items.append(("text", ""))
 
+        items.append(("slider", "Hsml Scale", renderer.hsml_scale, 0.1, 5.0, "hsml_scale"))
         items.append(("slider", "Summary Scale", renderer.summary_scale, 0.1, 10.0, "summary_scale"))
         items.append(("slider", "Summary Overlap", renderer.summary_overlap, 0.0, 1.0, "summary_overlap"))
         items.append(("slider", "Tree Min N", renderer.tree_min_particles, 0, 1e7, "tree_min_particles"))
@@ -522,8 +525,9 @@ class UserMenu(Panel):
             s["data"] = value
         elif field_key == "proj":
             s["proj"] = value
-        # Invalidate cache — next frame will rebuild tree moments for changed slot
-        app._composite_cache = None
+        # Reset limits to trigger auto-range on next _apply_render_mode
+        s["min"] = -1.0
+        s["max"] = 3.0
 
     def _commit_edit(self, app):
         if self._editing and self._edit_buffer:

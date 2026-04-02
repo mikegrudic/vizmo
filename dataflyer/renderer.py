@@ -300,9 +300,12 @@ class SplatRenderer:
         self.kernel = "cubic_spline"
         self.use_hybrid_rendering = True  # use quads for >64px particles
         self.use_quad_rendering = False  # True = all quads (pre-optimization path)
+        self.hsml_scale = 1.0  # global scaling factor for smoothing lengths
         self.summary_scale = 1.0  # scaling factor applied to summary splats
         self.summary_overlap = 0.1  # cell-size padding to bridge voids at tree boundaries
         self.use_aniso_summaries = True  # False = isotropic spherical summaries
+        self.auto_lod = True  # auto-tune LOD to maintain target FPS while moving
+        self.target_fps = 15.0  # target FPS for auto-LOD
         self.cull_interval = 0.5  # seconds between culls while moving
         self._needs_grid_rebuild = False
 
@@ -417,6 +420,10 @@ class SplatRenderer:
 
         if self.n_particles == 0:
             return
+
+        # Apply global smoothing length scaling
+        if self.hsml_scale != 1.0:
+            hsml = hsml * self.hsml_scale
 
         # Release old buffers
         for attr in (
