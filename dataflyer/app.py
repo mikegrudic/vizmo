@@ -207,7 +207,7 @@ class DataFlyerApp:
             vec = self.data.get_vector_field(field_name)
             proj = self._vector_projection
             if proj == "LOS":
-                fwd = self.camera.forward
+                fwd = self.camera.forward.copy()
                 self._los_camera_fwd = fwd.copy()
                 return (vec @ fwd).astype(np.float32)
             elif proj == "|v|":
@@ -239,7 +239,7 @@ class DataFlyerApp:
 
     def _uses_vector_field(self):
         """Check if any active field is a vector field."""
-        if self._render_mode_name == "WeightedAverage":
+        if self._render_mode_name in ("WeightedAverage", "WeightedVariance"):
             if self._wa_data_field in self._vector_fields:
                 return True
         if self._sd_field in self._vector_fields:
@@ -267,6 +267,8 @@ class DataFlyerApp:
         self._refine_budget = 0
         self._refine_saved_lod = None
         self._refine_saved_budget = None
+        # Force fresh LOS projection from current camera direction
+        self._los_camera_fwd = None
         self._composite = (self._render_mode_name == "Composite")
         if self._composite:
             self._render_mode = RenderMode(
@@ -670,6 +672,10 @@ class DataFlyerApp:
                 self._refine_saved_lod = None
                 self._refine_saved_budget = None
 
+            # Check LOS staleness every frame (camera may rotate at any time)
+            if self._is_los_stale():
+                self._apply_render_mode(auto_range=True)
+
             if moved:
                 # --- MOVING: auto-LOD + throttled cull ---
                 # Restore user base if coming out of refinement
@@ -727,9 +733,6 @@ class DataFlyerApp:
                 # --- STOPPED: progressive refinement ---
                 if self._was_moving:
                     self._smooth_frame_ms = 0.0
-                    # LOS recompute if needed
-                    if self._is_los_stale():
-                        self._apply_render_mode(auto_range=False)
                     # Save current settings, start refinement from user base
                     self._refine_saved_lod = self.renderer.lod_pixels
                     self._refine_saved_budget = self.renderer.max_render_particles

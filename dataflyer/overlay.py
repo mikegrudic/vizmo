@@ -780,6 +780,11 @@ class UserMenu(Panel):
                 self._handle_slot_dropdown(app, slot_idx, key[2:], value)
             elif key == "render_mode":
                 app._render_mode_name = value
+                # Set sensible defaults for WeightedVariance
+                if value == "WeightedVariance" and app._vector_fields:
+                    app._sd_field = "Masses"
+                    app._wa_data_field = app._vector_fields[0]  # e.g. "Velocities"
+                    app._vector_projection = "LOS"
                 app._apply_render_mode()
             elif key == "sd_field":
                 app._set_sd_field(value)
