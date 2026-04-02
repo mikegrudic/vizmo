@@ -417,19 +417,16 @@ class DataFlyerApp:
             # Update camera
             moved = self.camera.update(dt)
 
-            # Re-cull visible particles when camera moves or just stopped
+            # Re-cull visible particles every frame when camera moves
             t_cull = 0.0
-            if not hasattr(self, '_last_cull_time'):
-                self._last_cull_time = 0.0
+            if not hasattr(self, '_was_moving'):
                 self._was_moving = False
-            need_cull = moved or self._was_moving  # catch final frame after mouse release
+            need_cull = moved or self._was_moving
             self._was_moving = moved
             if need_cull and self.renderer.n_total > self.renderer.max_render_particles:
-                if now - self._last_cull_time > 0.1:
-                    t0 = time.perf_counter()
-                    self.renderer.update_visible(self.camera)
-                    t_cull = time.perf_counter() - t0
-                    self._last_cull_time = now
+                t0 = time.perf_counter()
+                self.renderer.update_visible(self.camera)
+                t_cull = time.perf_counter() - t0
 
             # Get framebuffer size (may differ from window size on retina)
             fb_width, fb_height = glfw.get_framebuffer_size(self.window)
