@@ -70,6 +70,39 @@ def _load_shader(name):
 from .spatial_grid import SpatialGrid  # noqa: E402
 
 
+class BufferSet:
+    """Manages a named group of GPU buffers with automatic lifecycle."""
+
+    def __init__(self, ctx):
+        self._ctx = ctx
+        self._buffers = {}
+
+    def upload(self, name, data):
+        """Upload data to a named buffer, releasing any previous buffer."""
+        if name in self._buffers:
+            self._buffers[name].release()
+        self._buffers[name] = self._ctx.buffer(data.tobytes())
+
+    def get(self, name):
+        """Get a buffer by name, or None."""
+        return self._buffers.get(name)
+
+    def release_all(self):
+        """Release all buffers."""
+        for buf in self._buffers.values():
+            try:
+                buf.release()
+            except Exception:
+                pass
+        self._buffers.clear()
+
+    def __contains__(self, name):
+        return name in self._buffers
+
+    def __bool__(self):
+        return bool(self._buffers)
+
+
 class SplatRenderer:
     def __init__(self, ctx):
         self.ctx = ctx
