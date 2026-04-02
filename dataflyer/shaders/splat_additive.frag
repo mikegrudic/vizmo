@@ -1,11 +1,8 @@
 #version 330
 
-// Additive blending pass for weighted-quantity rendering.
-// Outputs to a 2-attachment FBO:
-//   attachment 0: sum(mass * quantity * W / h^2)  (numerator)
-//   attachment 1: sum(mass * W / h^2)             (denominator = surface density)
+// Additive blending pass using point sprites.
+// gl_PointCoord gives [0,1] within the point square.
 
-in vec2 v_offset;
 in float v_mass;
 in float v_hsml;
 in float v_quantity;
@@ -14,7 +11,6 @@ layout(location = 0) out float out_numerator;
 layout(location = 1) out float out_denominator;
 
 float cubic_spline_2d(float q) {
-    // Normalized 2D cubic spline kernel, matches meshoid kernel2d
     float k;
     if (q <= 0.5) {
         k = 1.0 - 6.0 * q * q * (1.0 - q);
@@ -28,7 +24,8 @@ float cubic_spline_2d(float q) {
 }
 
 void main() {
-    float r = length(v_offset);
+    vec2 coord = gl_PointCoord * 2.0 - 1.0;
+    float r = length(coord);
     if (r > 1.0) discard;
 
     float w = cubic_spline_2d(r);

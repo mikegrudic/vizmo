@@ -517,18 +517,6 @@ class SplatRenderer:
             fragment_shader=_load_shader("star.frag"),
         )
 
-        # Quad vertices for billboard (two triangles)
-        quad = np.array([
-            -1, -1,
-             1, -1,
-            -1,  1,
-             1,  1,
-        ], dtype=np.float32)
-        self.quad_vbo = ctx.buffer(quad.tobytes())
-
-        quad_indices = np.array([0, 1, 2, 2, 1, 3], dtype=np.int32)
-        self.quad_ibo = ctx.buffer(quad_indices.tobytes())
-
         # Fullscreen quad for resolve pass
         fs_quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype=np.float32)
         self.fs_quad_vbo = ctx.buffer(fs_quad.tobytes())
@@ -717,15 +705,14 @@ class SplatRenderer:
             return
 
         content = [
-            (self.quad_vbo, "2f", "in_corner"),
-            (self.pos_vbo, "3f/i", "in_position"),
-            (self.hsml_vbo, "f/i", "in_hsml"),
-            (self.mass_vbo, "f/i", "in_mass"),
-            (self.qty_vbo, "f/i", "in_quantity"),
+            (self.pos_vbo, "3f", "in_position"),
+            (self.hsml_vbo, "f", "in_hsml"),
+            (self.mass_vbo, "f", "in_mass"),
+            (self.qty_vbo, "f", "in_quantity"),
         ]
 
         self.vao_additive = self.ctx.vertex_array(
-            self.prog_additive, content, index_buffer=self.quad_ibo,
+            self.prog_additive, content,
         )
 
     def _ensure_accum_fbo(self, width, height):
@@ -767,11 +754,9 @@ class SplatRenderer:
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.ONE, moderngl.ONE)  # pure additive
         self.ctx.disable(moderngl.DEPTH_TEST)
+        self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
 
-        self.vao_additive.render(
-            moderngl.TRIANGLES,
-            instances=self.n_particles,
-        )
+        self.vao_additive.render(moderngl.POINTS)
 
         # Pass 2: resolve to screen
         self.ctx.screen.use()
@@ -852,7 +837,7 @@ class SplatRenderer:
     def release(self):
         """Clean up GPU resources."""
         for attr in ("pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo",
-                     "quad_vbo", "quad_ibo", "fs_quad_vbo",
+                     "fs_quad_vbo",
                      "star_pos_vbo", "star_mass_vbo",
                      "vao_additive", "vao_resolve", "vao_star",
                      "prog_additive", "prog_resolve", "prog_star",
