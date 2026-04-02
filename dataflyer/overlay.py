@@ -522,6 +522,8 @@ class UserMenu(Panel):
             s["data"] = value
         elif field_key == "proj":
             s["proj"] = value
+        # Invalidate cache — next frame will rebuild tree moments for changed slot
+        app._composite_cache = None
 
     def _commit_edit(self, app):
         if self._editing and self._edit_buffer:

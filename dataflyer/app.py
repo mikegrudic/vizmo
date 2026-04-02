@@ -264,16 +264,22 @@ class DataFlyerApp:
     def _apply_render_mode(self, auto_range=True):
         """Rebuild render mode from current settings and re-weight the grid."""
         self._composite = (self._render_mode_name == "Composite")
+        self._composite_cache = None  # invalidate on any mode/field change
         if self._composite:
             self._render_mode = RenderMode(
                 name="Composite", weight_field="", qty_field="", resolve_mode=-1)
-            # Auto-range each slot by doing a quick render + readback
-            if auto_range:
+            self._build_composite_cache()
+            # Auto-range each slot using cached tree state
+            if auto_range and self._composite_cache:
+                grid = self.renderer._grid
                 for i, s in enumerate(self._slot):
-                    w, q = self._compute_slot(s)
+                    c = self._composite_cache[i]
+                    if grid is not None:
+                        grid.sorted_mass = c["sorted_mass"]
+                        grid.sorted_qty = c["sorted_qty"]
+                        grid.levels = c["levels"]
                     self.renderer.resolve_mode = s["resolve"]
                     self.renderer.log_scale = s["log"]
-                    self.renderer.update_weights(w, q)
                     self.renderer.update_visible(self.camera)
                     fb_w, fb_h = self.width, self.height
                     self.renderer._ensure_fbo(fb_w, fb_h, which=1)
@@ -361,27 +367,51 @@ class DataFlyerApp:
         s["resolve"] = resolve
         return weights, qty
 
+    def _build_composite_cache(self):
+        """Precompute and cache full tree state for both composite slots.
+
+        Caches sorted arrays + all tree levels (moments, derived quantities)
+        so per-frame rendering only swaps pointers — no moment recomputation.
+        """
+        grid = self.renderer._grid
+        if grid is None:
+            self._composite_cache = None
+            return
+        cache = []
+        for s in self._slot:
+            w, q = self._compute_slot(s)
+            self.renderer.update_weights(w, q)
+            # Save the full tree state (update_weights creates fresh arrays)
+            cache.append({
+                "sorted_mass": grid.sorted_mass,
+                "sorted_qty": grid.sorted_qty,
+                "levels": grid.levels,
+            })
+        self._composite_cache = cache
+
     def _render_composite_frame(self, fb_width, fb_height):
         """Render two fields into separate FBOs and composite."""
         r = self.renderer
         r._ensure_fbo(fb_width, fb_height, which=1)
         r._ensure_fbo(fb_width, fb_height, which=2)
+        grid = r._grid
 
-        # Slot 0 (lightness): full update_weights + cull + render into FBO1
-        s0 = self._slot[0]
-        w0, q0 = self._compute_slot(s0)
-        r.update_weights(w0, q0)
-        r.update_visible(self.camera)
-        r._render_accum(self.camera, fb_width, fb_height, r._accum_fbo)
+        if self._composite_cache is None:
+            self._build_composite_cache()
 
-        # Slot 1 (color): full update_weights + cull + render into FBO2
-        s1 = self._slot[1]
-        w1, q1 = self._compute_slot(s1)
-        r.update_weights(w1, q1)
-        r.update_visible(self.camera)
-        r._render_accum(self.camera, fb_width, fb_height, r._accum_fbo2)
+        fbos = [r._accum_fbo, r._accum_fbo2]
+        for i in range(2):
+            c = self._composite_cache[i]
+            if grid is not None:
+                # Swap cached tree state — no moment recomputation
+                grid.sorted_mass = c["sorted_mass"]
+                grid.sorted_qty = c["sorted_qty"]
+                grid.levels = c["levels"]
+            r.update_visible(self.camera)
+            r._render_accum(self.camera, fb_width, fb_height, fbos[i])
 
         # Composite resolve
+        s0, s1 = self._slot[0], self._slot[1]
         r.render_composite(
             self.camera, fb_width, fb_height,
             s0["resolve"], s0["min"], s0["max"], s0["log"],
