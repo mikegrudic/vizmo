@@ -421,7 +421,7 @@ class SpatialGrid:
             mass.astype(np.float32), qty.astype(np.float32),
         )
 
-    def query_frustum_lod(self, camera, max_particles, lod_pixels=4, importance_sampling=False, viewport_width=2048):
+    def query_frustum_lod(self, camera, max_particles, lod_pixels=4, importance_sampling=False, viewport_width=2048, summary_overlap=0.0):
         """Top-down multi-level LOD query. Returns (pos, hsml, mass, qty) arrays.
 
         All data comes from pre-sorted arrays built at grid construction time.
@@ -487,7 +487,7 @@ class SpatialGrid:
 
         s_idx = np.where(summary_mask)[0]
         if len(s_idx) > 0:
-            summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx], lv["cov"][s_idx], lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30)))
+            summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx], lv["cov"][s_idx], lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30), lv["cs"]))
 
         refine_cells = np.where(refine_mask)[0]
 
@@ -535,7 +535,7 @@ class SpatialGrid:
             # Summary splats for small cells
             s_idx = child_flat[small]
             if len(s_idx) > 0:
-                summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx], lv["cov"][s_idx], lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30)))
+                summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx], lv["cov"][s_idx], lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30), lv["cs"]))
 
             if li == 0:
                 # Finest level: real particles for large cells
@@ -605,10 +605,21 @@ class SpatialGrid:
             s_qty = np.concatenate([p[3] for p in summary_parts]).astype(np.float32)
             s_cov = np.concatenate([p[4] for p in summary_parts]).astype(np.float32)
             s_mean_h2 = np.concatenate([p[5] for p in summary_parts]).astype(np.float32)
+            # Per-splat cell size² (each level may differ)
+            s_cs2 = np.concatenate([
+                np.broadcast_to((p[6]**2)[None, :], (len(p[0]), 3))
+                for p in summary_parts
+            ]).astype(np.float32)
             # Add kernel smoothing to covariance: Σ_eff = Σ_spatial + 0.225*<h²>*I
             s_cov[:, 0] += 0.225 * s_mean_h2  # xx
             s_cov[:, 3] += 0.225 * s_mean_h2  # yy
             s_cov[:, 5] += 0.225 * s_mean_h2  # zz
+            # Add cell-size padding to bridge voids at cell boundaries
+            # α*cs² ensures neighboring Gaussians overlap sufficiently
+            alpha = summary_overlap
+            s_cov[:, 0] += alpha * s_cs2[:, 0]  # xx
+            s_cov[:, 3] += alpha * s_cs2[:, 1]  # yy
+            s_cov[:, 5] += alpha * s_cs2[:, 2]  # zz
         else:
             s_pos, s_hsml, s_mass, s_qty, s_cov = z3, z1, z1, z1, z6
 
@@ -721,6 +732,7 @@ class SplatRenderer:
         self.use_hybrid_rendering = True  # use quads for >64px particles
         self.use_quad_rendering = False  # True = all quads (pre-optimization path)
         self.summary_scale = 1.0  # scaling factor applied to summary splats
+        self.summary_overlap = 0.1  # cell-size padding to bridge voids at tree boundaries
         self.use_aniso_summaries = True  # False = isotropic spherical summaries
         self.cull_interval = 0.5  # seconds between culls while moving
 
@@ -756,6 +768,7 @@ class SplatRenderer:
                 lod_pixels=self.lod_pixels,
                 importance_sampling=self.use_importance_sampling,
                 viewport_width=self._viewport_width,
+                summary_overlap=self.summary_overlap,
             )
             if len(result) == 9:
                 # LOD path: real particles + anisotropic summaries

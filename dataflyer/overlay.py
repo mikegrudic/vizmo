@@ -113,6 +113,7 @@ class DevOverlay:
 
         # Sliders
         items.append(("slider", "Summary Scale", renderer.summary_scale, 0.1, 10.0, "summary_scale"))
+        items.append(("slider", "Summary Overlap", renderer.summary_overlap, 0.0, 1.0, "summary_overlap"))
         items.append(("slider", "Cull Interval", renderer.cull_interval, 0.0, 5.0, "cull_interval"))
         items.append(("text", f"Aniso splats: {renderer.n_aniso:,}"))
 
