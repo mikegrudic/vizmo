@@ -9,8 +9,7 @@ SHADER_DIR = Path(__file__).parent / "shaders"
 
 
 @njit(parallel=True, cache=True)
-def _gather_subsampled_direct(cell_start, vis_cells, budget,
-                               s_pos, s_hsml, s_mass, s_qty):
+def _gather_subsampled_direct(cell_start, vis_cells, budget, s_pos, s_hsml, s_mass, s_qty):
     """Gather particle data with uniform stride subsampling."""
     n_cells = len(vis_cells)
 
@@ -61,9 +60,9 @@ def _gather_subsampled_direct(cell_start, vis_cells, budget,
 
 
 @njit(parallel=True, cache=True)
-def _gather_importance_sampled(cell_start, vis_cells, budget,
-                                s_pos, s_hsml, s_mass, s_qty,
-                                cell_depths, cell_hsml_summary):
+def _gather_importance_sampled(
+    cell_start, vis_cells, budget, s_pos, s_hsml, s_mass, s_qty, cell_depths, cell_hsml_summary
+):
     """Gather particles with per-cell importance-weighted strides.
 
     Each cell gets a stride based on its angular area weight:
@@ -93,11 +92,13 @@ def _gather_importance_sampled(cell_start, vis_cells, budget,
         sum_w += w * n
 
     if total == 0 or sum_w == 0:
-        return (np.empty((0, 3), dtype=np.float32),
-                np.empty(0, dtype=np.float32),
-                np.empty(0, dtype=np.float32),
-                np.empty(0, dtype=np.float32),
-                np.int64(0))
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+            np.int64(0),
+        )
 
     # Per-cell: allocate budget proportional to weight
     # stride_i = max(1, n_i / allocated_i) where allocated_i = budget * w_i / sum_w
@@ -150,6 +151,7 @@ def _gather_importance_sampled(cell_start, vis_cells, budget,
 
     return o_pos, o_hsml, o_mass, o_qty, total
 
+
 # Maximum particles to render per frame for interactive performance
 MAX_RENDER_PARTICLES = 4_000_000
 
@@ -175,14 +177,12 @@ class SpatialGrid:
 
         # Finest-level cell assignment and sort
         cs = box / n_cells
-        cell_idx = np.clip(
-            ((positions - self.pmin) / cs).astype(np.int32), 0, n_cells - 1
-        )
+        cell_idx = np.clip(((positions - self.pmin) / cs).astype(np.int32), 0, n_cells - 1)
         cell_id = cell_idx[:, 0] * n_cells * n_cells + cell_idx[:, 1] * n_cells + cell_idx[:, 2]
         self.sort_order = np.argsort(cell_id)
         sorted_cell_id = cell_id[self.sort_order]
 
-        nc3 = n_cells ** 3
+        nc3 = n_cells**3
         self.cell_start = np.zeros(nc3 + 1, dtype=np.int64)
         unique_cells, counts = np.unique(sorted_cell_id, return_counts=True)
         self.cell_start[unique_cells + 1] = counts
@@ -218,7 +218,7 @@ class SpatialGrid:
         s_h = hsml[so]
         s_q = quantity[so]
 
-        nc3 = nc ** 3
+        nc3 = nc**3
         starts = self.cell_start[:-1].astype(np.intp)
         nonempty = starts < self.cell_start[1:]
         reduce_at = starts[nonempty]
@@ -237,11 +237,11 @@ class SpatialGrid:
             safe = np.maximum(mass_ne, 1e-30)
             mp_ne = np.add.reduceat(s_p * s_m[:, None], reduce_at)
             mq_ne = np.add.reduceat(s_m * s_q, reduce_at)
-            mh2_ne = np.add.reduceat(s_m * s_h ** 2, reduce_at)
-            mp2_ne = np.add.reduceat(s_p ** 2 * s_m[:, None], reduce_at)
+            mh2_ne = np.add.reduceat(s_m * s_h**2, reduce_at)
+            mp2_ne = np.add.reduceat(s_p**2 * s_m[:, None], reduce_at)
 
             com_ne = mp_ne / safe[:, None]
-            var_ne = (mp2_ne / safe[:, None] - com_ne ** 2).sum(axis=1)
+            var_ne = (mp2_ne / safe[:, None] - com_ne**2).sum(axis=1)
 
             cell_mass[ne_idx] = mass_ne
             cell_com[ne_idx] = com_ne
@@ -252,20 +252,26 @@ class SpatialGrid:
             #   <r^2>_kernel = h^2/2, projected spatial var = 2/3 * V_3d
             #   h_summary^2/2 = 2/3 * V_3d + <h^2>/2
             #   h_summary = sqrt(4/3 * V_3d + <h^2>)
-            h_var = np.sqrt(np.maximum((4.0/3.0) * var_ne + mh2_ne / safe, 1e-30))
+            h_var = np.sqrt(np.maximum((4.0 / 3.0) * var_ne + mh2_ne / safe, 1e-30))
             cell_hsml[ne_idx] = h_var
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
         cz = np.arange(nc, dtype=np.float32) * cs[2] + self.pmin[2] + cs[2] * 0.5
-        gx, gy, gz = np.meshgrid(cx, cy, cz, indexing='ij')
+        gx, gy, gz = np.meshgrid(cx, cy, cz, indexing="ij")
         centers = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
 
         return {
-            "nc": nc, "cs": cs,
-            "mass": cell_mass, "com": cell_com, "hsml": cell_hsml, "qty": cell_qty,
-            "mx2": cell_mx2, "mh2": cell_mh2,  # for coarsening
-            "cell_start": self.cell_start, "sort_order": self.sort_order,
+            "nc": nc,
+            "cs": cs,
+            "mass": cell_mass,
+            "com": cell_com,
+            "hsml": cell_hsml,
+            "qty": cell_qty,
+            "mx2": cell_mx2,
+            "mh2": cell_mh2,  # for coarsening
+            "cell_start": self.cell_start,
+            "sort_order": self.sort_order,
             "centers": centers,
             "half_diag": float(np.linalg.norm(cs) * 0.5),
         }
@@ -275,13 +281,13 @@ class SpatialGrid:
         cnc = child["nc"]
         nc = cnc // 2
         cs = child["cs"] * 2
-        nc3 = nc ** 3
+        nc3 = nc**3
 
         # Map child cell (ix, iy, iz) -> parent cell (ix//2, iy//2, iz//2)
         cix = np.arange(cnc)
         ciy = np.arange(cnc)
         ciz = np.arange(cnc)
-        gx, gy, gz = np.meshgrid(cix, ciy, ciz, indexing='ij')
+        gx, gy, gz = np.meshgrid(cix, ciy, ciz, indexing="ij")
         parent_id = (gx.ravel() // 2) * nc * nc + (gy.ravel() // 2) * nc + (gz.ravel() // 2)
 
         # Sum child properties into parent cells
@@ -301,26 +307,30 @@ class SpatialGrid:
         safe = np.maximum(cell_mass, 1e-30)
         cell_com = cell_mp / safe[:, None]
         cell_qty = cell_mq / safe
-        var = (cell_mx2 / safe[:, None] - cell_com ** 2).sum(axis=1)
-        h_var = np.sqrt(np.maximum((4.0/3.0) * var + cell_mh2 / safe, 1e-30))
+        var = (cell_mx2 / safe[:, None] - cell_com**2).sum(axis=1)
+        h_var = np.sqrt(np.maximum((4.0 / 3.0) * var + cell_mh2 / safe, 1e-30))
         cell_hsml = h_var
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
         cz = np.arange(nc, dtype=np.float32) * cs[2] + self.pmin[2] + cs[2] * 0.5
-        gx2, gy2, gz2 = np.meshgrid(cx, cy, cz, indexing='ij')
+        gx2, gy2, gz2 = np.meshgrid(cx, cy, cz, indexing="ij")
         centers = np.stack([gx2.ravel(), gy2.ravel(), gz2.ravel()], axis=1)
 
         return {
-            "nc": nc, "cs": cs,
-            "mass": cell_mass, "com": cell_com, "hsml": cell_hsml, "qty": cell_qty,
-            "mx2": cell_mx2, "mh2": cell_mh2,
+            "nc": nc,
+            "cs": cs,
+            "mass": cell_mass,
+            "com": cell_com,
+            "hsml": cell_hsml,
+            "qty": cell_qty,
+            "mx2": cell_mx2,
+            "mh2": cell_mh2,
             "centers": centers,
             "half_diag": float(np.linalg.norm(cs) * 0.5),
         }
 
-    def query_frustum_lod(self, camera, max_particles, lod_pixels=4,
-                          importance_sampling=False):
+    def query_frustum_lod(self, camera, max_particles, lod_pixels=4, importance_sampling=False):
         """Top-down multi-level LOD query. Returns (pos, hsml, mass, qty) arrays.
 
         All data comes from pre-sorted arrays built at grid construction time.
@@ -377,8 +387,7 @@ class SpatialGrid:
 
         s_idx = np.where(summary_mask)[0]
         if len(s_idx) > 0:
-            summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx],
-                                  lv["mass"][s_idx], lv["qty"][s_idx]))
+            summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx]))
 
         refine_cells = np.where(refine_mask)[0]
 
@@ -427,8 +436,7 @@ class SpatialGrid:
             # Summary splats for small cells
             s_idx = child_flat[small]
             if len(s_idx) > 0:
-                summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx],
-                                      lv["mass"][s_idx], lv["qty"][s_idx]))
+                summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx]))
 
             if li == 0:
                 # Finest level: real particles for large cells
@@ -440,20 +448,27 @@ class SpatialGrid:
                         # Use cell depths and summary h for per-cell weighting
                         vis_depths = safe_dist[large].astype(np.float64)
                         vis_cell_h = lv["hsml"][child_flat[large]].astype(np.float64)
-                        real_pos, real_hsml, real_mass, real_qty, n_visible_real = \
-                            _gather_importance_sampled(
-                                finest["cell_start"], vis_cells.astype(np.int64), budget,
-                                self.sorted_pos, self.sorted_hsml,
-                                self.sorted_mass, self.sorted_qty,
-                                vis_depths, vis_cell_h,
-                            )
+                        real_pos, real_hsml, real_mass, real_qty, n_visible_real = _gather_importance_sampled(
+                            finest["cell_start"],
+                            vis_cells.astype(np.int64),
+                            budget,
+                            self.sorted_pos,
+                            self.sorted_hsml,
+                            self.sorted_mass,
+                            self.sorted_qty,
+                            vis_depths,
+                            vis_cell_h,
+                        )
                     else:
-                        real_pos, real_hsml, real_mass, real_qty, n_visible_real = \
-                            _gather_subsampled_direct(
-                                finest["cell_start"], vis_cells.astype(np.int64), budget,
-                                self.sorted_pos, self.sorted_hsml,
-                                self.sorted_mass, self.sorted_qty,
-                            )
+                        real_pos, real_hsml, real_mass, real_qty, n_visible_real = _gather_subsampled_direct(
+                            finest["cell_start"],
+                            vis_cells.astype(np.int64),
+                            budget,
+                            self.sorted_pos,
+                            self.sorted_hsml,
+                            self.sorted_mass,
+                            self.sorted_qty,
+                        )
             else:
                 refine_cells = child_flat[large]
 
@@ -560,8 +575,8 @@ class SplatRenderer:
         self.alpha_scale = 1.0
         self.qty_min = -1.0
         self.qty_max = 3.0
-        self.mode = 0       # 0: surface density, 1: weighted quantity
-        self.lod_pixels = 4  # cells subtending fewer pixels than this get summarized
+        self.mode = 0  # 0: surface density, 1: weighted quantity
+        self.lod_pixels = 1  # cells subtending fewer pixels than this get summarized
         self.log_scale = 1  # 1: log10, 0: linear
         self.max_render_particles = MAX_RENDER_PARTICLES
         self.use_tree = True
@@ -580,10 +595,9 @@ class SplatRenderer:
         # Build spatial grid for fast frustum queries on large datasets
         if self.use_tree and self.n_total > self.max_render_particles:
             import time
+
             t0 = time.perf_counter()
-            self._grid = SpatialGrid(
-                self._all_pos, self._all_mass, self._all_hsml, self._all_qty
-            )
+            self._grid = SpatialGrid(self._all_pos, self._all_mass, self._all_hsml, self._all_qty)
             print(f"  Spatial grid built in {time.perf_counter()-t0:.1f}s")
         else:
             self._grid = None
@@ -595,7 +609,9 @@ class SplatRenderer:
 
         if self._grid is not None:
             pos, hsml, mass, qty = self._grid.query_frustum_lod(
-                camera, self.max_render_particles, lod_pixels=self.lod_pixels,
+                camera,
+                self.max_render_particles,
+                lod_pixels=self.lod_pixels,
                 importance_sampling=self.use_importance_sampling,
             )
             self._upload_arrays(pos, hsml, mass, qty)
@@ -614,8 +630,7 @@ class SplatRenderer:
                 hsml = self._all_hsml[idx] * ratio ** (1.0 / 3.0)
                 mass = self._all_mass[idx] * ratio
                 qty = self._all_qty[idx]
-                self._upload_arrays(pos, hsml.astype(np.float32),
-                                    mass.astype(np.float32), qty)
+                self._upload_arrays(pos, hsml.astype(np.float32), mass.astype(np.float32), qty)
             else:
                 self._upload_subset(idx)
 
@@ -641,8 +656,10 @@ class SplatRenderer:
     def _upload_subset(self, idx):
         """Upload a subset of particles by index."""
         self._upload_arrays(
-            self._all_pos[idx], self._all_hsml[idx],
-            self._all_mass[idx], self._all_qty[idx],
+            self._all_pos[idx],
+            self._all_hsml[idx],
+            self._all_mass[idx],
+            self._all_qty[idx],
         )
 
     def upload_particles(self, positions, hsml, masses, quantity=None):
@@ -712,7 +729,8 @@ class SplatRenderer:
         ]
 
         self.vao_additive = self.ctx.vertex_array(
-            self.prog_additive, content,
+            self.prog_additive,
+            content,
         )
 
     def _ensure_accum_fbo(self, width, height):
@@ -836,12 +854,24 @@ class SplatRenderer:
 
     def release(self):
         """Clean up GPU resources."""
-        for attr in ("pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo",
-                     "fs_quad_vbo",
-                     "star_pos_vbo", "star_mass_vbo",
-                     "vao_additive", "vao_resolve", "vao_star",
-                     "prog_additive", "prog_resolve", "prog_star",
-                     "_accum_fbo", "_accum_tex_num", "_accum_tex_den"):
+        for attr in (
+            "pos_vbo",
+            "hsml_vbo",
+            "mass_vbo",
+            "qty_vbo",
+            "fs_quad_vbo",
+            "star_pos_vbo",
+            "star_mass_vbo",
+            "vao_additive",
+            "vao_resolve",
+            "vao_star",
+            "prog_additive",
+            "prog_resolve",
+            "prog_star",
+            "_accum_fbo",
+            "_accum_tex_num",
+            "_accum_tex_den",
+        ):
             obj = getattr(self, attr, None)
             if obj is not None:
                 try:

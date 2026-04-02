@@ -417,11 +417,14 @@ class DataFlyerApp:
             # Update camera
             moved = self.camera.update(dt)
 
-            # Re-cull visible particles when camera moves
+            # Re-cull visible particles when camera moves or just stopped
             t_cull = 0.0
-            if moved and self.renderer.n_total > self.renderer.max_render_particles:
-                if not hasattr(self, '_last_cull_time'):
-                    self._last_cull_time = 0.0
+            if not hasattr(self, '_last_cull_time'):
+                self._last_cull_time = 0.0
+                self._was_moving = False
+            need_cull = moved or self._was_moving  # catch final frame after mouse release
+            self._was_moving = moved
+            if need_cull and self.renderer.n_total > self.renderer.max_render_particles:
                 if now - self._last_cull_time > 0.1:
                     t0 = time.perf_counter()
                     self.renderer.update_visible(self.camera)
