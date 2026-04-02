@@ -3,9 +3,65 @@
 import numpy as np
 import moderngl
 from pathlib import Path
+from dataclasses import dataclass
 from numba import njit, prange
 
 SHADER_DIR = Path(__file__).parent / "shaders"
+
+
+@dataclass
+class RenderMode:
+    """Defines how the two accumulation textures are combined in the resolve pass.
+
+    All fragment shaders write:
+        out_numerator   = sigma * quantity
+        out_denominator = sigma           (where sigma = mass * W(r) / h²)
+
+    The resolve shader then displays either the denominator directly (surface
+    density) or the ratio numerator/denominator (mass-weighted average).
+
+    To render a given mode, the caller sets:
+        - masses (weight field) → the "mass" slot in set_particles
+        - quantity             → the "quantity" slot in set_particles
+        - resolve_mode         → 0 for surface density, 1 for ratio
+
+    Examples:
+        SurfaceDensity("Masses"):
+            weight=Masses, qty=Masses (unused), resolve_mode=0
+            displays: Σ Masses * W / h²
+
+        SurfaceDensity("Density"):
+            weight=Density, qty=Density (unused), resolve_mode=0
+            displays: Σ Density * W / h²
+
+        MassWeightedAverage("Temperature"):
+            weight=Masses, qty=Temperature, resolve_mode=1
+            displays: Σ(Masses * Temperature * W / h²) / Σ(Masses * W / h²)
+    """
+    name: str           # display name
+    weight_field: str   # field loaded into the mass/weight slot
+    qty_field: str      # field loaded into the quantity slot
+    resolve_mode: int   # 0: display denominator, 1: display num/denom
+
+    @staticmethod
+    def surface_density(weight_field="Masses"):
+        """Create a surface density render mode for the given weight field."""
+        return RenderMode(
+            name=f"Σ {weight_field}",
+            weight_field=weight_field,
+            qty_field=weight_field,  # unused in resolve_mode=0, but must be valid
+            resolve_mode=0,
+        )
+
+    @staticmethod
+    def mass_weighted_average(qty_field, weight_field="Masses"):
+        """Create a mass-weighted average render mode (for future use)."""
+        return RenderMode(
+            name=f"<{qty_field}>",
+            weight_field=weight_field,
+            qty_field=qty_field,
+            resolve_mode=1,
+        )
 
 
 @njit(parallel=True, cache=True)
@@ -721,7 +777,7 @@ class SplatRenderer:
         self.alpha_scale = 1.0
         self.qty_min = -1.0
         self.qty_max = 3.0
-        self.mode = 0  # 0: surface density, 1: weighted quantity
+        self.resolve_mode = 0  # 0: surface density, 1: weighted quantity (set by RenderMode)
         self.lod_pixels = 4  # cells subtending fewer pixels than this get summarized
         self.log_scale = 1  # 1: log10, 0: linear
         self.max_render_particles = MAX_RENDER_PARTICLES
@@ -1125,7 +1181,7 @@ class SplatRenderer:
         self.prog_resolve["u_colormap"].value = 2
         self.prog_resolve["u_qty_min"].value = self.qty_min
         self.prog_resolve["u_qty_max"].value = self.qty_max
-        self.prog_resolve["u_mode"].value = self.mode
+        self.prog_resolve["u_mode"].value = self.resolve_mode
         self.prog_resolve["u_log_scale"].value = self.log_scale
 
         self.vao_resolve.render(moderngl.TRIANGLE_STRIP, vertices=4)
@@ -1152,9 +1208,9 @@ class SplatRenderer:
             return self.qty_min, self.qty_max
 
         w, h = self._fbo_size
-        # Read denominator (surface density) for mode 0, or compute ratio for mode 1
+        # Read denominator (surface density) for resolve_mode 0, or compute ratio for mode 1
         den_data = np.frombuffer(self._accum_tex_den.read(), dtype=np.float32)
-        if self.mode == 1:
+        if self.resolve_mode == 1:
             num_data = np.frombuffer(self._accum_tex_num.read(), dtype=np.float32)
             mask = den_data > 1e-30
             vals = np.where(mask, num_data / den_data, 0)

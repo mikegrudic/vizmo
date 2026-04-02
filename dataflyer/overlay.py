@@ -68,7 +68,7 @@ class DevOverlay:
         except TypeError:
             return ImageFont.load_default()
 
-    def update(self, renderer, camera, fps, current_qty, cmap_name, timings, message, cull_interval=0.5):
+    def update(self, renderer, camera, fps, render_mode_name, cmap_name, timings, message, cull_interval=0.5):
         """Build the overlay image with interactive widgets."""
         if not self.enabled:
             return
@@ -92,7 +92,7 @@ class DevOverlay:
             range_str = f"10^{renderer.qty_min:.2f} .. 10^{renderer.qty_max:.2f}"
         else:
             range_str = f"{renderer.qty_min:.3g} .. {renderer.qty_max:.3g}"
-        items.append(("text", f"Quantity: {current_qty}  Scale: {scale}"))
+        items.append(("text", f"Render: {render_mode_name}  Scale: {scale}"))
         items.append(("text", f"Range: {range_str}"))
         items.append(("text", f"Colormap: {cmap_name}"))
         items.append(("text", f"Pos: ({camera.position[0]:.2f}, {camera.position[1]:.2f}, {camera.position[2]:.2f})"))
@@ -447,14 +447,13 @@ class UserMenu:
         self._editing = None
         self._edit_buffer = ""
 
-    def update(self, renderer, quantities, current_qty, cmap_name, colormaps,
+    def update(self, renderer, cmap_name, colormaps,
                sd_fields=None, sd_field="Masses",
                sd_field2="None", sd_op="*", sd_ops=None):
         items = []
         self._widgets = []
 
-        items.append(("dropdown", "Map", current_qty, quantities, "quantity"))
-        if current_qty == "surface_density" and sd_fields and len(sd_fields) > 1:
+        if sd_fields and len(sd_fields) > 1:
             items.append(("dropdown", "Field", sd_field, sd_fields, "sd_field"))
             items.append(("dropdown", "Op", sd_op, sd_ops or ["*"], "sd_op"))
             items.append(("dropdown", "Field 2", sd_field2, ["None"] + sd_fields, "sd_field2"))
@@ -726,17 +725,7 @@ class UserMenu:
             elif wtype == "dropdown_item":
                 key = widget[3]
                 value = widget[4]
-                if key == "quantity":
-                    idx = app._quantities.index(value) if value in app._quantities else 0
-                    app._qty_idx = idx
-                    app._current_qty = value
-                    q = app.data.get_quantity(value)
-                    app.renderer.update_quantity(q)
-                    app.renderer.mode = 0 if value == "surface_density" else 1
-                    app._needs_auto_range = True
-                    if value == "surface_density" and app._sd_field != "Masses":
-                        app._set_sd_field(app._sd_field)
-                elif key == "sd_field":
+                if key == "sd_field":
                     app._set_sd_field(value)
                 elif key == "sd_field2":
                     app._sd_field2 = value

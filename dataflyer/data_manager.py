@@ -98,59 +98,6 @@ class SnapshotData:
 
         return data
 
-    def get_quantity(self, name):
-        """Load or compute a named physical quantity. Returns (N,) float32 array."""
-        if name == "surface_density":
-            return self.masses  # Surface density is just mass splatted
-
-        if name == "temperature":
-            grp = self._file.get("PartType0", {})
-            if "Temperature" in grp:
-                return self._read_field("PartType0", "Temperature").astype(np.float32)
-            # Estimate from InternalEnergy: T ~ (gamma-1) * mu * u / k_B
-            # For atomic hydrogen: mu ~ 1.23 m_p, gamma = 5/3
-            u = self._read_field("PartType0", "InternalEnergy").astype(np.float64)
-            # u is in code units (velocity^2). Convert to K assuming molecular weight ~0.6
-            # T = (gamma-1) * mu_mol * m_p * u / k_B
-            # With mu=0.6, gamma=5/3: T ~ 0.6 * 1.67e-24 * u * (UnitVelocity)^2 / 1.38e-16 * (2/3)
-            unit_v = float(self.header.get("UnitVelocity_In_CGS", 1e5))
-            mu = 0.6
-            mp = 1.6726e-24  # g
-            kB = 1.3807e-16  # erg/K
-            gamma = 5.0 / 3.0
-            T = (gamma - 1) * mu * mp * u * unit_v**2 / kB
-            return T.astype(np.float32)
-
-        if name == "density":
-            return self._read_field("PartType0", "Density").astype(np.float32)
-
-        if name == "velocity_magnitude":
-            vel = self._read_field("PartType0", "Velocities").astype(np.float32)
-            return np.linalg.norm(vel, axis=1).astype(np.float32)
-
-        if name == "velocity_z":
-            vel = self._read_field("PartType0", "Velocities").astype(np.float32)
-            return vel[:, 2].copy()
-
-        if name == "internal_energy":
-            return self._read_field("PartType0", "InternalEnergy").astype(np.float32)
-
-        raise KeyError(f"Unknown quantity: {name}")
-
-    def available_quantities(self):
-        """List quantities that can be loaded from this snapshot."""
-        result = ["surface_density"]
-        grp = self._file.get("PartType0", {})
-        if "Temperature" in grp or "InternalEnergy" in grp:
-            result.append("temperature")
-        if "Density" in grp:
-            result.append("density")
-        if "Velocities" in grp:
-            result.extend(["velocity_magnitude", "velocity_z"])
-        if "InternalEnergy" in grp:
-            result.append("internal_energy")
-        return result
-
     # Fields to exclude from the surface density weight dropdown
     _SKIP_FIELDS = {
         "Coordinates",

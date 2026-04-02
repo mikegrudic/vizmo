@@ -93,7 +93,7 @@ def dataflyer_surface_density(positions, masses, hsml, center, camera_distance,
     ctx = moderngl.create_standalone_context()
     renderer = SplatRenderer(ctx)
     renderer.colormap_tex = create_colormap_texture_safe(ctx, "magma")
-    renderer.mode = 0  # surface density
+    renderer.resolve_mode = 0  # surface density
     renderer.log_scale = 0
     if hasattr(renderer, 'use_tree'):
         renderer.use_tree = False  # render all particles directly, no LOD

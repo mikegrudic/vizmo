@@ -7,7 +7,7 @@ import moderngl
 
 from .camera import Camera
 from .data_manager import SnapshotData, find_snapshots
-from .renderer import SplatRenderer
+from .renderer import SplatRenderer, RenderMode
 from .colormaps import create_colormap_texture_safe, AVAILABLE_COLORMAPS
 from .overlay import DevOverlay, UserMenu
 
@@ -72,22 +72,19 @@ class DataFlyerApp:
         self._cmap_idx = 0
         self._set_colormap(AVAILABLE_COLORMAPS[0])
 
-        # Quantities
-        self._quantities = self.data.available_quantities()
-        self._qty_idx = 0
-        self._current_qty = self._quantities[0]
-
-        # Surface density weight field (any scalar PartType0 field)
+        # Weight fields and render mode
         self._sd_fields = self.data.available_fields()
         self._sd_field = "Masses"
         self._sd_field2 = "None"  # optional second field
         self._sd_op = "*"  # operation between field1 and field2
         self._SD_OPS = ["*", "+", "-", "/", "min", "max"]
+        self._render_mode = RenderMode.surface_density("Masses")
 
         # Store particles and upload (with culling for large datasets)
-        quantity = self.data.get_quantity(self._current_qty)
+        weights = self._compute_weights()
+        self.renderer.resolve_mode = self._render_mode.resolve_mode
         self.renderer.set_particles(
-            self.data.positions, self.data.hsml, self.data.masses, quantity,
+            self.data.positions, self.data.hsml, weights,
         )
         self.renderer.update_visible(self.camera)
         print(f"  Rendering {self.renderer.n_particles:,} / {self.renderer.n_total:,} visible particles")
@@ -123,9 +120,6 @@ class DataFlyerApp:
         self.data = SnapshotData(path)
         print(f"  {self.data.n_particles:,} gas, {self.data.n_stars} stars, t={self.data.time:.4g}")
 
-        self._quantities = self.data.available_quantities()
-        self._qty_idx = min(self._qty_idx, len(self._quantities) - 1)
-        self._current_qty = self._quantities[self._qty_idx]
         self._sd_fields = self.data.available_fields()
         if self._sd_field not in self._sd_fields:
             self._sd_field = "Masses"
@@ -133,12 +127,10 @@ class DataFlyerApp:
             self._sd_field2 = "None"
 
         weights = self._compute_weights()
-        q = self.data.get_quantity(self._current_qty)
         self.renderer.set_particles(
-            self.data.positions, self.data.hsml, weights, q,
+            self.data.positions, self.data.hsml, weights,
         )
         self.renderer.update_visible(self.camera)
-        self.renderer.mode = 0 if self._current_qty == "surface_density" else 1
 
         if self.data.n_stars > 0:
             self.renderer.upload_stars(self.data.star_positions, self.data.star_masses)
@@ -192,9 +184,10 @@ class DataFlyerApp:
     def _rebuild_sd_weights(self):
         """Recompute weights from current field settings and rebuild."""
         weights = self._compute_weights()
-        quantity = self.data.get_quantity(self._current_qty)
+        self._render_mode = RenderMode.surface_density(self._sd_field)
+        self.renderer.resolve_mode = self._render_mode.resolve_mode
         self.renderer.set_particles(
-            self.data.positions, self.data.hsml, weights, quantity,
+            self.data.positions, self.data.hsml, weights,
         )
         self.renderer.update_visible(self.camera)
         self._needs_auto_range = True
@@ -203,20 +196,6 @@ class DataFlyerApp:
         """Change the primary surface density weight field."""
         self._sd_field = field_name
         self._rebuild_sd_weights()
-
-    def _cycle_quantity(self, direction=1):
-        self._qty_idx = (self._qty_idx + direction) % len(self._quantities)
-        self._current_qty = self._quantities[self._qty_idx]
-        self._msg(f"Quantity: {self._current_qty}")
-        q = self.data.get_quantity(self._current_qty)
-        self.renderer.update_quantity(q)
-        self._needs_auto_range = True  # auto-range after next render
-        if self._current_qty == "surface_density":
-            self.renderer.mode = 0
-            if self._sd_field != "Masses":
-                self._set_sd_field(self._sd_field)
-        else:
-            self.renderer.mode = 1
 
     def _cycle_colormap(self, direction=1):
         self._cmap_idx = (self._cmap_idx + direction) % len(AVAILABLE_COLORMAPS)
@@ -236,25 +215,6 @@ class DataFlyerApp:
         if key == glfw.KEY_ESCAPE:
             glfw.set_window_should_close(window, True)
             return
-
-        # Tab: cycle quantity
-        if key == glfw.KEY_TAB:
-            self._cycle_quantity(1)
-            return
-
-        # 1-9: direct quantity selection
-        num_keys = [glfw.KEY_1, glfw.KEY_2, glfw.KEY_3, glfw.KEY_4,
-                    glfw.KEY_5, glfw.KEY_6, glfw.KEY_7, glfw.KEY_8, glfw.KEY_9]
-        for i, nk in enumerate(num_keys):
-            if key == nk and i < len(self._quantities):
-                self._qty_idx = i
-                self._current_qty = self._quantities[i]
-                self._msg(f"Quantity: {self._current_qty}")
-                q = self.data.get_quantity(self._current_qty)
-                self.renderer.update_quantity(q)
-                self.renderer.mode = 0 if self._current_qty == "surface_density" else 1
-                self._needs_auto_range = True
-                return
 
         # C: cycle colormap
         if key == glfw.KEY_C:
@@ -372,9 +332,9 @@ class DataFlyerApp:
             self._msg(f"Tree: {state}")
             # Rebuild or discard the grid
             if self.renderer.use_tree and self.renderer._grid is None:
-                q = self.data.get_quantity(self._current_qty)
+                weights = self._compute_weights()
                 self.renderer.set_particles(
-                    self.data.positions, self.data.hsml, self.data.masses, q)
+                    self.data.positions, self.data.hsml, weights)
             elif not self.renderer.use_tree:
                 self.renderer._grid = None
             self.renderer.update_visible(self.camera)
@@ -441,8 +401,6 @@ class DataFlyerApp:
         print("  Q/E      : Roll")
         print("  Scroll   : Adjust fly speed")
         print("  Left/Right: Previous/next snapshot")
-        print("  1-9      : Select quantity directly")
-        print("  Tab      : Next quantity")
         print("  C        : Next colormap")
         print("  +/-      : Contract/expand dynamic range")
         print("  [/]      : More/less LOD detail")
@@ -453,13 +411,9 @@ class DataFlyerApp:
         print("  \\        : Toggle dev overlay")
         print("  H        : Print this help")
         print("  ESC      : Quit")
-        print(f"\n  Quantities:")
-        for i, q in enumerate(self._quantities):
-            marker = " *" if q == self._current_qty else ""
-            print(f"    {i+1}: {q}{marker}")
         scale = "log" if self.renderer.log_scale else "linear"
-        print(f"\n  Colormap : {AVAILABLE_COLORMAPS[self._cmap_idx]}")
-        print(f"  Opacity  : {self.renderer.alpha_scale:.4f}")
+        print(f"\n  Render   : {self._render_mode.name}")
+        print(f"  Colormap : {AVAILABLE_COLORMAPS[self._cmap_idx]}")
         print(f"  Scale    : {scale}")
         print(f"  Range    : {self._range_str()}")
         if self.renderer.n_total > self.renderer.n_particles:
@@ -498,7 +452,7 @@ class DataFlyerApp:
                 count = f"{n_vis/1e6:.1f}M/{n_tot/1e6:.1f}M" if n_tot > n_vis else f"{n_tot/1e6:.1f}M"
                 glfw.set_window_title(
                     self.window,
-                    f"DataFlyer | {self._fps:.0f} fps | {count} | {self._current_qty} | "
+                    f"DataFlyer | {self._fps:.0f} fps | {count} | {self._render_mode.name} | "
                     f"{AVAILABLE_COLORMAPS[self._cmap_idx]} | t={self.data.time:.4g}{snap_info}"
                 )
 
@@ -582,7 +536,7 @@ class DataFlyerApp:
             # User menu (always visible)
             self.user_menu.set_framebuffer_size(fb_width, fb_height)
             self.user_menu.update(
-                self.renderer, self._quantities, self._current_qty,
+                self.renderer,
                 AVAILABLE_COLORMAPS[self._cmap_idx], AVAILABLE_COLORMAPS,
                 sd_fields=self._sd_fields, sd_field=self._sd_field,
                 sd_field2=self._sd_field2, sd_op=self._sd_op, sd_ops=self._SD_OPS,
@@ -594,7 +548,7 @@ class DataFlyerApp:
                 self.overlay.set_framebuffer_size(fb_width, fb_height)
                 self.overlay.update(
                     self.renderer, self.camera, self._fps,
-                    self._current_qty, AVAILABLE_COLORMAPS[self._cmap_idx],
+                    self._render_mode.name, AVAILABLE_COLORMAPS[self._cmap_idx],
                     self._timings, self._last_message, self.renderer.cull_interval,
                 )
                 self.overlay.render()
