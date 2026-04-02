@@ -597,6 +597,8 @@ class SplatRenderer:
         self.max_render_particles = MAX_RENDER_PARTICLES
         self.use_tree = True
         self.use_importance_sampling = False
+        self.KERNELS = ["cubic_spline", "wendland_c2", "gaussian", "quartic"]
+        self.kernel = "cubic_spline"
 
     def set_particles(self, positions, hsml, masses, quantity=None):
         """Store particle data on CPU. Call update_visible() to upload a subset."""
@@ -835,9 +837,12 @@ class SplatRenderer:
         self._accum_fbo.use()
         self._accum_fbo.clear(0.0, 0.0, 0.0, 0.0)
 
+        kernel_id = self.KERNELS.index(self.kernel)
+
         self.prog_additive["u_view"].write(view.tobytes())
         self.prog_additive["u_proj"].write(proj.tobytes())
         self.prog_additive["u_viewport_size"].value = (float(width), float(height))
+        self.prog_additive["u_kernel"].value = kernel_id
 
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.ONE, moderngl.ONE)  # pure additive
@@ -852,6 +857,7 @@ class SplatRenderer:
         if self.vao_quad is not None and self.n_big > 0:
             self.prog_quad["u_view"].write(view.tobytes())
             self.prog_quad["u_proj"].write(proj.tobytes())
+            self.prog_quad["u_kernel"].value = kernel_id
             self.vao_quad.render(moderngl.TRIANGLES, instances=self.n_big)
 
         # Pass 2: resolve to screen

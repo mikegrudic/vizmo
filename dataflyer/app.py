@@ -294,6 +294,14 @@ class DataFlyerApp:
             self.renderer.update_visible(self.camera)
             return
 
+        # K: cycle kernel
+        if key == glfw.KEY_K:
+            kernels = self.renderer.KERNELS
+            idx = (kernels.index(self.renderer.kernel) + 1) % len(kernels)
+            self.renderer.kernel = kernels[idx]
+            self._msg(f"Kernel: {self.renderer.kernel}")
+            return
+
         # T: toggle tree
         if key == glfw.KEY_T:
             self.renderer.use_tree = not self.renderer.use_tree
@@ -465,7 +473,7 @@ class DataFlyerApp:
                     f"FPS: {self._fps:.0f}",
                     f"Particles: {n_vis:,} / {n_tot:,}",
                     f"LOD: {self.renderer.lod_pixels}px  Budget: {self.renderer.max_render_particles/1e6:.1f}M",
-                    f"Tree: {tree}  Importance: {imp}",
+                    f"Tree: {tree}  Importance: {imp}  Kernel: {self.renderer.kernel}",
                     f"Cull: {self._timings['cull']*1000:.0f}ms  Render: {self._timings['render']*1000:.0f}ms",
                     f"Quantity: {self._current_qty}  Scale: {scale}",
                     f"Range: {self._range_str()}",
