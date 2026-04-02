@@ -362,17 +362,17 @@ class SpatialGrid:
         # Start from coarsest level
         coarsest = self.levels[-1]
         lv = coarsest
-        hd = lv["half_diag"]
         centers = lv["centers"]
 
         depths = centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
         rights = centers @ cam_right - np.dot(cam_pos, cam_right)
         ups = centers @ cam_up - np.dot(cam_pos, cam_up)
 
-        # Only cull behind camera. No side frustum -- GPU clips off-screen
-        # fragments anyway, and tight frustum culling drops edge particles.
-        visible = depths > -hd
+        # No frustum culling -- render everything. GPU clips off-screen
+        # fragments. Culling was dropping visible particles at edges and
+        # behind camera when inside the data volume.
         has_mass = lv["mass"] > 0
+        visible = has_mass
 
         dist = np.sqrt(depths**2 + rights**2 + ups**2)
         safe_dist = np.maximum(dist, 0.01)
@@ -418,7 +418,7 @@ class SpatialGrid:
             rights = centers @ cam_right - np.dot(cam_pos, cam_right)
             ups = centers @ cam_up - np.dot(cam_pos, cam_up)
 
-            vis = depths > -hd  # only cull behind camera
+            vis = np.ones(len(depths), dtype=bool)  # no culling
 
             dist = np.sqrt(depths**2 + rights**2 + ups**2)
             safe_dist = np.maximum(dist, 0.01)
