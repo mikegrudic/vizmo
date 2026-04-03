@@ -17,6 +17,8 @@ from .data_manager import SnapshotData, find_snapshots
 from .wgpu_renderer import WGPURenderer
 from .colormaps import colormap_to_texture_data, AVAILABLE_COLORMAPS
 from .renderer import RenderMode
+from .field_ops import (resolve_field, compute_weights, compute_slot_fields,
+                        project_vector, combine_fields)
 
 
 def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
@@ -309,90 +311,22 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             _state[name] = value
 
         def _project_field(self, field_name):
-            import numpy as np
-            if field_name in _state["_vector_fields"]:
-                vec = data.get_vector_field(field_name)
-                proj = _state["_vector_projection"]
-                if proj == "LOS":
-                    fwd = camera.forward.copy()
-                    _state["_los_camera_fwd"] = fwd.copy()
-                    return (vec @ fwd).astype(np.float32)
-                elif proj == "|v|":
-                    return np.linalg.norm(vec, axis=1).astype(np.float32)
-                else:
-                    return (vec * vec).sum(axis=1).astype(np.float32)
-            return data.get_field(field_name)
+            if field_name in _state["_vector_fields"] and _state["_vector_projection"] == "LOS":
+                _state["_los_camera_fwd"] = camera.forward.copy()
+            return resolve_field(field_name, _state["_vector_fields"], data,
+                                 _state["_vector_projection"], camera.forward)
 
         def _compute_weights(self):
-            import numpy as np
-            w = self._project_field(_state["_sd_field"])
-            f2 = _state.get("_sd_field2", "None")
-            if f2 != "None":
-                w2 = self._project_field(f2)
-                op = _state.get("_sd_op", "*")
-                if op == "*": w = w * w2
-                elif op == "+": w = w + w2
-                elif op == "-": w = w - w2
-                elif op == "/": w = w / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
-                elif op == "min": w = np.minimum(w, w2)
-                elif op == "max": w = np.maximum(w, w2)
-            return w
+            if _state["_sd_field"] in _state["_vector_fields"] and _state["_vector_projection"] == "LOS":
+                _state["_los_camera_fwd"] = camera.forward.copy()
+            return compute_weights(
+                _state["_sd_field"], _state.get("_sd_field2", "None"),
+                _state.get("_sd_op", "*"), _state["_vector_fields"], data,
+                _state["_vector_projection"], camera.forward)
 
         def _compute_slot(self, slot):
             """Compute weights and qty for a composite slot dict."""
-            s = slot
-            w_name = s["weight"]
-            if w_name in _state["_vector_fields"]:
-                vec = data.get_vector_field(w_name)
-                proj = s["proj"]
-                if proj == "LOS":
-                    weights = (vec @ camera.forward).astype(np.float32)
-                elif proj == "|v|":
-                    weights = np.linalg.norm(vec, axis=1).astype(np.float32)
-                else:
-                    weights = (vec * vec).sum(axis=1).astype(np.float32)
-            else:
-                weights = data.get_field(w_name)
-                if s.get("weight2", "None") != "None":
-                    w2_name = s["weight2"]
-                    if w2_name in _state["_vector_fields"]:
-                        vec = data.get_vector_field(w2_name)
-                        proj = s["proj"]
-                        if proj == "LOS":
-                            w2 = (vec @ camera.forward).astype(np.float32)
-                        elif proj == "|v|":
-                            w2 = np.linalg.norm(vec, axis=1).astype(np.float32)
-                        else:
-                            w2 = (vec * vec).sum(axis=1).astype(np.float32)
-                    else:
-                        w2 = data.get_field(w2_name)
-                    op = s.get("op", "*")
-                    if op == "*": weights = weights * w2
-                    elif op == "+": weights = weights + w2
-                    elif op == "-": weights = weights - w2
-                    elif op == "/": weights = weights / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
-                    elif op == "min": weights = np.minimum(weights, w2)
-                    elif op == "max": weights = np.maximum(weights, w2)
-
-            if s["mode"] in ("WeightedAverage", "WeightedVariance"):
-                d_name = s["data"]
-                if d_name in _state["_vector_fields"]:
-                    vec = data.get_vector_field(d_name)
-                    proj = s["proj"]
-                    if proj == "LOS":
-                        qty = (vec @ camera.forward).astype(np.float32)
-                    elif proj == "|v|":
-                        qty = np.linalg.norm(vec, axis=1).astype(np.float32)
-                    else:
-                        qty = (vec * vec).sum(axis=1).astype(np.float32)
-                else:
-                    qty = data.get_field(d_name)
-            else:
-                qty = None
-
-            resolve = {"SurfaceDensity": 0, "WeightedAverage": 1, "WeightedVariance": 2}[s["mode"]]
-            s["resolve"] = resolve
-            return weights, qty
+            return compute_slot_fields(slot, _state["_vector_fields"], data, camera.forward)
 
         def _apply_render_mode(self, auto_range=True):
             nonlocal _render_mode, needs_auto_range, refine_budget, refine_saved_lod, refine_saved_budget
@@ -528,46 +462,22 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                       sl["mode"] in ("WeightedAverage", "WeightedVariance") and
                       sl["data"] in _state["_vector_fields"])
 
-        # Compute weight
-        w_name = sl["weight"]
-        if w_name in _state["_vector_fields"]:
-            vec = data.get_vector_field(w_name)
-            proj = sl.get("proj", "LOS")
-            if proj == "LOS":
-                w = (vec @ camera.forward).astype(np.float32)
-            elif proj == "|v|":
-                w = np.linalg.norm(vec, axis=1).astype(np.float32)
-            else:
-                w = (vec * vec).sum(axis=1).astype(np.float32)
-        else:
-            w = data.get_field(w_name)
-            if sl.get("weight2", "None") != "None":
-                w2 = data.get_field(sl["weight2"])
-                op = sl.get("op", "*")
-                if op == "*": w = w * w2
-                elif op == "+": w = w + w2
-                elif op == "-": w = w - w2
-                elif op == "/": w = w / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
-                elif op == "min": w = np.minimum(w, w2)
-                elif op == "max": w = np.maximum(w, w2)
+        # Compute weight using shared helpers
+        proj = sl.get("proj", "LOS")
+        vf = _state["_vector_fields"]
+        w = resolve_field(sl["weight"], vf, data, proj, camera.forward)
+        w2_name = sl.get("weight2", "None")
+        if w2_name != "None":
+            w2 = resolve_field(w2_name, vf, data, proj, camera.forward)
+            w = combine_fields(w, w2, sl.get("op", "*"))
 
         so = renderer._grid.sort_order
         sm = w[so].astype(np.float32)
 
         if is_los_qty:
-            # Placeholder — GPU LOS projection will fill qty buffer
-            sq = sm  # won't be used
+            sq = sm  # placeholder — GPU LOS projection will fill qty buffer
         elif sl["mode"] in ("WeightedAverage", "WeightedVariance"):
-            d_name = sl["data"]
-            if d_name in _state["_vector_fields"]:
-                vec = data.get_vector_field(d_name)
-                proj = sl.get("proj", "LOS")
-                if proj == "|v|":
-                    q = np.linalg.norm(vec, axis=1).astype(np.float32)
-                else:
-                    q = (vec * vec).sum(axis=1).astype(np.float32)
-            else:
-                q = data.get_field(d_name)
+            q = resolve_field(sl["data"], vf, data, proj, camera.forward)
             sq = q[so].astype(np.float32)
         else:
             sq = sm

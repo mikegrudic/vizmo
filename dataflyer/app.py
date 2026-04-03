@@ -10,6 +10,7 @@ from .data_manager import SnapshotData, find_snapshots
 from .renderer import SplatRenderer, RenderMode
 from .colormaps import create_colormap_texture_safe, AVAILABLE_COLORMAPS
 from .overlay import DevOverlay, UserMenu
+from .field_ops import resolve_field, compute_weights, compute_slot_fields
 
 
 class DataFlyerApp:
@@ -207,40 +208,18 @@ class DataFlyerApp:
 
     def _project_field(self, field_name):
         """Load a field and project to scalar if it's a vector field."""
-        import numpy as np
-        if field_name in self._vector_fields:
-            vec = self.data.get_vector_field(field_name)
-            proj = self._vector_projection
-            if proj == "LOS":
-                fwd = self.camera.forward.copy()
-                self._los_camera_fwd = fwd.copy()
-                return (vec @ fwd).astype(np.float32)
-            elif proj == "|v|":
-                return np.linalg.norm(vec, axis=1).astype(np.float32)
-            else:  # |v|^2
-                return (vec * vec).sum(axis=1).astype(np.float32)
-        return self.data.get_field(field_name)
+        if field_name in self._vector_fields and self._vector_projection == "LOS":
+            self._los_camera_fwd = self.camera.forward.copy()
+        return resolve_field(field_name, self._vector_fields, self.data,
+                             self._vector_projection, self.camera.forward)
 
     def _compute_weights(self):
         """Compute the final weight array from field1, op, and field2."""
-        import numpy as np
-        w = self._project_field(self._sd_field)
-        if self._sd_field2 != "None":
-            w2 = self._project_field(self._sd_field2)
-            op = self._sd_op
-            if op == "*":
-                w = w * w2
-            elif op == "+":
-                w = w + w2
-            elif op == "-":
-                w = w - w2
-            elif op == "/":
-                w = w / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
-            elif op == "min":
-                w = np.minimum(w, w2)
-            elif op == "max":
-                w = np.maximum(w, w2)
-        return w
+        if self._sd_field in self._vector_fields and self._vector_projection == "LOS":
+            self._los_camera_fwd = self.camera.forward.copy()
+        return compute_weights(self._sd_field, self._sd_field2, self._sd_op,
+                               self._vector_fields, self.data,
+                               self._vector_projection, self.camera.forward)
 
     def _uses_vector_field(self):
         """Check if any active field is a vector field."""
@@ -320,60 +299,7 @@ class DataFlyerApp:
 
     def _compute_slot(self, slot):
         """Compute weights and qty arrays for a composite slot dict."""
-        import numpy as np
-        s = slot
-        w_name = s["weight"]
-        if w_name in self._vector_fields:
-            vec = self.data.get_vector_field(w_name)
-            proj = s["proj"]
-            if proj == "LOS":
-                weights = (vec @ self.camera.forward).astype(np.float32)
-            elif proj == "|v|":
-                weights = np.linalg.norm(vec, axis=1).astype(np.float32)
-            else:
-                weights = (vec * vec).sum(axis=1).astype(np.float32)
-        else:
-            weights = self.data.get_field(w_name)
-            if s["weight2"] != "None":
-                w2_name = s["weight2"]
-                if w2_name in self._vector_fields:
-                    vec = self.data.get_vector_field(w2_name)
-                    proj = s["proj"]
-                    if proj == "LOS":
-                        w2 = (vec @ self.camera.forward).astype(np.float32)
-                    elif proj == "|v|":
-                        w2 = np.linalg.norm(vec, axis=1).astype(np.float32)
-                    else:
-                        w2 = (vec * vec).sum(axis=1).astype(np.float32)
-                else:
-                    w2 = self.data.get_field(w2_name)
-                op = s["op"]
-                if op == "*": weights = weights * w2
-                elif op == "+": weights = weights + w2
-                elif op == "-": weights = weights - w2
-                elif op == "/": weights = weights / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
-                elif op == "min": weights = np.minimum(weights, w2)
-                elif op == "max": weights = np.maximum(weights, w2)
-
-        if s["mode"] in ("WeightedAverage", "WeightedVariance"):
-            d_name = s["data"]
-            if d_name in self._vector_fields:
-                vec = self.data.get_vector_field(d_name)
-                proj = s["proj"]
-                if proj == "LOS":
-                    qty = (vec @ self.camera.forward).astype(np.float32)
-                elif proj == "|v|":
-                    qty = np.linalg.norm(vec, axis=1).astype(np.float32)
-                else:
-                    qty = (vec * vec).sum(axis=1).astype(np.float32)
-            else:
-                qty = self.data.get_field(d_name)
-        else:
-            qty = None
-
-        resolve = {"SurfaceDensity": 0, "WeightedAverage": 1, "WeightedVariance": 2}[s["mode"]]
-        s["resolve"] = resolve
-        return weights, qty
+        return compute_slot_fields(slot, self._vector_fields, self.data, self.camera.forward)
 
     def _render_composite_frame(self, fb_width, fb_height):
         """Render two fields into separate FBOs and composite.
