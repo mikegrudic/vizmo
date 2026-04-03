@@ -1,12 +1,5 @@
-// Star particle rendering as instanced quads (replaces star.vert + star.frag).
-
-struct Camera {
-    view: mat4x4<f32>,
-    proj: mat4x4<f32>,
-    viewport_size: vec2<f32>,
-    kernel_id: u32,
-    _pad: u32,
-};
+// Star particle rendering as instanced quads.
+// Camera, quad_corner provided by common.wgsl (prepended at load time).
 
 struct StarParams {
     point_size: f32,
@@ -26,12 +19,6 @@ struct VertexOutput {
     @location(0) coord: vec2<f32>,
     @location(1) mass: f32,
 };
-
-fn quad_corner(vertex_index: u32) -> vec2<f32> {
-    let x = f32(vertex_index & 1u) * 2.0 - 1.0;
-    let y = f32((vertex_index >> 1u) & 1u) * 2.0 - 1.0;
-    return vec2<f32>(x, y);
-}
 
 @vertex
 fn vs_main(

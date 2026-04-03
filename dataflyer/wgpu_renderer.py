@@ -9,8 +9,14 @@ import wgpu
 SHADER_DIR = Path(__file__).parent / "shaders"
 
 
-def _load_wgsl(name):
-    return (SHADER_DIR / name).read_text()
+_COMMON_WGSL = (SHADER_DIR / "common.wgsl").read_text()
+
+
+def _load_wgsl(name, include_common=False):
+    src = (SHADER_DIR / name).read_text()
+    if include_common:
+        src = _COMMON_WGSL + "\n" + src
+    return src
 
 
 def _make_bind_group(dev, layout, buffers):
@@ -153,12 +159,12 @@ class WGPURenderer:
         """Compile all shader modules and create pipeline layouts."""
         dev = self.device
 
-        # Shader modules
-        self._splat_shader = dev.create_shader_module(code=_load_wgsl("splat_quad.wgsl"))
-        self._aniso_shader = dev.create_shader_module(code=_load_wgsl("splat_aniso.wgsl"))
+        # Shader modules (render shaders include common.wgsl for Camera, quad_corner, eval_kernel)
+        self._splat_shader = dev.create_shader_module(code=_load_wgsl("splat_quad.wgsl", include_common=True))
+        self._aniso_shader = dev.create_shader_module(code=_load_wgsl("splat_aniso.wgsl", include_common=True))
         self._resolve_shader = dev.create_shader_module(code=_load_wgsl("resolve.wgsl"))
         self._composite_shader = dev.create_shader_module(code=_load_wgsl("composite.wgsl"))
-        self._star_shader = dev.create_shader_module(code=_load_wgsl("star.wgsl"))
+        self._star_shader = dev.create_shader_module(code=_load_wgsl("star.wgsl", include_common=True))
 
         # Camera uniform buffer (shared by splat and star shaders)
         # struct Camera { view: mat4x4, proj: mat4x4, viewport_size: vec2, kernel_id: u32, _pad: u32 }
