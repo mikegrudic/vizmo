@@ -80,7 +80,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
     # Renderer
     renderer = WGPURenderer(device, canvas_context, present_format)
-    renderer._viewport_width = fb_w
+    renderer._viewport_width = width  # use window size for LOD, not retina framebuffer size
 
     # Colormap
     rgba = colormap_to_texture_data("magma")
@@ -809,6 +809,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             fb_w, fb_h = new_fb_w, new_fb_h
             canvas_context.set_physical_size(fb_w, fb_h)
             camera.aspect = fb_w / max(fb_h, 1)
+            win_w, win_h = glfw.get_window_size(window)
+            renderer._viewport_width = win_w  # LOD uses window size, not retina
 
         # Render
         try:
@@ -859,15 +861,18 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 _state["_needs_auto_range"] = False
 
             smooth_fps_val = 1000.0 / max(smooth_frame_ms, 1.0) if smooth_frame_ms > 0 else 0.0
-            # Always build the overlay texture so toggle works instantly
-            was_enabled = overlay.enabled
-            overlay.enabled = True
-            overlay.update(
-                renderer, camera, fps, _render_mode.name,
-                AVAILABLE_COLORMAPS[_state["_cmap_idx"]], _timings, _last_message,
-                smooth_fps=smooth_fps_val,
-            )
-            overlay.enabled = was_enabled
+            # Only rebuild overlay texture at ~4Hz to avoid PIL cost every frame
+            _overlay_age = getattr(overlay, '_last_update_time', 0)
+            if now - _overlay_age > 0.25:
+                overlay._last_update_time = now
+                was_enabled = overlay.enabled
+                overlay.enabled = True
+                overlay.update(
+                    renderer, camera, fps, _render_mode.name,
+                    AVAILABLE_COLORMAPS[_state["_cmap_idx"]], _timings, _last_message,
+                    smooth_fps=smooth_fps_val,
+                )
+                overlay.enabled = was_enabled
             user_menu.update(
                 renderer,
                 AVAILABLE_COLORMAPS[_state["_cmap_idx"]], AVAILABLE_COLORMAPS,
