@@ -537,22 +537,22 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             cache_ready = _slot_sorted[i] is not None
             if gpu_ready_now and renderer._grid is not None and cache_ready:
                 sorted_mass, sorted_qty = _slot_sorted[i][1], _slot_sorted[i][2]
+                slot_id = _slot_sorted[i][0]
 
-                # Write mass to GPU
-                device.queue.write_buffer(gpu_compute._particle_bufs["mass"], 0, sorted_mass.tobytes())
+                # Upload to persistent per-slot GPU buffers (no-op if unchanged)
+                gpu_compute.upload_slot_data(i, slot_id, sorted_mass, sorted_qty)
 
-                # For LOS vector fields: use GPU projection instead of CPU-sorted qty
+                # GPU-to-GPU copy from slot buffers to active particle buffers (~1ms)
+                gpu_compute.activate_slot(i)
+
+                # For LOS vector fields: overwrite qty with GPU projection
                 is_los_vec = (sl.get("proj") == "LOS" and
                               sl["mode"] in ("WeightedAverage", "WeightedVariance") and
                               sl["data"] in _state["_vector_fields"])
-                is_los_weight = (sl.get("proj") == "LOS" and
-                                 sl["weight"] in _state["_vector_fields"])
                 if is_los_vec:
                     if not gpu_compute.has_los_field() or getattr(gpu_compute, '_los_field_name', '') != sl["data"]:
                         gpu_compute.upload_vector_field(renderer._grid, sl["data"], data)
                     gpu_compute.dispatch_los_project(camera)
-                else:
-                    device.queue.write_buffer(gpu_compute._particle_bufs["qty"], 0, sorted_qty.tobytes())
 
                 n_out, n_vis, summary_data = gpu_compute.dispatch_cull(
                     camera, renderer.max_render_particles,
@@ -638,7 +638,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         # GPU compute init (blocking upload once grid is available)
         gpu_ready = getattr(gpu_compute, '_upload_ready', False)
-        if not gpu_ready and gpu_compute is None and renderer._grid is not None:
+        # Only use GPU compute for datasets large enough to benefit (>10M particles)
+        GPU_COMPUTE_THRESHOLD = 10_000_000
+        if (not gpu_ready and gpu_compute is None and renderer._grid is not None
+                and renderer.n_total >= GPU_COMPUTE_THRESHOLD):
             try:
                 gpu_compute = GPUCompute(device)
                 gpu_compute.upload_snapshot(renderer._grid)
@@ -760,8 +763,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             if renderer.auto_lod and smooth_frame_ms > 0 and (now - last_lod_adjust) >= tau:
                 target_ms = 1000.0 / max(renderer.target_fps, 1.0)
                 if smooth_frame_ms > target_ms:
-                    renderer.lod_pixels = min(256, renderer.lod_pixels * 2)
-                    renderer.max_render_particles = max(100_000, renderer.max_render_particles // 2)
+                    renderer.lod_pixels = min(32, renderer.lod_pixels * 2)
+                    renderer.max_render_particles = max(500_000, renderer.max_render_particles // 2)
                     last_lod_adjust = now
                 elif smooth_frame_ms < target_ms * 0.5:
                     renderer.lod_pixels = max(1, renderer.lod_pixels // 2)

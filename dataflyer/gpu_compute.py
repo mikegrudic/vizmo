@@ -133,6 +133,16 @@ class GPUCompute:
             "qty": dev.create_buffer(size=n * 4, usage=particle_usage),
         }
 
+        # Per-slot persistent buffers for composite mode (avoid re-uploading every frame)
+        self._slot_bufs = [
+            {"mass": dev.create_buffer(size=n * 4, usage=particle_usage),
+             "qty": dev.create_buffer(size=n * 4, usage=particle_usage),
+             "id": None},  # slot config id for cache invalidation
+            {"mass": dev.create_buffer(size=n * 4, usage=particle_usage),
+             "qty": dev.create_buffer(size=n * 4, usage=particle_usage),
+             "id": None},
+        ]
+
         # Cell start (convert int64 → u32)
         cell_start_u32 = grid.cell_start.astype(np.uint32)
         self._cell_start_buf = dev.create_buffer_with_data(
@@ -805,6 +815,26 @@ class GPUCompute:
         cpass.set_bind_group(0, los_bg)
         cpass.dispatch_workgroups(dispatch_x, dispatch_y)
         cpass.end()
+        dev.queue.submit([encoder.finish()])
+
+    def upload_slot_data(self, slot_idx, slot_id, sorted_mass, sorted_qty):
+        """Write sorted mass/qty to persistent per-slot buffers. Only writes on config change."""
+        sb = self._slot_bufs[slot_idx]
+        if sb["id"] == slot_id:
+            return  # already up to date
+        dev = self.device
+        dev.queue.write_buffer(sb["mass"], 0, sorted_mass.tobytes())
+        dev.queue.write_buffer(sb["qty"], 0, sorted_qty.tobytes())
+        sb["id"] = slot_id
+
+    def activate_slot(self, slot_idx):
+        """Copy per-slot mass/qty into the active particle buffers for cull/gather."""
+        dev = self.device
+        sb = self._slot_bufs[slot_idx]
+        n = self._n_particles
+        encoder = dev.create_command_encoder()
+        encoder.copy_buffer_to_buffer(sb["mass"], 0, self._particle_bufs["mass"], 0, n * 4)
+        encoder.copy_buffer_to_buffer(sb["qty"], 0, self._particle_bufs["qty"], 0, n * 4)
         dev.queue.submit([encoder.finish()])
 
     def has_los_field(self):
