@@ -518,16 +518,21 @@ class SpatialGrid:
         safe_dist = np.maximum(dist, 0.01)
         h_pix = lv["hsml"] / safe_dist * pix_per_rad
 
-        summary_mask = visible & has_mass & (h_pix <= lod_pixels)
-        refine_mask = visible & has_mass & (h_pix > lod_pixels)
+        # Always refine the coarsest levels (nc <= 8) — they're too coarse
+        # to produce meaningful summary splats
+        if lv["nc"] <= 8:
+            refine_mask = visible & has_mass
+        else:
+            summary_mask = visible & has_mass & (h_pix <= lod_pixels)
+            refine_mask = visible & has_mass & (h_pix > lod_pixels)
 
-        s_idx = np.where(summary_mask)[0]
-        if len(s_idx) > 0:
-            summary_parts.append((
-                lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx],
-                lv["qty"][s_idx], lv["cov"][s_idx],
-                lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30), lv["cs"],
-            ))
+            s_idx = np.where(summary_mask)[0]
+            if len(s_idx) > 0:
+                summary_parts.append((
+                    lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx],
+                    lv["qty"][s_idx], lv["cov"][s_idx],
+                    lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30), lv["cs"],
+                ))
 
         refine_cells = np.where(refine_mask)[0]
 

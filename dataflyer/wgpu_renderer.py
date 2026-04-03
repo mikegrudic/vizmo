@@ -80,7 +80,7 @@ class WGPURenderer:
         self.summary_overlap = 0.1
         self.use_aniso_summaries = True
         self.bypass_cull = False
-        self.auto_lod = False
+        self.auto_lod = True
         self.target_fps = 15.0
         self.auto_lod_smooth = 1.0
         self.pid_Kp = 0.5

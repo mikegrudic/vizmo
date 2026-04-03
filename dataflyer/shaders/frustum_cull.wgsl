@@ -91,10 +91,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let safe_dist = max(dist, 0.01);
     let h_pix = hsml / safe_dist * params.pix_per_rad;
 
-    if (h_pix <= params.lod_pixels) {
+    if (params.is_finest == 1u) {
+        // Finest level: always emit particles (summary gather skips level 0,
+        // so SUMMARY cells here would be silently dropped)
+        decision[idx] = 3u;  // EMIT_PARTICLES
+    } else if (h_pix <= params.lod_pixels) {
         decision[idx] = 1u;  // SUMMARY
-    } else if (params.is_finest == 1u) {
-        decision[idx] = 3u;  // EMIT_PARTICLES (finest level)
     } else {
         decision[idx] = 2u;  // REFINE (go to children)
     }
