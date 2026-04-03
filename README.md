@@ -48,16 +48,16 @@ pip install -e ".[wgpu]"
 dataflyer snapshot.hdf5 --backend wgpu
 ```
 
-**Performance comparison** (SN_512, 134M particles, Apple M3 Max):
+**Performance** (SN_512, 134M particles, Apple M3 Max, 3024×1842 retina):
 
-| Stage | moderngl | wgpu |
+| Metric | moderngl | wgpu |
 |---|---|---|
-| Cull + LOD + gather | 37 ms (CPU) | 34 ms (GPU compute) |
-| GPU upload | 77 ms | 0 ms (zero-copy) |
-| Total per frame | 125 ms (8 fps) | ~34 ms (29 fps) |
+| GPU cull + LOD + gather | 37 ms (CPU) | 14 ms (GPU compute) |
+| GPU upload per frame | 77 ms | 0 ms (zero-copy) |
+| Flythrough FPS (4M budget) | 8 fps | 27 fps |
 | Depth sort (4M particles) | 328 ms (CPU, unusable) | 8.4 ms (GPU radix sort) |
 
-The wgpu backend keeps all particle data GPU-resident. On field switch, only the mass/quantity arrays (~1 GB) are re-uploaded. On unified memory systems (Apple Silicon), this transfer is near-zero.
+The wgpu backend keeps all particle data GPU-resident. Batched compute dispatches with pre-built bind groups minimize CPU→GPU round-trips. GPU-side summary gathering eliminates per-level decision readbacks. On field switch, only the mass/quantity arrays (~1 GB) are re-uploaded. On unified memory systems (Apple Silicon), this transfer is near-zero.
 
 ## Controls
 

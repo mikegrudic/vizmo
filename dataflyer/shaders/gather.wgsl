@@ -70,7 +70,7 @@ fn apply_stride(@builtin(global_invocation_id) gid: vec3<u32>) {
     let stride = gather_params.stride;
     let kept = (n + stride - 1u) / stride;
     cell_out_counts[cell] = kept;
-    atomicAdd(&counters[1], kept);  // exact output total in counters[1]
+    atomicAdd(&counters[1], kept);
 }
 
 // Pass 3: After prefix sum on cell_out_counts, gather particles
@@ -87,7 +87,7 @@ fn gather_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (n == 0u) { return; }
 
     let stride = gather_params.stride;
-    let out_start = cell_out_counts[cell];  // now contains prefix-summed offset
+    let out_start = cell_out_counts[cell];
 
     // Rescale factor
     let kept = (n + stride - 1u) / stride;

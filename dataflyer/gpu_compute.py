@@ -299,6 +299,18 @@ class GPUCompute:
             compute={"module": self._cull_module, "entry_point": "main"},
         )
 
+        # --- Compute stride pipeline (single thread, eliminates CPU readback) ---
+        stride_module = dev.create_shader_module(code=_load_wgsl("compute_stride.wgsl"))
+        self._stride_bgl = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
+        ])
+        stride_layout = dev.create_pipeline_layout(bind_group_layouts=[self._stride_bgl])
+        self._stride_pipeline = dev.create_compute_pipeline(
+            layout=stride_layout,
+            compute={"module": stride_module, "entry_point": "main"},
+        )
+
         # --- Prefix sum pipelines ---
         self._scan_bgl = dev.create_bind_group_layout(entries=[
             {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
@@ -517,18 +529,17 @@ class GPUCompute:
             cpass.end()
         dev.queue.submit([encoder.finish()])
 
-        # Read total summary count (single readback)
-        sc_data = dev.queue.read_buffer(self._summary_counters_buf, size=4)
-        n_summaries = struct.unpack("I", sc_data)[0]
-        n_summaries = min(n_summaries, self._max_summaries)
-
-        # === Pass 2: Count particles in EMIT cells ===
-        # Clear counters
+        # === Pass 2: Count + stride + apply stride + prefix sum ===
         dev.queue.write_buffer(self._counters_buf, 0, struct.pack("IIII", 0, 0, 0, 0))
 
-        # Write gather params (stride=1 initially)
+        max_buf_bytes = self.device.adapter.limits.get("max-buffer-size", 2**30)
+        MAX_OUTPUT_CAP = max_buf_bytes // (16 * 4)
+        budget = min(max(max_particles // 2, max_particles - self._max_summaries), MAX_OUTPUT_CAP)
+        if budget > self._max_output:
+            self._grow_output_buffers(budget)
+
         dev.queue.write_buffer(self._gather_params_buf, 0,
-                               struct.pack("IIII", nc3, max_particles, 0, 1))
+                               struct.pack("IIII", nc3, budget, 0, 1))
 
         finest_decision_buf = self._level_bufs[0]["decision"]
         gather_bg0 = dev.create_bind_group(
@@ -542,6 +553,7 @@ class GPUCompute:
             ],
         )
 
+        # Count particles
         encoder = dev.create_command_encoder()
         cpass = encoder.begin_compute_pass()
         cpass.set_pipeline(self._count_pipeline)
@@ -552,24 +564,14 @@ class GPUCompute:
         cpass.end()
         dev.queue.submit([encoder.finish()])
 
-        # Read total visible count
+        # Read total visible, compute stride on CPU
         counter_data = dev.queue.read_buffer(self._counters_buf, size=16)
         total_visible = struct.unpack("I", counter_data[:4])[0]
-
-        # Compute stride — grow output buffer if needed.
-        # Use ~25% of max buffer size for output (rest is source data + overhead).
-        # 28 bytes/particle (pos=16 + hsml=4 + mass=4 + qty=4), pos is largest at 16.
-        max_buf_bytes = self.device.adapter.limits.get("max-buffer-size", 2**30)
-        MAX_OUTPUT_CAP = max_buf_bytes // (16 * 4)  # conservative: 25% of limit for pos buffer
-        budget = min(max(max_particles - n_summaries, max_particles // 2), MAX_OUTPUT_CAP)
-        if budget > self._max_output:
-            self._grow_output_buffers(budget)
         stride = max(1, total_visible // budget) if total_visible > budget else 1
 
-        # === Pass 3: Apply stride to get per-cell output counts ===
+        # Apply stride
         dev.queue.write_buffer(self._gather_params_buf, 0,
                                struct.pack("IIII", nc3, budget, total_visible, stride))
-
         encoder = dev.create_command_encoder()
         cpass = encoder.begin_compute_pass()
         cpass.set_pipeline(self._apply_stride_pipeline)
@@ -580,10 +582,10 @@ class GPUCompute:
         cpass.end()
         dev.queue.submit([encoder.finish()])
 
-        # === Pass 4: Prefix sum on cell_out_counts ===
+        # Prefix sum
         self._prefix_sum(self._cell_out_counts_buf, nc3)
 
-        # Read exact output count from counters[1] (written by apply_stride)
+        # Read n_output from apply_stride
         counter_data2 = dev.queue.read_buffer(self._counters_buf, size=16)
         n_output = struct.unpack("I", counter_data2[4:8])[0]
         n_output = min(n_output, self._max_output)
@@ -598,6 +600,11 @@ class GPUCompute:
         cpass.dispatch_workgroups(_div_ceil(nc3, WG_SIZE))
         cpass.end()
         dev.queue.submit([encoder.finish()])
+
+        # Read n_summaries
+        sc_data = dev.queue.read_buffer(self._summary_counters_buf, size=4)
+        n_summaries = struct.unpack("I", sc_data)[0]
+        n_summaries = min(n_summaries, self._max_summaries)
 
         # === Read back summary data from GPU ===
         z3 = np.zeros((0, 3), dtype=np.float32)
