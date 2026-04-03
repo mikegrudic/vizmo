@@ -31,7 +31,33 @@ If a directory contains multiple snapshots, they are automatically discovered an
 ```
 dataflyer snapshot.hdf5 [--width 1920] [--height 1080] [--fov 90]
                         [--screenshot output.png] [--benchmark N]
+                        [--backend moderngl|wgpu]
 ```
+
+### Rendering backends
+
+DataFlyer supports two rendering backends:
+
+- **moderngl** (default) — OpenGL 3.3 via ModernGL. Mature, full UI support. CPU-side frustum culling and LOD with per-frame GPU upload.
+- **wgpu** — WebGPU via wgpu-py (Metal on macOS, Vulkan on Linux). GPU-resident particle data with compute shader culling, LOD, and gathering — zero CPU-GPU transfer per frame. Includes GPU radix sort for future depth-ordered opacity rendering.
+
+The wgpu backend requires the optional `wgpu` dependency:
+
+```bash
+pip install -e ".[wgpu]"
+dataflyer snapshot.hdf5 --backend wgpu
+```
+
+**Performance comparison** (SN_512, 134M particles, Apple M3 Max):
+
+| Stage | moderngl | wgpu |
+|---|---|---|
+| Cull + LOD + gather | 37 ms (CPU) | 34 ms (GPU compute) |
+| GPU upload | 77 ms | 0 ms (zero-copy) |
+| Total per frame | 125 ms (8 fps) | ~34 ms (29 fps) |
+| Depth sort (4M particles) | 328 ms (CPU, unusable) | 8.4 ms (GPU radix sort) |
+
+The wgpu backend keeps all particle data GPU-resident. On field switch, only the mass/quantity arrays (~1 GB) are re-uploaded. On unified memory systems (Apple Silicon), this transfer is near-zero.
 
 ## Controls
 
@@ -82,14 +108,21 @@ Select from the **Mode** dropdown in the user menu:
 
 ```
 dataflyer/
-  app.py           - Main loop, key actions, render mode orchestration
-  renderer.py      - RenderMode, ParticleLayer, BufferSet, SplatRenderer
-  spatial_grid.py  - CellMoments, SpatialGrid, numba gather kernels
-  camera.py        - 6DOF camera with cached basis vectors
-  data_manager.py  - HDF5 I/O with lazy loading and cosmological corrections
-  overlay.py       - Panel/PanelStyle base, DevOverlay, UserMenu
-  colormaps.py     - Matplotlib colormap to GPU texture
-  shaders/         - GLSL vertex/fragment shaders
+  app.py            - Main loop (moderngl backend), key actions, render mode orchestration
+  renderer.py       - RenderMode, ParticleLayer, BufferSet, SplatRenderer (moderngl)
+  wgpu_app.py       - Main loop (wgpu backend) with progressive refinement and auto-LOD
+  wgpu_renderer.py  - WGPURenderer: full wgpu render pipeline (accumulate + resolve)
+  gpu_compute.py    - GPUCompute: GPU-resident data, compute cull/LOD/gather/sort
+  wgpu_overlay.py   - WGPUDevOverlay, WGPUUserMenu (wgpu panel rendering)
+  spatial_grid.py   - CellMoments, SpatialGrid, numba gather kernels
+  camera.py         - 6DOF camera with cached basis vectors
+  data_manager.py   - HDF5 I/O with lazy loading and cosmological corrections
+  overlay.py        - Panel/PanelStyle base, DevOverlay, UserMenu (moderngl)
+  colormaps.py      - Matplotlib colormap to GPU texture
+  shaders/          - GLSL (moderngl) and WGSL (wgpu) shaders
+    *.vert, *.frag  - OpenGL 3.3 GLSL shaders
+    *.wgsl          - WebGPU WGSL shaders (splat, aniso, resolve, composite, star,
+                      text, frustum_cull, prefix_sum, gather, depth_keys, radix_sort)
 ```
 
 ## Tests

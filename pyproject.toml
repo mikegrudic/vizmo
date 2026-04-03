@@ -20,5 +20,8 @@ dependencies = [
     "Pillow",
 ]
 
+[project.optional-dependencies]
+wgpu = ["wgpu>=0.19"]
+
 [project.scripts]
 dataflyer = "dataflyer.app:main"

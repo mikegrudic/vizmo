@@ -245,31 +245,38 @@ class Panel:
                 self._widgets.append((y, y + LH, "field", key))
                 y += LH
 
-        # Upload texture
+        # Finalize: compute panel bounds, upload texture, build VAO
         self._panel_w = tw
         self._panel_h = th
         data = img.tobytes()
+
+        fb_w, fb_h = self._fb_width, self._fb_height
+        if s.position == "top-right":
+            self._panel_x = fb_w - tw - 10
+            self._panel_y = 10
+        else:
+            self._panel_x = 10
+            self._panel_y = fb_h - th - 10
+
+        self._upload_panel(tw, th, data)
+
+    def _upload_panel(self, tw, th, data):
+        """Upload PIL image to GPU and build vertex data. Override for wgpu."""
         if self._tex is not None:
             self._tex.release()
         self._tex = self.ctx.texture((tw, th), 4, data=data)
         self._tex.filter = (0x2601, 0x2601)
 
-        # Position
         fb_w, fb_h = self._fb_width, self._fb_height
+        s = self.style
+        px_w = tw / fb_w * 2
+        px_h = th / fb_h * 2
         if s.position == "top-right":
-            self._panel_x = fb_w - tw - 10
-            self._panel_y = 10
-            px_w = tw / fb_w * 2
-            px_h = th / fb_h * 2
             x1 = 1.0 - px_w - 0.01
             x2 = 1.0 - 0.01
             y1 = 1.0 - px_h - 0.01
             y2 = 1.0 - 0.01
-        else:  # bottom-left
-            self._panel_x = 10
-            self._panel_y = fb_h - th - 10
-            px_w = tw / fb_w * 2
-            px_h = th / fb_h * 2
+        else:
             x1 = -1.0 + 0.01
             x2 = -1.0 + px_w + 0.01
             y1 = -1.0 + 0.01
