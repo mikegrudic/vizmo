@@ -81,7 +81,7 @@ class WGPURenderer:
         self.bypass_cull = False
         self.auto_lod = True
         self.target_fps = 15.0
-        self.auto_lod_smooth = 0.3
+        self.auto_lod_smooth = 1.0
         self.pid_Kp = 4.0
         self.pid_Ki = 0.0
         self.pid_Kd = 0.0

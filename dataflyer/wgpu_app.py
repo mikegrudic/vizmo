@@ -772,19 +772,18 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 do_cull()
                 last_cull_time = now
 
-            # Smoothed WORK time (cull + upload, excludes vsync wait)
-            work_ms = getattr(renderer, '_last_cull_ms', 0) + getattr(renderer, '_last_upload_ms', 0)
+            # Smoothed wall-clock frame time (EMA)
             if dt > 0:
                 if not was_moving:
                     smooth_frame_ms = 0.0
                     pid_integral = 0.0
                     pid_prev_error = 0.0
-                elif smooth_frame_ms == 0.0 and work_ms > 0:
-                    smooth_frame_ms = work_ms
-                elif work_ms > 0:
+                elif smooth_frame_ms == 0.0:
+                    smooth_frame_ms = dt * 1000
+                else:
                     tau = max(renderer.auto_lod_smooth, 0.01)
                     a = min(dt / tau, 1.0)
-                    smooth_frame_ms = (1 - a) * smooth_frame_ms + a * work_ms
+                    smooth_frame_ms = (1 - a) * smooth_frame_ms + a * dt * 1000
 
             # PID auto-LOD on log2(budget)
             import math

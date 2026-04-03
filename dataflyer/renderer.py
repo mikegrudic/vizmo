@@ -307,7 +307,7 @@ class SplatRenderer:
         self.bypass_cull = False  # render all particles without frustum culling
         self.auto_lod = True  # auto-tune LOD to maintain target FPS while moving
         self.target_fps = 15.0  # target FPS for auto-LOD
-        self.auto_lod_smooth = 0.3  # EMA smoothing timescale in seconds
+        self.auto_lod_smooth = 1.0  # EMA smoothing timescale in seconds
         self.pid_Kp = 4.0  # PID proportional gain (log2-units/sec per unit error)
         self.pid_Ki = 0.0  # PID integral gain
         self.pid_Kd = 0.0  # PID derivative gain (0 recommended — D amplifies noise)
