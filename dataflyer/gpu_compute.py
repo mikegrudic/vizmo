@@ -204,6 +204,18 @@ class GPUCompute:
         self._scan_params_buf = dev.create_buffer(
             size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
+        # Per-level cull uniform buffers (one per level, written once per frame)
+        n_levels = len(grid.levels)
+        self._per_level_cull_params = [
+            dev.create_buffer(size=96, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+            for _ in range(n_levels)
+        ]
+        # Per-level summary params buffers
+        self._per_level_summary_params = [
+            dev.create_buffer(size=32, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+            for _ in range(n_levels)
+        ]
+
         self._upload_ready = False
 
     def _upload_particle_steps(self, grid):
@@ -339,13 +351,12 @@ class GPUCompute:
             compute={"module": self._gather_module, "entry_point": "gather_particles"},
         )
 
-        # --- Summary gather pipelines ---
+        # --- Summary gather pipeline (atomic offset, no prefix sum) ---
         summary_module = dev.create_shader_module(code=_load_wgsl("gather_summaries.wgsl"))
         self._summary_bgl0 = dev.create_bind_group_layout(entries=[
             {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
             {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
             {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
         ])
         self._summary_bgl1 = dev.create_bind_group_layout(entries=[
             {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
@@ -363,10 +374,6 @@ class GPUCompute:
         ])
         summary_layout = dev.create_pipeline_layout(
             bind_group_layouts=[self._summary_bgl0, self._summary_bgl1, self._summary_bgl2])
-        self._summary_count_pipeline = dev.create_compute_pipeline(
-            layout=summary_layout,
-            compute={"module": summary_module, "entry_point": "count_summaries"},
-        )
         self._summary_gather_pipeline = dev.create_compute_pipeline(
             layout=summary_layout,
             compute={"module": summary_module, "entry_point": "gather_summaries"},
@@ -402,6 +409,48 @@ class GPUCompute:
             ],
         )
 
+        # Pre-build per-level cull bind groups
+        self._per_level_cull_bgs = []
+        for li in range(self._n_levels):
+            lb = self._level_bufs[li]
+            parent_decision_buf = (
+                self._level_bufs[li + 1]["decision"] if li < self._n_levels - 1
+                else self._dummy_decision_buf
+            )
+            bg = dev.create_bind_group(
+                layout=self._cull_bgl,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": self._per_level_cull_params[li]}},
+                    {"binding": 1, "resource": {"buffer": lb["mass"]}},
+                    {"binding": 2, "resource": {"buffer": lb["hsml"]}},
+                    {"binding": 3, "resource": {"buffer": lb["centers"]}},
+                    {"binding": 4, "resource": {"buffer": parent_decision_buf}},
+                    {"binding": 5, "resource": {"buffer": lb["decision"]}},
+                ],
+            )
+            self._per_level_cull_bgs.append(bg)
+
+        # Pre-build per-level summary bind groups
+        self._per_level_summary_bg0s = []
+        self._per_level_summary_bg1s = []
+        for li in range(self._n_levels):
+            lb = self._level_bufs[li]
+            bg0 = dev.create_bind_group(layout=self._summary_bgl0, entries=[
+                {"binding": 0, "resource": {"buffer": self._per_level_summary_params[li]}},
+                {"binding": 1, "resource": {"buffer": lb["decision"]}},
+                {"binding": 2, "resource": {"buffer": self._summary_counters_buf}},
+            ])
+            bg1 = dev.create_bind_group(layout=self._summary_bgl1, entries=[
+                {"binding": 0, "resource": {"buffer": lb["com_gpu"]}},
+                {"binding": 1, "resource": {"buffer": lb["hsml"]}},
+                {"binding": 2, "resource": {"buffer": lb["mass"]}},
+                {"binding": 3, "resource": {"buffer": lb["qty_gpu"]}},
+                {"binding": 4, "resource": {"buffer": lb["cov_gpu"]}},
+                {"binding": 5, "resource": {"buffer": lb["mh2_gpu"]}},
+            ])
+            self._per_level_summary_bg0s.append(bg0)
+            self._per_level_summary_bg1s.append(bg1)
+
     def dispatch_cull(self, camera, max_particles, lod_pixels=4,
                       viewport_width=2048, summary_overlap=0.0):
         """Run GPU frustum cull + LOD + gather. Returns (n_particles, summary_data).
@@ -416,18 +465,14 @@ class GPUCompute:
         fov_rad = float(np.radians(camera.fov))
         pix_per_rad = viewport_width / (2.0 * np.tan(fov_rad / 2))
 
-        # === Pass 1: Multi-level frustum cull + LOD ===
-        # Each level must be a separate submit so the uniform buffer write
-        # takes effect before the dispatch.
+        # === Pass 1: Multi-level frustum cull + LOD (batched) ===
+        # Write all per-level params upfront, then one submit with all dispatches.
         for li in range(self._n_levels - 1, -1, -1):
             lb = self._level_bufs[li]
             level_nc = lb["nc"]
-            level_nc3 = level_nc ** 3
-
             is_coarsest = 1 if li == self._n_levels - 1 else 0
             is_finest = 1 if li == 0 else 0
             parent_nc = self._level_bufs[li + 1]["nc"] if li < self._n_levels - 1 else 0
-
             params_data = struct.pack(
                 "fff f fff f fff f fff f ffff IIII",
                 *camera.position, 0.0,
@@ -437,96 +482,45 @@ class GPUCompute:
                 fov_rad, camera.aspect, pix_per_rad, float(lod_pixels),
                 is_coarsest, is_finest, parent_nc, level_nc,
             )
-            dev.queue.write_buffer(self._cull_params_buf, 0, params_data)
+            dev.queue.write_buffer(self._per_level_cull_params[li], 0, params_data)
 
-            parent_decision_buf = (
-                self._level_bufs[li + 1]["decision"] if li < self._n_levels - 1
-                else self._dummy_decision_buf
-            )
-
-            cull_bg = dev.create_bind_group(
-                layout=self._cull_bgl,
-                entries=[
-                    {"binding": 0, "resource": {"buffer": self._cull_params_buf}},
-                    {"binding": 1, "resource": {"buffer": lb["mass"]}},
-                    {"binding": 2, "resource": {"buffer": lb["hsml"]}},
-                    {"binding": 3, "resource": {"buffer": lb["centers"]}},
-                    {"binding": 4, "resource": {"buffer": parent_decision_buf}},
-                    {"binding": 5, "resource": {"buffer": lb["decision"]}},
-                ],
-            )
-
-            encoder = dev.create_command_encoder()
+        encoder = dev.create_command_encoder()
+        for li in range(self._n_levels - 1, -1, -1):
+            level_nc3 = self._level_bufs[li]["nc"] ** 3
             cpass = encoder.begin_compute_pass()
             cpass.set_pipeline(self._cull_pipeline)
-            cpass.set_bind_group(0, cull_bg)
+            cpass.set_bind_group(0, self._per_level_cull_bgs[li])
             cpass.dispatch_workgroups(_div_ceil(level_nc3, WG_SIZE))
             cpass.end()
-            dev.queue.submit([encoder.finish()])
+        dev.queue.submit([encoder.finish()])
 
-        # === GPU Summary Gather: per-level count + prefix sum + gather ===
-        summary_offset = 0
-        n_summaries = 0
-        for li in range(self._n_levels - 1, 0, -1):  # skip finest
+        # === GPU Summary Gather (batched, atomic offset) ===
+        # Write all per-level summary params, clear counter, one submit with all levels
+        dev.queue.write_buffer(self._summary_counters_buf, 0, struct.pack("IIII", 0, 0, 0, 0))
+        for li in range(self._n_levels - 1, 0, -1):
             lb = self._level_bufs[li]
-            level_nc3 = lb["nc"] ** 3
             cs = lb["cs"]
-
-            # Clear per-level counter
-            dev.queue.write_buffer(self._summary_counters_buf, 0, struct.pack("IIII", 0, 0, 0, 0))
-            dev.queue.write_buffer(self._summary_params_buf, 0,
-                                   struct.pack("IfffffII", level_nc3, summary_overlap,
+            dev.queue.write_buffer(self._per_level_summary_params[li], 0,
+                                   struct.pack("IfffffII", lb["nc"] ** 3, summary_overlap,
                                                float(cs[0]**2), float(cs[1]**2),
-                                               float(cs[2]**2), summary_offset, 0, 0))
+                                               float(cs[2]**2), 0, 0, 0))
 
-            sbg0 = dev.create_bind_group(layout=self._summary_bgl0, entries=[
-                {"binding": 0, "resource": {"buffer": self._summary_params_buf}},
-                {"binding": 1, "resource": {"buffer": lb["decision"]}},
-                {"binding": 2, "resource": {"buffer": self._summary_counts_buf}},
-                {"binding": 3, "resource": {"buffer": self._summary_counters_buf}},
-            ])
-            sbg1 = dev.create_bind_group(layout=self._summary_bgl1, entries=[
-                {"binding": 0, "resource": {"buffer": lb["com_gpu"]}},
-                {"binding": 1, "resource": {"buffer": lb["hsml"]}},
-                {"binding": 2, "resource": {"buffer": lb["mass"]}},
-                {"binding": 3, "resource": {"buffer": lb["qty_gpu"]}},
-                {"binding": 4, "resource": {"buffer": lb["cov_gpu"]}},
-                {"binding": 5, "resource": {"buffer": lb["mh2_gpu"]}},
-            ])
-
-            # Count
-            encoder = dev.create_command_encoder()
-            cpass = encoder.begin_compute_pass()
-            cpass.set_pipeline(self._summary_count_pipeline)
-            cpass.set_bind_group(0, sbg0)
-            cpass.set_bind_group(1, sbg1)
-            cpass.set_bind_group(2, self._summary_out_bg)
-            cpass.dispatch_workgroups(_div_ceil(level_nc3, WG_SIZE))
-            cpass.end()
-            dev.queue.submit([encoder.finish()])
-
-            # Read this level's count
-            sc_data = dev.queue.read_buffer(self._summary_counters_buf, size=4)
-            level_count = struct.unpack("I", sc_data)[0]
-            if level_count == 0:
-                continue
-
-            # Prefix sum on counts
-            self._prefix_sum(self._summary_counts_buf, level_nc3)
-
-            # Gather
-            encoder = dev.create_command_encoder()
+        encoder = dev.create_command_encoder()
+        for li in range(self._n_levels - 1, 0, -1):
+            level_nc3 = self._level_bufs[li]["nc"] ** 3
             cpass = encoder.begin_compute_pass()
             cpass.set_pipeline(self._summary_gather_pipeline)
-            cpass.set_bind_group(0, sbg0)
-            cpass.set_bind_group(1, sbg1)
+            cpass.set_bind_group(0, self._per_level_summary_bg0s[li])
+            cpass.set_bind_group(1, self._per_level_summary_bg1s[li])
             cpass.set_bind_group(2, self._summary_out_bg)
             cpass.dispatch_workgroups(_div_ceil(level_nc3, WG_SIZE))
             cpass.end()
-            dev.queue.submit([encoder.finish()])
+        dev.queue.submit([encoder.finish()])
 
-            summary_offset += level_count
-            n_summaries += level_count
+        # Read total summary count (single readback)
+        sc_data = dev.queue.read_buffer(self._summary_counters_buf, size=4)
+        n_summaries = struct.unpack("I", sc_data)[0]
+        n_summaries = min(n_summaries, self._max_summaries)
 
         # === Pass 2: Count particles in EMIT cells ===
         # Clear counters

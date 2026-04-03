@@ -543,9 +543,11 @@ class WGPURenderer:
         self._set_identity_sort_index(n)
 
     def _set_identity_sort_index(self, n):
-        """Create identity sort index buffer (no sorting)."""
+        """Create identity sort index buffer (no sorting). Cached by size."""
         if n == 0:
-            n = 1  # wgpu requires non-zero buffer size
+            n = 1
+        if hasattr(self, '_identity_sort_n') and self._identity_sort_n >= n:
+            return  # reuse existing buffer (large enough)
         identity = np.arange(n, dtype=np.uint32)
         self._sort_index_buf = self.device.create_buffer_with_data(
             data=identity, usage=wgpu.BufferUsage.STORAGE)
@@ -553,6 +555,7 @@ class WGPURenderer:
             layout=self._splat_bgl2,
             entries=[{"binding": 0, "resource": {"buffer": self._sort_index_buf}}],
         )
+        self._identity_sort_n = n
 
     def set_sort_index_buffer(self, sort_index_buf):
         """Set an external sort index buffer (from GPUCompute.dispatch_sort)."""
