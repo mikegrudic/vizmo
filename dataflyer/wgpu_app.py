@@ -18,7 +18,8 @@ from .wgpu_renderer import WGPURenderer
 from .colormaps import colormap_to_texture_data, AVAILABLE_COLORMAPS
 from .renderer import RenderMode
 from .field_ops import (resolve_field, compute_weights, compute_slot_fields,
-                        project_vector, combine_fields)
+                        project_vector, combine_fields, make_default_app_state,
+                        is_los_stale, SD_OPS, RENDER_MODES, VECTOR_PROJECTIONS)
 
 
 def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
@@ -136,33 +137,21 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     _last_message = ""
     _render_mode = RenderMode.surface_density("Masses")
     _cmap_idx = 0
-    _sd_fields = data.available_fields()
-    _vector_fields = data.available_vector_fields()
-    _sd_field = "Masses"
-    _sd_field2 = "None"
-    _sd_op = "*"
-    _render_mode_name = "SurfaceDensity"
-    _wa_data_field = "Masses"
-    _RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance", "Composite"]
-    _SD_OPS = ["*", "+", "-", "/", "min", "max"]
-    _VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
-    _vector_projection = "LOS"
-    _los_camera_fwd = None
-
-    # Composite mode slots
-    _has_vel = "Velocities" in _vector_fields
-    _composite = False
-    _slot = [
-        {"mode": "SurfaceDensity", "weight": "Masses", "data": "Masses",
-         "weight2": "None", "op": "*", "proj": "LOS",
-         "min": -1.0, "max": 3.0, "log": 1, "resolve": 0},
-        {"mode": "WeightedVariance" if _has_vel else "SurfaceDensity",
-         "weight": "Masses",
-         "data": "Velocities" if _has_vel else "Masses",
-         "weight2": "None", "op": "*", "proj": "LOS",
-         "min": -1.0, "max": 3.0, "log": 1,
-         "resolve": 2 if _has_vel else 0},
-    ]
+    _s = make_default_app_state(data)
+    _sd_fields = _s["sd_fields"]
+    _vector_fields = _s["vector_fields"]
+    _sd_field = _s["sd_field"]
+    _sd_field2 = _s["sd_field2"]
+    _sd_op = _s["sd_op"]
+    _render_mode_name = _s["render_mode_name"]
+    _wa_data_field = _s["wa_data_field"]
+    _RENDER_MODES = RENDER_MODES
+    _SD_OPS = SD_OPS
+    _VECTOR_PROJECTIONS = VECTOR_PROJECTIONS
+    _vector_projection = _s["vector_projection"]
+    _los_camera_fwd = _s["los_camera_fwd"]
+    _composite = _s["composite"]
+    _slot = _s["slot"]
 
     # Stars
     if data.n_stars > 0:
@@ -215,6 +204,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         s["max"] = hi
         print(f"Auto-range {label}: {lo:.3g} .. {hi:.3g}")
 
+    def _adjust_range(rend, factor):
+        mid = (rend.qty_min + rend.qty_max) / 2
+        half = (rend.qty_max - rend.qty_min) / 2 * factor
+        rend.qty_min = mid - half
+        rend.qty_max = mid + half
+
     def key_callback(win, key, scancode, action, mods):
         nonlocal user_lod, user_budget, _cmap_idx, needs_auto_range, ui_hidden
         if user_menu.on_key(key, action):
@@ -255,15 +250,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 user_budget = renderer.max_render_particles
                 print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
             elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
-                mid = (renderer.qty_min + renderer.qty_max) / 2
-                half = (renderer.qty_max - renderer.qty_min) / 2 * 0.8
-                renderer.qty_min = mid - half
-                renderer.qty_max = mid + half
+                _adjust_range(renderer, 0.8)
             elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
-                mid = (renderer.qty_min + renderer.qty_max) / 2
-                half = (renderer.qty_max - renderer.qty_min) / 2 * 1.25
-                renderer.qty_min = mid - half
-                renderer.qty_max = mid + half
+                _adjust_range(renderer, 1.25)
             elif key == glfw.KEY_C:
                 nonlocal _cmap_idx
                 _cmap_idx = (_cmap_idx + 1) % len(AVAILABLE_COLORMAPS)
@@ -419,8 +408,6 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
     needs_auto_range = True
     ui_hidden = False
-    _gpu_upload_iter = None  # chunked upload iterator
-
     # Main loop state
     last_time = time.perf_counter()
     frame_count = 0
@@ -637,26 +624,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 _state["_los_camera_fwd"] = camera.forward.copy()
         elif not moved:
             # CPU fallback for non-GPU LOS (when gpu_compute not ready)
-            def _is_los_stale():
-                # Check if any active field is a vector with LOS projection
-                uses_vector = False
-                if _state["_render_mode_name"] in ("WeightedAverage", "WeightedVariance"):
-                    if _state["_wa_data_field"] in _vector_fields:
-                        uses_vector = True
-                if _state["_sd_field"] in _vector_fields:
-                    uses_vector = True
-                sd_f2 = _state.get("_sd_field2", "None")
-                if sd_f2 != "None" and sd_f2 in _vector_fields:
-                    uses_vector = True
-                if not uses_vector:
-                    return False
-                if _state["_vector_projection"] != "LOS":
-                    return False
-                if _state["_los_camera_fwd"] is None:
-                    return True
-                dot = float(np.dot(_state["_los_camera_fwd"], camera.forward))
-                return dot < 0.9998
-            if _is_los_stale():
+            if is_los_stale(_state["_render_mode_name"], _state["_wa_data_field"],
+                            _state["_sd_field"], _state.get("_sd_field2", "None"),
+                            _vector_fields, _state["_vector_projection"],
+                            _state.get("_los_camera_fwd"), camera.forward):
                 app_proxy._apply_render_mode(auto_range=True)
 
         # --- Cull / progressive refinement / auto-LOD ---
@@ -938,55 +909,9 @@ def _run_wgpu_benchmark(n_frames, window, canvas_context, device, renderer, came
     up0 = camera.up.copy()
     right0 = camera.right.copy()
 
-    def rodrigues(v, axis, angle):
-        c, s = np.cos(angle), np.sin(angle)
-        return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
+    from .benchmark import build_benchmark_keyframes, slerp_vec, print_benchmark_results
 
-    def slerp_vec(a, b, t):
-        blend = a * (1 - t) + b * t
-        n = np.linalg.norm(blend)
-        return blend / n if n > 1e-8 else a
-
-    # Build keyframes (same as moderngl benchmark)
-    keyframes = []
-    def kf(pos, fwd, up, label):
-        keyframes.append((pos.astype(np.float32), fwd.astype(np.float32),
-                          up.astype(np.float32), label))
-
-    kf(start_pos, fwd0, up0, "start")
-    kf(start_pos, rodrigues(fwd0, right0, np.radians(30)), up0, "look up")
-    kf(start_pos, rodrigues(fwd0, right0, np.radians(-30)), up0, "look down")
-    kf(start_pos, rodrigues(fwd0, up0, np.radians(45)), up0, "look left")
-    kf(start_pos, rodrigues(fwd0, up0, np.radians(-45)), up0, "look right")
-    kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(30)), "roll left")
-    kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(-30)), "roll right")
-    kf(start_pos, fwd0, up0, "reset")
-
-    far_pos = start_pos + fwd0 * extent * 1.5
-    n_fly = max(n_frames // 4, 10)
-    for i in range(n_fly):
-        t = (i + 1) / n_fly
-        kf(start_pos * (1 - t) + far_pos * t, fwd0, up0, f"fly out {int(t*100)}%")
-
-    fwd_back = -fwd0
-    kf(far_pos, fwd_back, up0, "turn around")
-
-    for i in range(n_fly):
-        t = (i + 1) / n_fly
-        kf(far_pos * (1 - t) + start_pos * t, fwd_back, up0, f"fly back {int(t*100)}%")
-
-    n_orbit = max(n_frames - len(keyframes), 0)
-    if n_orbit > 0:
-        radius = extent * 0.6
-        angles = np.linspace(0, 2 * np.pi, n_orbit, endpoint=False)
-        for theta in angles:
-            pos = np.array([center[0] + radius * np.sin(theta), center[1],
-                            center[2] + radius * np.cos(theta)], dtype=np.float32)
-            fwd = (center - pos).astype(np.float32)
-            fwd = fwd / np.linalg.norm(fwd)
-            kf(pos, fwd, up0, "orbit")
-
-    keyframes = keyframes[:n_frames]
+    keyframes = build_benchmark_keyframes(camera, center, extent, n_frames)
 
     # Progressive refinement to full detail
     budget = max(4_000_000, renderer.max_render_particles)
@@ -1154,23 +1079,9 @@ def _run_wgpu_benchmark(n_frames, window, canvas_context, device, renderer, came
     # Print results
     frame_times = np.array(frame_times)
     cull_times = np.array(cull_times)
-    phases = np.array(phase_list)
 
-    print(f"\n--- wgpu Benchmark Results ({len(frame_times)} frames) ---")
-    for phase_name in ("transition", "hold"):
-        mask = phases == phase_name
-        if not mask.any():
-            continue
-        ft = frame_times[mask]
-        ct = cull_times[mask]
-        fps = 1000.0 / ft
-        print(f"  {phase_name.capitalize()} ({mask.sum()} frames):")
-        print(f"    Frame time:  median={np.median(ft):.1f}ms  "
-              f"p5={np.percentile(ft, 5):.1f}ms  p95={np.percentile(ft, 95):.1f}ms")
-        print(f"    FPS:         median={np.median(fps):.0f}  "
-              f"p5={np.percentile(fps, 5):.0f}  p95={np.percentile(fps, 95):.0f}")
-        print(f"    Cull time:   median={np.median(ct):.1f}ms  p95={np.percentile(ct, 95):.1f}ms")
-    print(f"  Particles:   {renderer.n_total:,} total")
+    print_benchmark_results(frame_times, cull_times, phase_list,
+                            renderer.n_total, backend="wgpu")
 
     outfile = f"benchmark_wgpu_{int(time.time())}.npz"
     kf_labels = [kf[3] for kf in keyframes]

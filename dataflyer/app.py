@@ -10,7 +10,9 @@ from .data_manager import SnapshotData, find_snapshots
 from .renderer import SplatRenderer, RenderMode
 from .colormaps import create_colormap_texture_safe, AVAILABLE_COLORMAPS
 from .overlay import DevOverlay, UserMenu
-from .field_ops import resolve_field, compute_weights, compute_slot_fields
+from .field_ops import (resolve_field, compute_weights, compute_slot_fields,
+                        make_default_app_state, is_los_stale, uses_vector_field,
+                        SD_OPS, RENDER_MODES, VECTOR_PROJECTIONS)
 
 
 class DataFlyerApp:
@@ -75,41 +77,22 @@ class DataFlyerApp:
         self._set_colormap(AVAILABLE_COLORMAPS[0])
 
         # Weight fields and render mode
-        self._sd_fields = self.data.available_fields()
-        self._vector_fields = self.data.available_vector_fields()
-        self._sd_field = "Masses"
-        self._sd_field2 = "None"  # optional second field
-        self._sd_op = "*"  # operation between field1 and field2
-        self._SD_OPS = ["*", "+", "-", "/", "min", "max"]
-        self._RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance", "Composite"]
-        self._render_mode_name = "SurfaceDensity"
-        self._wa_data_field = "Masses"  # data field for WeightedAverage
-        self._VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
-        self._vector_projection = "LOS"  # active projection for vector data fields
-        self._los_camera_fwd = None  # camera forward at last LOS recompute
+        _s = make_default_app_state(self.data)
+        self._sd_fields = _s["sd_fields"]
+        self._vector_fields = _s["vector_fields"]
+        self._sd_field = _s["sd_field"]
+        self._sd_field2 = _s["sd_field2"]
+        self._sd_op = _s["sd_op"]
+        self._SD_OPS = SD_OPS
+        self._RENDER_MODES = RENDER_MODES
+        self._render_mode_name = _s["render_mode_name"]
+        self._wa_data_field = _s["wa_data_field"]
+        self._VECTOR_PROJECTIONS = VECTOR_PROJECTIONS
+        self._vector_projection = _s["vector_projection"]
+        self._los_camera_fwd = _s["los_camera_fwd"]
         self._render_mode = RenderMode.surface_density("Masses")
-
-        # Composite mode: slot 0 = lightness, slot 1 = color
-        # Defaults match CrunchSnaps CoolMap: lightness=SurfaceDensity(Masses),
-        # color=WeightedVariance(Velocities LOS) i.e. 1D velocity dispersion
-        self._composite = False
-        _has_vel = "Velocities" in self._vector_fields
-        self._slot = [
-            {  # slot 0: lightness — surface density of Masses (log)
-                "mode": "SurfaceDensity", "weight": "Masses", "data": "Masses",
-                "weight2": "None", "op": "*", "proj": "LOS",
-                "min": -1.0, "max": 3.0, "log": 1, "resolve": 0,
-            },
-            {  # slot 1: color — 1D velocity dispersion (log)
-                "mode": "WeightedVariance" if _has_vel else "SurfaceDensity",
-                "weight": "Masses",
-                "data": "Velocities" if _has_vel else "Masses",
-                "weight2": "None", "op": "*",
-                "proj": "LOS",
-                "min": -1.0, "max": 3.0, "log": 1,
-                "resolve": 2 if _has_vel else 0,
-            },
-        ]
+        self._composite = _s["composite"]
+        self._slot = _s["slot"]
 
         # Store particles and upload (with culling for large datasets)
         weights = self._compute_weights()
@@ -222,28 +205,14 @@ class DataFlyerApp:
                                self._vector_projection, self.camera.forward)
 
     def _uses_vector_field(self):
-        """Check if any active field is a vector field."""
-        if self._render_mode_name in ("WeightedAverage", "WeightedVariance"):
-            if self._wa_data_field in self._vector_fields:
-                return True
-        if self._sd_field in self._vector_fields:
-            return True
-        if self._sd_field2 != "None" and self._sd_field2 in self._vector_fields:
-            return True
-        return False
+        return uses_vector_field(self._render_mode_name, self._wa_data_field,
+                                 self._sd_field, self._sd_field2, self._vector_fields)
 
     def _is_los_stale(self):
-        """Check if the LOS projection needs recomputing due to camera rotation."""
-        if not self._uses_vector_field():
-            return False
-        if self._vector_projection != "LOS":
-            return False
-        if self._los_camera_fwd is None:
-            return True
-        import numpy as np
-        # Recompute if camera direction changed by more than ~1 degree
-        dot = float(np.dot(self._los_camera_fwd, self.camera.forward))
-        return dot < 0.9998  # cos(1 degree) ~ 0.99985
+        return is_los_stale(self._render_mode_name, self._wa_data_field,
+                            self._sd_field, self._sd_field2, self._vector_fields,
+                            self._vector_projection, self._los_camera_fwd,
+                            self.camera.forward)
 
     def _apply_render_mode(self, auto_range=True):
         """Rebuild render mode from current settings and re-weight the grid."""
@@ -337,16 +306,9 @@ class DataFlyerApp:
         self._msg(f"Colormap: {name}")
         self._set_colormap(name)
 
-    def _contract_range(self):
+    def _adjust_range(self, factor):
         mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
-        half = (self.renderer.qty_max - self.renderer.qty_min) / 2 * 0.8
-        self.renderer.qty_min = mid - half
-        self.renderer.qty_max = mid + half
-        self._msg(f"Range: {self._range_str()}")
-
-    def _expand_range(self):
-        mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
-        half = (self.renderer.qty_max - self.renderer.qty_min) / 2 * 1.25
+        half = (self.renderer.qty_max - self.renderer.qty_min) / 2 * factor
         self.renderer.qty_min = mid - half
         self.renderer.qty_max = mid + half
         self._msg(f"Range: {self._range_str()}")
@@ -355,14 +317,12 @@ class DataFlyerApp:
         self.renderer.lod_pixels = max(1, self.renderer.lod_pixels // 2)
         self._user_lod = self.renderer.lod_pixels
         self._msg(f"LOD: {self.renderer.lod_pixels}px (more detail)")
-        self._refinement_level = 0
         self.renderer.update_visible(self.camera)
 
     def _decrease_lod(self):
         self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
         self._user_lod = self.renderer.lod_pixels
         self._msg(f"LOD: {self.renderer.lod_pixels}px (faster)")
-        self._refinement_level = 0
         self.renderer.update_visible(self.camera)
 
     def _increase_budget(self):
@@ -370,7 +330,6 @@ class DataFlyerApp:
             self.renderer.n_total, int(self.renderer.max_render_particles * 2))
         self._user_budget = self.renderer.max_render_particles
         self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
-        self._refinement_level = 0
         self.renderer.update_visible(self.camera)
 
     def _decrease_budget(self):
@@ -378,7 +337,6 @@ class DataFlyerApp:
             1_000, self.renderer.max_render_particles // 2)
         self._user_budget = self.renderer.max_render_particles
         self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
-        self._refinement_level = 0
         self.renderer.update_visible(self.camera)
 
     def _toggle_log_scale(self):
@@ -431,10 +389,10 @@ class DataFlyerApp:
             glfw.KEY_RIGHT:         (self._next_snapshot,           "Next snapshot"),
             glfw.KEY_LEFT:          (self._prev_snapshot,           "Previous snapshot"),
             glfw.KEY_R:             (self._auto_range_from_framebuffer, "Auto-range"),
-            glfw.KEY_EQUAL:         (self._contract_range,          "Contract range"),
-            glfw.KEY_KP_ADD:        (self._contract_range,          None),
-            glfw.KEY_MINUS:         (self._expand_range,            "Expand range"),
-            glfw.KEY_KP_SUBTRACT:   (self._expand_range,            None),
+            glfw.KEY_EQUAL:         (lambda: self._adjust_range(0.8), "Contract range"),
+            glfw.KEY_KP_ADD:        (lambda: self._adjust_range(0.8), None),
+            glfw.KEY_MINUS:         (lambda: self._adjust_range(1.25), "Expand range"),
+            glfw.KEY_KP_SUBTRACT:   (lambda: self._adjust_range(1.25), None),
             glfw.KEY_RIGHT_BRACKET: (self._increase_lod,            "More LOD detail"),
             glfw.KEY_LEFT_BRACKET:  (self._decrease_lod,            "Less LOD detail"),
             glfw.KEY_PERIOD:        (self._increase_budget,         "More particles"),
@@ -803,63 +761,9 @@ class DataFlyerApp:
                           self.data.positions.max(axis=0)], axis=0)
         start_pos = self.camera.position.copy()
 
-        def rodrigues(v, axis, angle):
-            c, s = np.cos(angle), np.sin(angle)
-            return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
+        from .benchmark import build_benchmark_keyframes, slerp_vec, print_benchmark_results
 
-        # Build waypoints: look around, fly across, turn, fly back
-        fwd0 = self.camera.forward.copy()
-        up0 = self.camera.up.copy()
-        right0 = self.camera.right.copy()
-
-        keyframes = []  # (position, forward, up, label)
-        def kf(pos, fwd, up, label):
-            keyframes.append((pos.astype(np.float32), fwd.astype(np.float32),
-                              up.astype(np.float32), label))
-
-        kf(start_pos, fwd0, up0, "start")
-        kf(start_pos, rodrigues(fwd0, right0, np.radians(30)), up0, "look up")
-        kf(start_pos, rodrigues(fwd0, right0, np.radians(-30)), up0, "look down")
-        kf(start_pos, rodrigues(fwd0, up0, np.radians(45)), up0, "look left")
-        kf(start_pos, rodrigues(fwd0, up0, np.radians(-45)), up0, "look right")
-        kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(30)), "roll left")
-        kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(-30)), "roll right")
-        kf(start_pos, fwd0, up0, "reset")
-
-        # Fly to opposite side
-        far_pos = start_pos + fwd0 * extent * 1.5
-        n_fly = max(n_frames // 4, 10)
-        for i in range(n_fly):
-            t = (i + 1) / n_fly
-            pos = start_pos * (1 - t) + far_pos * t
-            kf(pos, fwd0, up0, f"fly out {int(t*100)}%")
-
-        # Turn around
-        fwd_back = -fwd0
-        kf(far_pos, fwd_back, up0, "turn around")
-
-        # Fly back
-        for i in range(n_fly):
-            t = (i + 1) / n_fly
-            pos = far_pos * (1 - t) + start_pos * t
-            kf(pos, fwd_back, up0, f"fly back {int(t*100)}%")
-
-        # Orbit around the data center for remaining frames
-        n_orbit = max(n_frames - len(keyframes), 0)
-        if n_orbit > 0:
-            radius = extent * 0.6
-            angles = np.linspace(0, 2 * np.pi, n_orbit, endpoint=False)
-            for theta in angles:
-                pos = np.array([
-                    center[0] + radius * np.sin(theta),
-                    center[1],
-                    center[2] + radius * np.cos(theta),
-                ], dtype=np.float32)
-                fwd = (center - pos)
-                fwd = fwd / np.linalg.norm(fwd)
-                kf(pos, fwd, up0, "orbit")
-
-        keyframes = keyframes[:n_frames]
+        keyframes = build_benchmark_keyframes(self.camera, center, extent, n_frames)
 
         # Progressive refinement to full detail before starting benchmark
         fb_width, fb_height = glfw.get_framebuffer_size(self.window)
@@ -915,12 +819,6 @@ class DataFlyerApp:
         cam_fwd_list = []
         phase_list = []
         kf_idx_list = []
-
-        def slerp_vec(a, b, t):
-            """Interpolate unit vectors via slerp-like blend."""
-            blend = a * (1 - t) + b * t
-            n = np.linalg.norm(blend)
-            return blend / n if n > 1e-8 else a
 
         def render_frame():
             fb_w, fb_h = glfw.get_framebuffer_size(self.window)
@@ -1015,26 +913,9 @@ class DataFlyerApp:
 
         frame_times = np.array(frame_times)
         cull_times = np.array(cull_times)
-        phases = np.array(phase_list)
 
-        print(f"\n--- Benchmark Results ({len(frame_times)} frames) ---")
-        for phase_name in ("transition", "hold"):
-            mask = phases == phase_name
-            if not mask.any():
-                continue
-            ft = frame_times[mask]
-            ct = cull_times[mask]
-            fps = 1000.0 / ft
-            print(f"  {phase_name.capitalize()} ({mask.sum()} frames):")
-            print(f"    Frame time:  median={np.median(ft):.1f}ms  "
-                  f"p5={np.percentile(ft, 5):.1f}ms  "
-                  f"p95={np.percentile(ft, 95):.1f}ms")
-            print(f"    FPS:         median={np.median(fps):.0f}  "
-                  f"p5={np.percentile(fps, 5):.0f}  "
-                  f"p95={np.percentile(fps, 95):.0f}")
-            print(f"    Cull time:   median={np.median(ct):.1f}ms  "
-                  f"p95={np.percentile(ct, 95):.1f}ms")
-        print(f"  Particles:   {self.renderer.n_total:,} total")
+        print_benchmark_results(frame_times, cull_times, phase_list,
+                                self.renderer.n_total)
 
         # Save detailed per-frame data
         outfile = f"benchmark_{int(time.time())}.npz"

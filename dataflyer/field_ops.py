@@ -1,6 +1,74 @@
-"""Shared helpers for vector field projection and field combination."""
+"""Shared helpers for vector field projection, field combination, and app state."""
 
 import numpy as np
+
+# Constants shared between both app backends
+SD_OPS = ["*", "+", "-", "/", "min", "max"]
+RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance", "Composite"]
+VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
+
+
+def make_default_app_state(data):
+    """Create the default shared state dict for both app backends.
+
+    Args:
+        data: SnapshotData instance.
+
+    Returns:
+        dict with all field/mode/slot defaults.
+    """
+    sd_fields = data.available_fields()
+    vector_fields = data.available_vector_fields()
+    has_vel = "Velocities" in vector_fields
+    return {
+        "sd_fields": sd_fields,
+        "vector_fields": vector_fields,
+        "sd_field": "Masses",
+        "sd_field2": "None",
+        "sd_op": "*",
+        "render_mode_name": "SurfaceDensity",
+        "wa_data_field": "Masses",
+        "vector_projection": "LOS",
+        "los_camera_fwd": None,
+        "composite": False,
+        "slot": [
+            {"mode": "SurfaceDensity", "weight": "Masses", "data": "Masses",
+             "weight2": "None", "op": "*", "proj": "LOS",
+             "min": -1.0, "max": 3.0, "log": 1, "resolve": 0},
+            {"mode": "WeightedVariance" if has_vel else "SurfaceDensity",
+             "weight": "Masses",
+             "data": "Velocities" if has_vel else "Masses",
+             "weight2": "None", "op": "*", "proj": "LOS",
+             "min": -1.0, "max": 3.0, "log": 1,
+             "resolve": 2 if has_vel else 0},
+        ],
+    }
+
+
+def uses_vector_field(render_mode_name, wa_data_field, sd_field, sd_field2, vector_fields):
+    """Check if any active field is a vector field."""
+    if render_mode_name in ("WeightedAverage", "WeightedVariance"):
+        if wa_data_field in vector_fields:
+            return True
+    if sd_field in vector_fields:
+        return True
+    if sd_field2 != "None" and sd_field2 in vector_fields:
+        return True
+    return False
+
+
+def is_los_stale(render_mode_name, wa_data_field, sd_field, sd_field2,
+                 vector_fields, vector_projection, los_camera_fwd, camera_forward):
+    """Check if the LOS projection needs recomputing due to camera rotation."""
+    if not uses_vector_field(render_mode_name, wa_data_field, sd_field, sd_field2,
+                             vector_fields):
+        return False
+    if vector_projection != "LOS":
+        return False
+    if los_camera_fwd is None:
+        return True
+    dot = float(np.dot(los_camera_fwd, camera_forward))
+    return dot < 0.9998
 
 
 def project_vector(vec, projection, camera_forward):
