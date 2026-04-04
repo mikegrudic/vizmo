@@ -78,7 +78,7 @@ def _load_shader(name):
     return (SHADER_DIR / name).read_text()
 
 
-from .spatial_grid import SpatialGrid  # noqa: E402
+from .adaptive_octree import AdaptiveOctree  # noqa: E402
 
 
 class ParticleLayer:
@@ -296,7 +296,8 @@ class SplatRenderer:
         self.max_render_particles = MAX_RENDER_PARTICLES
         self.use_tree = True
         self.tree_min_particles = 0  # only build tree if N > this threshold
-        self.tree_n_cells = 64  # grid cells per side (must be power of 2)
+        self.tree_n_cells = 64  # grid cells per side (legacy, unused with adaptive octree)
+        self.tree_leaf_size = 32  # max particles per leaf cell
         self.use_importance_sampling = False
         self.KERNELS = ["cubic_spline", "wendland_c2", "gaussian", "quartic", "sphere"]
         self.kernel = "cubic_spline"
@@ -334,8 +335,8 @@ class SplatRenderer:
             import time
 
             t0 = time.perf_counter()
-            self._grid = SpatialGrid(
-                self._all_pos, self._all_mass, self._all_hsml, self._all_qty, n_cells=self.tree_n_cells
+            self._grid = AdaptiveOctree(
+                self._all_pos, self._all_mass, self._all_hsml, self._all_qty, leaf_size=self.tree_leaf_size
             )
             print(f"  Spatial grid built in {time.perf_counter()-t0:.1f}s")
         else:
@@ -382,8 +383,8 @@ class SplatRenderer:
                 import time
 
                 t0 = time.perf_counter()
-                self._grid = SpatialGrid(
-                    self._all_pos, self._all_mass, self._all_hsml, self._all_qty, n_cells=self.tree_n_cells
+                self._grid = AdaptiveOctree(
+                    self._all_pos, self._all_mass, self._all_hsml, self._all_qty, leaf_size=self.tree_leaf_size
                 )
                 print(f"  Spatial grid rebuilt in {time.perf_counter()-t0:.1f}s")
             else:

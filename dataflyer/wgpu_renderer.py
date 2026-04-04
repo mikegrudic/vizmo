@@ -102,7 +102,8 @@ class WGPURenderer:
         self.max_render_particles = 4_000_000
         self.use_tree = True
         self.tree_min_particles = 0
-        self.tree_n_cells = 64
+        self.tree_n_cells = 64  # legacy, unused with adaptive octree
+        self.tree_leaf_size = 32
         self.use_importance_sampling = False
         self.kernel = "cubic_spline"
         self.use_hybrid_rendering = True
@@ -368,7 +369,7 @@ class WGPURenderer:
 
     def set_particles(self, positions, hsml, masses, quantity=None):
         """Store particle data on CPU. Call update_visible() to upload a subset."""
-        from .spatial_grid import SpatialGrid
+        from .adaptive_octree import AdaptiveOctree
 
         self._all_pos = positions.astype(np.float32)
         self._all_hsml = hsml.astype(np.float32)
@@ -383,8 +384,8 @@ class WGPURenderer:
 
         if self.use_tree and self.n_total > self.tree_min_particles:
             t0 = time.perf_counter()
-            self._grid = SpatialGrid(
-                self._all_pos, self._all_mass, self._all_hsml, self._all_qty, n_cells=self.tree_n_cells
+            self._grid = AdaptiveOctree(
+                self._all_pos, self._all_mass, self._all_hsml, self._all_qty, leaf_size=self.tree_leaf_size
             )
             print(f"  Spatial grid built in {time.perf_counter()-t0:.1f}s")
         else:
@@ -418,12 +419,12 @@ class WGPURenderer:
 
         if self._needs_grid_rebuild:
             self._needs_grid_rebuild = False
-            from .spatial_grid import SpatialGrid
+            from .adaptive_octree import AdaptiveOctree
 
             if self.use_tree and self.n_total > self.tree_min_particles:
                 t0 = time.perf_counter()
-                self._grid = SpatialGrid(
-                    self._all_pos, self._all_mass, self._all_hsml, self._all_qty, n_cells=self.tree_n_cells
+                self._grid = AdaptiveOctree(
+                    self._all_pos, self._all_mass, self._all_hsml, self._all_qty, leaf_size=self.tree_leaf_size
                 )
                 print(f"  Spatial grid rebuilt in {time.perf_counter()-t0:.1f}s")
             else:
