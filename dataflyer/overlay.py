@@ -417,6 +417,7 @@ class DevOverlay(Panel):
 
         items.append(("toggle", "Invert Mouse", camera.invert_mouse, "cam:invert_mouse"))
         items.append(("toggle", "Tree", renderer.use_tree, "use_tree"))
+        items.append(("toggle", "Adaptive Tree", renderer.use_adaptive_tree, "use_adaptive_tree"))
         items.append(("toggle", "Importance Sampling", renderer.use_importance_sampling, "use_importance_sampling"))
         items.append(("toggle", "Hybrid Rendering", renderer.use_hybrid_rendering, "use_hybrid_rendering"))
         items.append(("toggle", "Quad Rendering", renderer.use_quad_rendering, "use_quad_rendering"))
@@ -494,11 +495,12 @@ class DevOverlay(Panel):
         if wtype == "toggle":
             key = widget[3]
             if key.startswith("cam:"):
-                # Camera attribute — stored on self._camera (set during update)
                 attr = key[4:]
                 setattr(self._camera, attr, not getattr(self._camera, attr))
             else:
                 setattr(renderer, key, not getattr(renderer, key))
+            if key == "use_adaptive_tree":
+                renderer._needs_grid_rebuild = True
             return True
 
         if wtype == "dropdown_item":

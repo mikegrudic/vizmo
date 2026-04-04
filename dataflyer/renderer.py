@@ -295,6 +295,7 @@ class SplatRenderer:
         self.log_scale = 1  # 1: log10, 0: linear
         self.max_render_particles = MAX_RENDER_PARTICLES
         self.use_tree = True
+        self.use_adaptive_tree = True
         self.tree_min_particles = 0  # only build tree if N > this threshold
         self.tree_n_cells = 64  # grid cells per side (legacy, unused with adaptive octree)
         self.tree_leaf_size = 1024  # max particles per leaf cell
@@ -332,15 +333,27 @@ class SplatRenderer:
 
         # Build spatial grid for frustum culling and LOD
         if self.use_tree and self.n_total > self.tree_min_particles:
-            import time
-
-            t0 = time.perf_counter()
-            self._grid = AdaptiveOctree(
-                self._all_pos, self._all_mass, self._all_hsml, self._all_qty, leaf_size=self.tree_leaf_size
-            )
-            print(f"  Spatial grid built in {time.perf_counter()-t0:.1f}s")
+            self._grid = self._build_grid()
         else:
             self._grid = None
+
+    def _build_grid(self):
+        """Build spatial tree for frustum culling. Respects use_adaptive_tree flag."""
+        import time
+        t0 = time.perf_counter()
+        if self.use_adaptive_tree:
+            grid = AdaptiveOctree(
+                self._all_pos, self._all_mass, self._all_hsml, self._all_qty,
+                leaf_size=self.tree_leaf_size)
+            label = "Adaptive octree"
+        else:
+            from .spatial_grid import SpatialGrid
+            grid = SpatialGrid(
+                self._all_pos, self._all_mass, self._all_hsml, self._all_qty,
+                n_cells=self.tree_n_cells)
+            label = "Uniform grid"
+        print(f"  {label} built in {time.perf_counter()-t0:.1f}s")
+        return grid
 
     def update_weights(self, masses, quantity=None):
         """Update weight/quantity arrays without rebuilding grid structure.
@@ -380,13 +393,7 @@ class SplatRenderer:
         if self._needs_grid_rebuild:
             self._needs_grid_rebuild = False
             if self.use_tree and self.n_total > self.tree_min_particles:
-                import time
-
-                t0 = time.perf_counter()
-                self._grid = AdaptiveOctree(
-                    self._all_pos, self._all_mass, self._all_hsml, self._all_qty, leaf_size=self.tree_leaf_size
-                )
-                print(f"  Spatial grid rebuilt in {time.perf_counter()-t0:.1f}s")
+                self._grid = self._build_grid()
             else:
                 self._grid = None
 
