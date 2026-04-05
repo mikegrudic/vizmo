@@ -8,11 +8,11 @@ RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance", "Compos
 VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
 
 
-def max_entropy_limits(vals, weights, n_bins=256, n_search=30):
+def max_entropy_limits(vals, weights, n_bins=64, n_search=20):
     """Find (lo, hi) that maximize mass-weighted Shannon entropy of the color histogram.
 
-    Searches over candidate clipping fractions of the mass-weighted CDF and
-    returns the value limits whose uniform-bin histogram has highest entropy.
+    Fully vectorized search over candidate clipping fractions of the
+    mass-weighted CDF.
     """
     # Subsample to cap sort cost
     if len(vals) > 100_000:
@@ -29,36 +29,37 @@ def max_entropy_limits(vals, weights, n_bins=256, n_search=30):
         return float(sv[0]), float(sv[-1])
     cw /= total
 
-    # Candidate lo/hi as mass-weighted CDF fractions
+    # Candidate lo/hi values from mass-weighted CDF fractions
     lo_fracs = np.linspace(0.0, 0.25, n_search)
     hi_fracs = np.linspace(0.75, 1.0, n_search)
+    lo_vals = np.interp(lo_fracs, cw, sv)
+    hi_vals = np.interp(hi_fracs, cw, sv)
 
-    best_H = -np.inf
-    best_lo = float(sv[0])
-    best_hi = float(sv[-1])
+    # Bin-edge fractions [0, 1/n_bins, ..., 1]
+    t = np.arange(n_bins + 1, dtype=np.float64) / n_bins
 
-    for a in lo_fracs:
-        lo_val = float(np.interp(a, cw, sv))
-        for b in hi_fracs:
-            hi_val = float(np.interp(b, cw, sv))
-            if hi_val <= lo_val:
-                continue
-            # CDF at uniform bin edges
-            edges = np.linspace(lo_val, hi_val, n_bins + 1)
-            cdf_edges = np.interp(edges, sv, cw)
-            p = np.diff(cdf_edges)
-            # Clipped mass folds into edge bins
-            p[0] += cdf_edges[0]
-            p[-1] += 1.0 - cdf_edges[-1]
-            # Shannon entropy
-            pos = p > 0
-            H = -np.dot(p[pos], np.log2(p[pos]))
-            if H > best_H:
-                best_H = H
-                best_lo = lo_val
-                best_hi = hi_val
+    # All edge positions: shape (n_search, n_search, n_bins+1)
+    span = hi_vals[None, :, None] - lo_vals[:, None, None]
+    edges = lo_vals[:, None, None] + t * span
 
-    return best_lo, best_hi
+    # Single vectorized CDF lookup
+    cdf_at_edges = np.interp(edges.ravel(), sv, cw).reshape(edges.shape)
+
+    # Bin probabilities
+    p = np.diff(cdf_at_edges, axis=2)
+    p[:, :, 0] += cdf_at_edges[:, :, 0]
+    p[:, :, -1] += 1.0 - cdf_at_edges[:, :, -1]
+
+    # Shannon entropy
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_p = np.where(p > 0, np.log2(p), 0.0)
+    H = -np.sum(p * log_p, axis=2)
+
+    # Mask invalid pairs
+    H[hi_vals[None, :] <= lo_vals[:, None]] = -np.inf
+
+    i, j = np.unravel_index(H.argmax(), H.shape)
+    return float(lo_vals[i]), float(hi_vals[j])
 
 
 def make_default_app_state(data):
