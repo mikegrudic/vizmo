@@ -111,7 +111,6 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
     # Build grid in background thread so the window stays responsive
     from .gpu_compute import GPUCompute
-    from .adaptive_octree import AdaptiveOctree
     import threading
 
     gpu_compute = None
@@ -119,8 +118,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
     def _build_grid_bg():
         try:
-            _bg["grid"] = AdaptiveOctree(data.positions, weights, data.hsml, weights)
-            print("  Spatial grid built (background)")
+            # Use renderer's _build_grid to respect use_adaptive_tree flag
+            renderer._all_pos = data.positions.astype(np.float32)
+            renderer._all_mass = weights.astype(np.float32)
+            renderer._all_hsml = data.hsml.astype(np.float32)
+            renderer._all_qty = weights.astype(np.float32)
+            _bg["grid"] = renderer._build_grid()
         except Exception as e:
             print(f"  Grid build failed: {e}")
         _bg["done"] = True
