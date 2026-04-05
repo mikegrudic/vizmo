@@ -116,7 +116,7 @@ class WGPURenderer:
         self.bypass_cull = False
         self.auto_lod = True
         self.target_fps = 15.0
-        self.auto_lod_smooth = 1.0
+        self.auto_lod_smooth = 0.05
         self.pid_Kp = 0.5
         self.pid_Kd = 0.0
         self.pid_Ki = 0.0
@@ -868,14 +868,18 @@ class WGPURenderer:
                 mean = np.where(mask, num / den, 0)
                 mean_sq = np.where(mask, sq / den, 0)
             vals = np.sqrt(np.maximum(mean_sq - mean * mean, 0))[mask]
+            mass = den[mask]
         elif self.resolve_mode == 1:
             num = self._read_accum_texture_r(self._accum_textures["textures"][0])
             mask = den > 1e-30
             with np.errstate(invalid="ignore"):
                 vals = np.where(mask, num / den, 0)
             vals = vals[mask]
+            mass = den[mask]
         else:
-            vals = den[den > 1e-30]
+            mask = den > 1e-30
+            vals = den[mask]
+            mass = vals
 
         if len(vals) == 0:
             return self.qty_min, self.qty_max
@@ -890,15 +894,8 @@ class WGPURenderer:
             lim_lo = float(partitioned[k_lo])
             lim_hi = float(partitioned[k_hi])
         else:
-            if len(vals) > 100_000:
-                step = len(vals) // 100_000
-                sub = vals[::step]
-            else:
-                sub = vals
-            sorted_vals = np.sort(sub)
-            cdf = sorted_vals.cumsum() / sorted_vals.sum()
-            lim_lo = float(np.interp(0.01, cdf, sorted_vals))
-            lim_hi = float(np.interp(0.99, cdf, sorted_vals))
+            from dataflyer.field_ops import max_entropy_limits
+            lim_lo, lim_hi = max_entropy_limits(vals, mass)
 
         if self.log_scale and not has_negative:
             if lim_lo <= 0:

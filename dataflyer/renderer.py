@@ -311,7 +311,7 @@ class SplatRenderer:
         self.bypass_cull = False  # render all particles without frustum culling
         self.auto_lod = True  # auto-tune LOD to maintain target FPS while moving
         self.target_fps = 15.0  # target FPS for auto-LOD
-        self.auto_lod_smooth = 1.0  # EMA smoothing timescale in seconds
+        self.auto_lod_smooth = 0.05  # EMA smoothing timescale in seconds
         self.pid_Kp = 0.5  # PID proportional gain (log2-units/sec per unit error)
         self.pid_Kd = 0.0  # PID derivative gain
         self.pid_Ki = 0.0  # PID integral gain
@@ -795,14 +795,18 @@ class SplatRenderer:
                 mean = np.where(mask, num_data / den_data, 0)
                 mean_sq = np.where(mask, sq_data / den_data, 0)
             vals = np.sqrt(np.maximum(mean_sq - mean * mean, 0))[mask]
+            mass = den_data[mask]
         elif self.resolve_mode == 1:
             num_data = np.frombuffer(self._accum_tex_num.read(), dtype=np.float32)
             mask = den_data > 1e-30
             with np.errstate(invalid="ignore"):
                 vals = np.where(mask, num_data / den_data, 0)
             vals = vals[mask]
+            mass = den_data[mask]
         else:
-            vals = den_data[den_data > 1e-30]
+            mask = den_data > 1e-30
+            vals = den_data[mask]
+            mass = vals
 
         if len(vals) == 0:
             return self.qty_min, self.qty_max
@@ -818,17 +822,8 @@ class SplatRenderer:
             lim_lo = float(partitioned[k_lo])
             lim_hi = float(partitioned[k_hi])
         else:
-            # All positive: mass-weighted CDF for signal-aware limits.
-            # Subsample to cap sort cost at ~100k elements.
-            if len(vals) > 100_000:
-                step = len(vals) // 100_000
-                sub = vals[::step]
-            else:
-                sub = vals
-            sorted_vals = np.sort(sub)
-            cdf = sorted_vals.cumsum() / sorted_vals.sum()
-            lim_lo = float(np.interp(0.01, cdf, sorted_vals))
-            lim_hi = float(np.interp(0.99, cdf, sorted_vals))
+            from dataflyer.field_ops import max_entropy_limits
+            lim_lo, lim_hi = max_entropy_limits(vals, mass)
 
         if self.log_scale and not has_negative:
             if lim_lo <= 0:

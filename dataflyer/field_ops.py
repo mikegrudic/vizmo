@@ -8,6 +8,59 @@ RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance", "Compos
 VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
 
 
+def max_entropy_limits(vals, weights, n_bins=256, n_search=30):
+    """Find (lo, hi) that maximize mass-weighted Shannon entropy of the color histogram.
+
+    Searches over candidate clipping fractions of the mass-weighted CDF and
+    returns the value limits whose uniform-bin histogram has highest entropy.
+    """
+    # Subsample to cap sort cost
+    if len(vals) > 100_000:
+        step = len(vals) // 100_000
+        vals = vals[::step]
+        weights = weights[::step]
+
+    order = np.argsort(vals)
+    sv = vals[order]
+    sw = weights[order]
+    cw = np.cumsum(sw)
+    total = cw[-1]
+    if total <= 0:
+        return float(sv[0]), float(sv[-1])
+    cw /= total
+
+    # Candidate lo/hi as mass-weighted CDF fractions
+    lo_fracs = np.linspace(0.0, 0.25, n_search)
+    hi_fracs = np.linspace(0.75, 1.0, n_search)
+
+    best_H = -np.inf
+    best_lo = float(sv[0])
+    best_hi = float(sv[-1])
+
+    for a in lo_fracs:
+        lo_val = float(np.interp(a, cw, sv))
+        for b in hi_fracs:
+            hi_val = float(np.interp(b, cw, sv))
+            if hi_val <= lo_val:
+                continue
+            # CDF at uniform bin edges
+            edges = np.linspace(lo_val, hi_val, n_bins + 1)
+            cdf_edges = np.interp(edges, sv, cw)
+            p = np.diff(cdf_edges)
+            # Clipped mass folds into edge bins
+            p[0] += cdf_edges[0]
+            p[-1] += 1.0 - cdf_edges[-1]
+            # Shannon entropy
+            pos = p > 0
+            H = -np.dot(p[pos], np.log2(p[pos]))
+            if H > best_H:
+                best_H = H
+                best_lo = lo_val
+                best_hi = hi_val
+
+    return best_lo, best_hi
+
+
 def make_default_app_state(data):
     """Create the default shared state dict for both app backends.
 
