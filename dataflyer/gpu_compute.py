@@ -410,8 +410,34 @@ class GPUCompute:
         qty_src = grid.sorted_qty if grid.sorted_qty is not None else grid._raw_qty
         mass_f32 = np.ascontiguousarray(mass_src, dtype=np.float32)
         qty_f32 = np.ascontiguousarray(qty_src, dtype=np.float32)
-        dev.queue.write_buffer(self._particle_bufs["mass"], 0, mass_f32.tobytes())
-        dev.queue.write_buffer(self._particle_bufs["qty"], 0, qty_f32.tobytes())
+
+        # Subsample-only mode splits particles across multiple per-chunk
+        # buffers. Write each chunk's slice into its own buffer; otherwise
+        # we'd overrun the (single-chunk) legacy alias and hang Metal.
+        chunks = getattr(self, "_chunk_bufs", None)
+        if chunks:
+            # In SurfaceDensity mode update_weights sets _raw_qty to the
+            # same array as _raw_mass. The qty buffer is then unused by
+            # the resolve shader, so we can skip uploading it entirely
+            # and halve the staging traffic.
+            qty_is_mass = qty_src is mass_src
+            for cb in chunks:
+                start, cn = cb["start"], cb["n"]
+                dev.queue.write_buffer(
+                    cb["mass"], 0, mass_f32[start:start + cn].tobytes())
+                if not qty_is_mass:
+                    dev.queue.write_buffer(
+                        cb["qty"], 0, qty_f32[start:start + cn].tobytes())
+            # One blocking sync at the end forces all the queued writes to
+            # complete before we return to the render loop. Without this,
+            # the next dispatch_subsample_cull's read_buffer deadlocks
+            # behind ~1 GB of pending uploads. read_buffer here works
+            # because we are still inside the overlay click callback, not
+            # inside the render frame callback.
+            dev.queue.read_buffer(chunks[0]["mass"], size=4)
+        else:
+            dev.queue.write_buffer(self._particle_bufs["mass"], 0, mass_f32.tobytes())
+            dev.queue.write_buffer(self._particle_bufs["qty"], 0, qty_f32.tobytes())
 
         # Subsample-only mode has no level buffers — skip per-level upload.
         if not self._level_bufs:
