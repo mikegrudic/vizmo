@@ -112,7 +112,7 @@ class WGPURenderer:
         self.hsml_scale = 1.0
         self.summary_scale = 1.0
         self.summary_overlap = 0.1
-        self.use_aniso_summaries = True
+        self.use_aniso_summaries = False
         self.bypass_cull = False
         self.auto_lod = True
         self.target_fps = 15.0
@@ -448,6 +448,7 @@ class WGPURenderer:
                 importance_sampling=self.use_importance_sampling,
                 viewport_width=self._viewport_width,
                 summary_overlap=self.summary_overlap,
+                anisotropic=self.use_aniso_summaries,
             )
             self._last_cull_ms = (time.perf_counter() - t0) * 1000
             t0 = time.perf_counter()

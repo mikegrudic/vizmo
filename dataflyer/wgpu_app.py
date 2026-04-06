@@ -605,7 +605,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         # Only use GPU compute for datasets large enough to benefit (>10M particles)
         GPU_COMPUTE_THRESHOLD = 10_000_000
         if (not gpu_ready and gpu_compute is None and renderer._grid is not None
-                and renderer.n_total >= GPU_COMPUTE_THRESHOLD):
+                and renderer.n_total >= GPU_COMPUTE_THRESHOLD
+                and not getattr(renderer._grid, 'is_adaptive', False)):
             try:
                 gpu_compute = GPUCompute(device)
                 gpu_compute.upload_snapshot(renderer._grid)
@@ -756,7 +757,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 refine_saved_lod = renderer.lod_pixels
                 refine_saved_budget = renderer.max_render_particles
 
-            refine_budget = min(refine_budget * 2, renderer.n_total)
+            gpu_ready = getattr(gpu_compute, '_upload_ready', False)
+            max_refine = renderer.n_total if gpu_ready else min(renderer.n_total, 8_000_000)
+            refine_budget = min(refine_budget * 2, max_refine)
             renderer.lod_pixels = 1
             renderer.max_render_particles = refine_budget
 

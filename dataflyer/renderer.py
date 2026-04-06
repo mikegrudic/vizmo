@@ -307,7 +307,7 @@ class SplatRenderer:
         self.hsml_scale = 1.0  # global scaling factor for smoothing lengths
         self.summary_scale = 1.0  # scaling factor applied to summary splats
         self.summary_overlap = 0.1  # cell-size padding to bridge voids at tree boundaries
-        self.use_aniso_summaries = True  # False = isotropic spherical summaries
+        self.use_aniso_summaries = False  # True = anisotropic Gaussian splats
         self.bypass_cull = False  # render all particles without frustum culling
         self.auto_lod = True  # auto-tune LOD to maintain target FPS while moving
         self.target_fps = 15.0  # target FPS for auto-LOD
