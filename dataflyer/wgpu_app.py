@@ -18,8 +18,13 @@ from .field_ops import (resolve_field, compute_weights, compute_slot_fields,
 
 
 def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
-                 fullscreen=False):
-    """Run the DataFlyer application with the wgpu backend."""
+                 fullscreen=False, screenshot=None):
+    """Run the DataFlyer application with the wgpu backend.
+
+    If `screenshot` is set to a path, the canvas loop runs just long
+    enough for GPU init + auto-range to complete, takes a screenshot,
+    and exits without entering the interactive loop.
+    """
     import os
     snapshot_path = os.path.abspath(snapshot_path)
 
@@ -257,6 +262,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 from .colormaps import colormap_to_texture_data
                 renderer.set_colormap(colormap_to_texture_data(AVAILABLE_COLORMAPS[_cmap_idx]))
                 _state["_cmap_idx"] = _cmap_idx
+            elif key == glfw.KEY_P:
+                _take_screenshot()
             elif key == glfw.KEY_F1 or key == glfw.KEY_BACKSLASH:
                 overlay.enabled = not overlay.enabled
             elif key == glfw.KEY_TAB:
@@ -557,7 +564,26 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         renderer._last_cull_ms = 0.0
         renderer._last_upload_ms = 0.0
 
-    print("DataFlyer [wgpu] running. WASD=move, mouse=look, ESC=quit, R=auto-range.")
+    def _take_screenshot(path=None):
+        """Render the current view at full framebuffer resolution into
+        an offscreen texture and save it. Filename defaults to
+        dataflyer_<timestamp>.png in the cwd.
+        """
+        import os
+        if path is None:
+            path = f"dataflyer_{int(time.time())}.png"
+        fb_w_, fb_h_ = glfw.get_framebuffer_size(window)
+        if _state["_composite"]:
+            s0 = _state["_slot"][0]
+            s1 = _state["_slot"][1]
+            comp = (s0["resolve"], s0["min"], s0["max"], s0["log"],
+                    s1["resolve"], s1["min"], s1["max"], s1["log"])
+            renderer.screenshot(path, fb_w_, fb_h_, camera, composite_args=comp)
+        else:
+            renderer.screenshot(path, fb_w_, fb_h_, camera)
+        return os.path.abspath(path)
+
+    print("DataFlyer [wgpu] running. WASD=move, mouse=look, ESC=quit, R=auto-range, P=screenshot.")
 
     while not glfw.window_should_close(window):
         now = time.perf_counter()
@@ -872,6 +898,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             except Exception:
                 pass
             needs_auto_range = False
+            # Headless screenshot mode: take the shot now that init,
+            # auto-range, and one full render have completed, then exit.
+            if screenshot is not None:
+                _take_screenshot(screenshot)
+                glfw.set_window_should_close(window, True)
 
         # Update timing stats
         cull_s = getattr(renderer, '_last_cull_ms', 0) / 1000

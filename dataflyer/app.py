@@ -11,6 +11,9 @@ def main():
     parser.add_argument("--height", type=int, default=1080, help="Window height")
     parser.add_argument("--fov", type=float, default=90.0,
                         help="Field of view in degrees")
+    parser.add_argument("--screenshot", type=str, default=None, metavar="OUT",
+                        help="Render one frame to OUT (PNG) after GPU init "
+                             "+ auto-range complete, then exit")
     parser.add_argument("--fullscreen", action="store_true",
                         help="Run in fullscreen mode at specified resolution")
     parser.add_argument("--profile", type=str, default=None, metavar="OUT",
@@ -26,7 +29,8 @@ def main():
         pr.enable()
         try:
             run_wgpu_app(args.snapshot, width=args.width, height=args.height,
-                         fov=args.fov, fullscreen=args.fullscreen)
+                         fov=args.fov, fullscreen=args.fullscreen,
+                         screenshot=args.screenshot)
         finally:
             pr.disable()
             pr.dump_stats(args.profile)
@@ -37,7 +41,8 @@ def main():
             print(f"View with: snakeviz {args.profile}")
     else:
         run_wgpu_app(args.snapshot, width=args.width, height=args.height,
-                     fov=args.fov, fullscreen=args.fullscreen)
+                     fov=args.fov, fullscreen=args.fullscreen,
+                     screenshot=args.screenshot)
 
 
 if __name__ == "__main__":

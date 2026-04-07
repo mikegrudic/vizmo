@@ -54,7 +54,7 @@ DEV_STYLE = PanelStyle(
 )
 
 USER_STYLE = PanelStyle(
-    font_size=42, line_height=56, margin=20, min_width=400,
+    font_size=28, line_height=37, margin=13, min_width=267,
     bg_color=(15, 15, 25, 100),
     text_color=(220, 220, 220, 255),
     accent_color=(100, 180, 255, 255),

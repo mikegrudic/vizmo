@@ -793,6 +793,124 @@ class WGPURenderer:
         self._encode_star_overlay(encoder, screen_view)
         self.device.queue.submit([encoder.finish()])
 
+    def screenshot(self, path, width, height, camera, composite_args=None):
+        """Render one frame at (width, height) into an offscreen RGBA8
+        texture and save it to `path`.
+
+        Args:
+            path: output file path. Format inferred from extension by PIL.
+            width, height: framebuffer size in pixels.
+            camera: Camera instance.
+            composite_args: optional tuple
+                (m1, lo1, hi1, log1, m2, lo2, hi2, log2)
+                to render in composite mode. None → single-slot resolve.
+        """
+        if self._colormap_tex is None:
+            raise RuntimeError("screenshot: colormap not set")
+
+        dev = self.device
+
+        # 1) Accumulate particles into the FBO triple. In composite mode
+        # the caller is responsible for having uploaded both slots; we
+        # render slot 0 into _accum_textures and slot 1 into
+        # _accum_textures2 (matching the live composite path).
+        if composite_args is not None:
+            self._ensure_fbo(width, height, which=1)
+            self._ensure_fbo(width, height, which=2)
+            self.set_active_subsample_slot(0)
+            self._write_camera_uniforms(camera, width, height)
+            self._render_accum(camera, width, height, self._accum_textures)
+            self.set_active_subsample_slot(1)
+            self._write_camera_uniforms(camera, width, height)
+            self._render_accum(camera, width, height, self._accum_textures2)
+            self.set_active_subsample_slot(None)
+        else:
+            self._ensure_fbo(width, height, which=1)
+            self._write_camera_uniforms(camera, width, height)
+            self._render_accum(camera, width, height, self._accum_textures)
+
+        # 2) Allocate an offscreen target in the same format the resolve
+        # / composite pipeline was built against (the swapchain
+        # present_format). We'll byte-swap on the CPU side if needed.
+        out_tex = dev.create_texture(
+            size=(width, height, 1),
+            format=self.present_format,
+            usage=(wgpu.TextureUsage.RENDER_ATTACHMENT
+                   | wgpu.TextureUsage.COPY_SRC),
+        )
+        out_view = out_tex.create_view()
+
+        # 3) Run the resolve (or composite) pass into out_tex. The two
+        # paths build their own bind groups against the existing
+        # _resolve_pipeline / _composite_pipeline.
+        import struct
+        if composite_args is not None:
+            m1, lo1, hi1, log1, m2, lo2, hi2, log2 = composite_args
+            comp_data = struct.pack(
+                "ffIIffII", lo1, hi1, m1, log1, lo2, hi2, m2, log2)
+            dev.queue.write_buffer(self._composite_params_buf, 0, comp_data)
+            bind_group = dev.create_bind_group(
+                layout=self._composite_bgl,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": self._composite_params_buf}},
+                    {"binding": 1, "resource": self._accum_textures["views"][0]},
+                    {"binding": 2, "resource": self._accum_textures["views"][1]},
+                    {"binding": 3, "resource": self._accum_textures["views"][2]},
+                    {"binding": 4, "resource": self._accum_textures2["views"][0]},
+                    {"binding": 5, "resource": self._accum_textures2["views"][1]},
+                    {"binding": 6, "resource": self._accum_textures2["views"][2]},
+                    {"binding": 7, "resource": self._colormap_tex.create_view()},
+                    {"binding": 8, "resource": self._colormap_sampler},
+                ],
+            )
+            pipeline = self._composite_pipeline
+        else:
+            resolve_data = struct.pack(
+                "ffII", self.qty_min, self.qty_max,
+                self.resolve_mode, self.log_scale)
+            dev.queue.write_buffer(self._resolve_params_buf, 0, resolve_data)
+            bind_group = dev.create_bind_group(
+                layout=self._resolve_bgl,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": self._resolve_params_buf}},
+                    {"binding": 1, "resource": self._accum_textures["views"][0]},
+                    {"binding": 2, "resource": self._accum_textures["views"][1]},
+                    {"binding": 3, "resource": self._accum_textures["views"][2]},
+                    {"binding": 4, "resource": self._colormap_tex.create_view()},
+                    {"binding": 5, "resource": self._colormap_sampler},
+                ],
+            )
+            pipeline = self._resolve_pipeline
+
+        encoder = dev.create_command_encoder()
+        rp = encoder.begin_render_pass(color_attachments=[{
+            "view": out_view, "clear_value": (0, 0, 0, 1),
+            "load_op": "clear", "store_op": "store",
+        }])
+        rp.set_pipeline(pipeline)
+        rp.set_bind_group(0, bind_group)
+        rp.draw(3, 1, 0, 0)
+        rp.end()
+        dev.queue.submit([encoder.finish()])
+
+        # 4) Read back. read_texture requires bytes_per_row to be a
+        # multiple of 256, so we round up and crop the padding.
+        bytes_per_row = ((width * 4 + 255) // 256) * 256
+        data = dev.queue.read_texture(
+            {"texture": out_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            {"offset": 0, "bytes_per_row": bytes_per_row},
+            (width, height, 1),
+        )
+        arr = np.frombuffer(data, dtype=np.uint8).reshape(
+            height, bytes_per_row // 4, 4)
+        arr = arr[:, :width, :]
+        # Convert BGRA → RGBA if needed.
+        if "bgra" in self.present_format:
+            arr = arr[:, :, [2, 1, 0, 3]]
+        from PIL import Image
+        Image.fromarray(arr, mode="RGBA").save(path)
+        print(f"  Saved screenshot: {path}")
+
     def _read_accum_texture_r(self, texture, size=None):
         """Read back an accumulation texture's red channel as float32 array.
 
