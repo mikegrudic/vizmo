@@ -1,6 +1,6 @@
 # vizmo
 
-Real-time 3D fly-through explorer for unstructured simulation data. Loads HDF5 snapshots from GIZMO/Gadget simulations and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite CoolMap visualizations on the GPU via WebGPU.
+Real-time 3D fly-through explorer for unstructured simulation data. Loads HDF5 snapshots from GIZMO/Gadget/AREPO simulations and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite CoolMap visualizations on the GPU via WebGPU.
 
 This is a **vibecoded** app. I have no idea how its front- or backends work, and am not sure if I could really properly support or get it running for you 10 years from now! But it would not exist otherwise. Software is weird now. It is what it is. 
 
