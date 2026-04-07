@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vizmo"
-version = "0.1.3"
+version = "0.1.4"
 description = "Real-time 3D fly-through explorer for mesh-free/unstructured simulation data"
 readme = "README.md"
 license = "MIT"
