@@ -167,7 +167,6 @@ class WGPURenderer:
         self._all_hsml = None
         self._all_mass = None
         self._all_qty = None
-        self._grid = None
 
         # GPU resources
         self._accum_textures = None
@@ -381,9 +380,9 @@ class WGPURenderer:
     # ---- Data management (matches SplatRenderer interface) ----
 
     def set_particles(self, positions, hsml, masses, quantity=None):
-        """Store CPU-side particle data and trigger the (background)
-        AdaptiveOctree construction. The actual GPU upload is performed
-        by GPUCompute.upload_subsample_only after the grid is built.
+        """Store CPU-side particle data. The actual GPU upload is
+        performed by GPUCompute.upload_subsample_only on the first
+        canvas tick.
         """
         self._all_pos = positions.astype(np.float32)
         self._all_hsml = hsml.astype(np.float32)
@@ -395,28 +394,14 @@ class WGPURenderer:
         # Default LOD: stride ~ n^(1/3)/16. Auto-LOD adapts from here.
         self.lod_pixels = max(1.0, self.n_total ** (1.0 / 3.0) / 16.0)
 
-    def _build_grid(self):
-        """Construct the AdaptiveOctree wrapper that holds the raw
-        particle arrays for the GPU subsample upload. No tree subdivision
-        is performed (subsample mode never needs it).
-        """
-        t0 = time.perf_counter()
-        from .adaptive_octree import AdaptiveOctree
-        grid = AdaptiveOctree(
-            self._all_pos, self._all_mass, self._all_hsml, self._all_qty)
-        print(f"  Adaptive octree built in {time.perf_counter()-t0:.1f}s")
-        return grid
-
     def update_weights(self, masses, quantity=None):
-        """Update the underlying grid's mass/qty arrays after a field
-        swap. The GPU side is re-uploaded by GPUCompute.upload_weights.
+        """Update the renderer's CPU mass/qty arrays after a field swap.
+        The GPU side must be re-uploaded by GPUCompute.upload_weights.
         """
         self._all_mass = masses.astype(np.float32)
         if quantity is None:
             quantity = masses
         self._all_qty = quantity.astype(np.float32)
-        if self._grid is not None:
-            self._grid.update_weights(masses, quantity)
 
     def set_subsample_chunks(self, chunks, world_offset=None):
         """Configure compute-driven splat: render directly from per-chunk

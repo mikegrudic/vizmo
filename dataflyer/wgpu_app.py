@@ -112,28 +112,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     except Exception:
         pass
 
-    # Build grid in background thread so the window stays responsive
     from .gpu_compute import GPUCompute
-    import threading
-
     gpu_compute = None
-    _bg = {"grid": None, "done": False}  # mutable container for thread result
-
-    def _build_grid_bg():
-        try:
-            # Use renderer's _build_grid to respect use_adaptive_tree flag
-            renderer._all_pos = data.positions.astype(np.float32)
-            renderer._all_mass = weights.astype(np.float32)
-            renderer._all_hsml = data.hsml.astype(np.float32)
-            renderer._all_qty = weights.astype(np.float32)
-            _bg["grid"] = renderer._build_grid()
-        except Exception as e:
-            print(f"  Grid build failed: {e}")
-        _bg["done"] = True
-
-    glfw.set_window_title(window, "DataFlyer [wgpu] | Building spatial grid...")
-    grid_thread = threading.Thread(target=_build_grid_bg, daemon=True)
-    grid_thread.start()
+    glfw.set_window_title(window, "DataFlyer [wgpu] | Initializing...")
 
     # UI overlays
     from .wgpu_overlay import WGPUDevOverlay, WGPUUserMenu
@@ -173,7 +154,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         gpu_ready_now = gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False)
         fb_w_, fb_h_ = glfw.get_framebuffer_size(window)
 
-        if gpu_ready_now and renderer._grid is not None:
+        if gpu_ready_now:
             # GPU subsample path: upload this slot's mass/qty into the
             # composite slot's per-chunk buffers, bind them as the active
             # slot, and let _render_accum dispatch the splat draws.
@@ -333,11 +314,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             if mode == "Composite":
                 _render_mode = RenderMode(name="Composite", weight_field="", qty_field="", resolve_mode=-1)
                 # Pre-populate slot caches then auto-range
-                if renderer._grid is not None:
-                    for si in range(2):
-                        _ensure_slot_sorted(si)
-                    _auto_range_composite_slot(0, "Lightness")
-                    _auto_range_composite_slot(1, "Color")
+                for si in range(2):
+                    _ensure_slot_sorted(si)
+                _auto_range_composite_slot(0, "Lightness")
+                _auto_range_composite_slot(1, "Color")
                 return
 
             if mode in ("WeightedAverage", "WeightedVariance"):
@@ -356,8 +336,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 renderer.resolve_mode = 0
 
             renderer.update_weights(weights, qty)
-            if gpu_compute is not None and renderer._grid is not None:
-                gpu_compute.upload_weights(renderer._grid)
+            if gpu_compute is not None:
+                gpu_compute.upload_weights(
+                    renderer._all_mass, renderer._all_qty)
                 # GPU LOS projection isn't wired into the subsample path
                 # (would need to update qty across every per-chunk buffer
                 # per camera rotation). The CPU _project_field above
@@ -477,11 +458,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         if cached is not None and cached[0] == slot_id:
             return cached[1], cached[2]
 
-        # Always compute the qty field on the CPU in subsample mode (no GPU
-        # LOS projection wired up).
-        is_los_qty = False
-
-        # Compute weight using shared helpers
+        # Compute weight (and optional second weight field) on the CPU.
+        # The GPU upload path is in raw particle order, so no sort is
+        # applied here.
         proj = sl.get("proj", "LOS")
         vf = _state["_vector_fields"]
         w = resolve_field(sl["weight"], vf, data, proj, camera.forward)
@@ -489,24 +468,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         if w2_name != "None":
             w2 = resolve_field(w2_name, vf, data, proj, camera.forward)
             w = combine_fields(w, w2, sl.get("op", "*"))
+        sm = w.astype(np.float32)
 
-        # In subsample-only mode the grid never builds the Morton sort,
-        # so sort_order is None and we use the raw particle order. The
-        # subsample upload path uses raw arrays too, so this matches.
-        so = getattr(renderer._grid, "sort_order", None)
-        if so is not None:
-            sm = w[so].astype(np.float32)
-        else:
-            sm = w.astype(np.float32)
-
-        if is_los_qty:
-            sq = sm  # placeholder — GPU LOS projection will fill qty buffer
-        elif sl["mode"] in ("WeightedAverage", "WeightedVariance"):
+        if sl["mode"] in ("WeightedAverage", "WeightedVariance"):
             q = resolve_field(sl["data"], vf, data, proj, camera.forward)
-            if so is not None:
-                sq = q[so].astype(np.float32)
-            else:
-                sq = q.astype(np.float32)
+            sq = q.astype(np.float32)
         else:
             sq = sm
 
@@ -523,7 +489,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         for i in range(2):
             sl = _state["_slot"][i]
-            if gpu_ready_now and renderer._grid is not None:
+            if gpu_ready_now:
                 # Subsample path: ensure the slot's sorted mass/qty is
                 # cached for the *current* camera direction (the cache
                 # key includes a quantized fwd for LOS slots), then
@@ -598,13 +564,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             fps_time = now
             n_vis = renderer.n_particles
             n_tot = renderer.n_total
-            init_msg = ""
-            if not _bg["done"]:
-                init_msg = " | Building spatial grid..."
-            elif renderer._grid is None:
-                init_msg = " | Loading grid..."
-            elif gpu_compute is None:
-                init_msg = " | Initializing GPU compute..."
+            init_msg = " | Initializing GPU..." if gpu_compute is None else ""
             glfw.set_window_title(
                 window,
                 f"DataFlyer [wgpu] | {fps:.0f} fps | {n_vis/1e6:.1f}M/{n_tot/1e6:.1f}M{init_msg}"
@@ -612,20 +572,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         glfw.poll_events()
 
-        # Pick up background grid build when complete
-        if _bg["done"] and _bg["grid"] is not None and renderer._grid is None:
-            renderer._grid = _bg["grid"]
-            _bg["grid"] = None  # don't repeat
-
-        # GPU subsample pipeline init (one-time upload after grid is built)
+        # GPU subsample pipeline init (one-time upload, first frame).
         gpu_ready = getattr(gpu_compute, '_upload_ready', False)
-        if (not gpu_ready and gpu_compute is None
-                and renderer._grid is not None):
+        if not gpu_ready and gpu_compute is None:
             try:
                 gpu_compute = GPUCompute(device)
                 gpu_compute.upload_subsample_only(
-                    renderer._grid,
-                    max_output=int(renderer.max_render_particles))
+                    renderer._all_pos, renderer._all_hsml,
+                    renderer._all_mass, renderer._all_qty)
                 renderer.set_subsample_chunks(
                     gpu_compute.get_chunk_bufs(),
                     world_offset=gpu_compute.get_pos_offset())
@@ -937,14 +891,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 overlay._last_update_time = now
                 was_enabled = overlay.enabled
                 overlay.enabled = True
-                # Surface init progress in the dev overlay message line
-                init_status = ""
-                if not _bg["done"]:
-                    init_status = "Initializing: building spatial grid..."
-                elif renderer._grid is None:
-                    init_status = "Initializing: loading grid..."
-                elif gpu_compute is None and renderer.n_total >= 10_000_000:
-                    init_status = "Initializing: uploading to GPU compute..."
+                init_status = ("Initializing: uploading to GPU..."
+                               if gpu_compute is None else "")
                 overlay_message = init_status if init_status else _last_message
                 overlay.update(
                     renderer, camera, fps, _render_mode.name,

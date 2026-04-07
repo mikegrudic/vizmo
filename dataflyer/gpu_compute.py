@@ -30,25 +30,14 @@ class GPUCompute:
 
     # ---- Initial upload ----
 
-    def upload_subsample_only(self, grid, max_output=4_000_000):
+    def upload_subsample_only(self, pos, hsml, mass, qty):
         """Allocate per-chunk source particle buffers for the splat
         pipeline. Particles are pre-shuffled and the bounding-box center
         is subtracted from positions before upload (world-origin shift,
         for float32 precision on cosmological-scale snapshots).
         """
         dev = self.device
-
-        pos_src = getattr(grid, "_raw_pos", None)
-        if pos_src is None:
-            pos_src = grid.sorted_pos
-            hsml_src = grid.sorted_hsml
-            mass_src = grid.sorted_mass
-            qty_src = grid.sorted_qty
-        else:
-            hsml_src = grid._raw_hsml
-            mass_src = grid._raw_mass
-            qty_src = grid._raw_qty
-
+        pos_src, hsml_src, mass_src, qty_src = pos, hsml, mass, qty
         n = len(pos_src)
         self._n_particles = n
 
@@ -176,22 +165,20 @@ class GPUCompute:
 
     # ---- Re-upload of mass/qty after a render-mode change (non-composite) ----
 
-    def upload_weights(self, grid):
+    def upload_weights(self, mass, qty):
         """Re-upload mass/qty for every chunk after a field swap.
-        Reads from grid._raw_mass / _raw_qty (subsample mode keeps
-        sorted_* unset; raw arrays match the original particle order
-        and our shuffle perm reindexes them to the chunk order).
+        Both arrays are in raw particle order; the shuffle perm built
+        on initial upload is reapplied so they line up with the
+        already-shuffled pos/hsml chunks.
         """
         dev = self.device
-        mass_src = grid.sorted_mass if grid.sorted_mass is not None else grid._raw_mass
-        qty_src = grid.sorted_qty if grid.sorted_qty is not None else grid._raw_qty
         perm = self._shuffle_perm
-        mass_f32 = np.ascontiguousarray(mass_src, dtype=np.float32)
+        mass_f32 = np.ascontiguousarray(mass, dtype=np.float32)
         if perm is not None:
             mass_f32 = mass_f32[perm]
-        qty_is_mass = qty_src is mass_src
+        qty_is_mass = qty is mass or qty is None
         if not qty_is_mass:
-            qty_f32 = np.ascontiguousarray(qty_src, dtype=np.float32)
+            qty_f32 = np.ascontiguousarray(qty, dtype=np.float32)
             if perm is not None:
                 qty_f32 = qty_f32[perm]
         # Pace each chunk with a small read so Metal's staging buffer
