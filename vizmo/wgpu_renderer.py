@@ -880,10 +880,12 @@ class WGPURenderer:
     def _star_columns_tree(self, cam_pos):
         """KDTree-accelerated per-star column densities.
 
-        Gas is binned by h (octave-wide). For each star and each bin,
-        subdivide (star → cam) into pieces of length ~2*h_bin and run
-        a multi-point ball query at the bin's tight radius. This keeps
-        the candidate set local even when global h_max is huge.
+        Gas is binned by h (octave-wide). For each bin, we batch the
+        segment-subdivision query points from ALL stars into a single
+        cKDTree.query_ball_point(workers=-1) call — small per-(star,bin)
+        calls don't give scipy's thread pool enough work to amortize
+        spawn overhead, so batching per bin is what actually engages
+        multiple cores.
         """
         if self._ext_bins is None:
             self._build_ext_hbins()
@@ -898,38 +900,66 @@ class WGPURenderer:
         n_stars = xstar.shape[0]
         columns = np.zeros(n_stars, dtype=np.float64)
 
-        for s in range(n_stars):
-            ray = cam_pos - xstar[s]
-            d_obs = float(np.linalg.norm(ray))
-            if d_obs == 0.0:
-                continue
-            ray_dir = ray / d_obs
-            cand_chunks = []
-            for bin_idx, tree, h_bin in self._ext_bins:
-                seg_len = max(2.0 * h_bin, 1e-30)
+        # Per-star geometry, computed once.
+        rays = cam_pos[None, :] - xstar                         # (n_stars, 3)
+        d_obs_arr = np.linalg.norm(rays, axis=1)                # (n_stars,)
+        safe = d_obs_arr > 0.0
+        ray_dirs = np.zeros_like(rays)
+        ray_dirs[safe] = rays[safe] / d_obs_arr[safe, None]
+
+        # Accumulate per-star candidate index lists across all bins.
+        star_cands = [[] for _ in range(n_stars)]
+
+        for bin_idx, tree, h_bin in self._ext_bins:
+            seg_len = max(2.0 * h_bin, 1e-30)
+            centers_list = []
+            owner_list = []  # which star each center belongs to
+            max_radius = 0.0
+            for s in range(n_stars):
+                if not safe[s]:
+                    continue
+                d_obs = d_obs_arr[s]
                 n_chunks = max(1, int(np.ceil(d_obs / seg_len)))
-                # Cap subdivisions: a single star can otherwise spawn
-                # millions of query points if h_bin << d_obs.
                 if n_chunks > 4096:
                     n_chunks = 4096
                 step = d_obs / n_chunks
                 ts = (np.arange(n_chunks) + 0.5) * step
-                centers = xstar[s][None, :] + ts[:, None] * ray_dir[None, :]
-                radius = 0.5 * step + h_bin
-                idx_lists = tree.query_ball_point(centers, r=radius)
-                # Flatten + dedupe within this bin, then map to global indices.
-                flat = []
-                for lst in idx_lists:
-                    if lst:
-                        flat.append(lst)
-                if not flat:
-                    continue
-                local = np.unique(np.concatenate([np.asarray(l, dtype=np.int64) for l in flat]))
-                if local.size:
-                    cand_chunks.append(bin_idx[local])
-            if not cand_chunks:
+                centers = xstar[s][None, :] + ts[:, None] * ray_dirs[s][None, :]
+                centers_list.append(centers)
+                owner_list.append(np.full(n_chunks, s, dtype=np.int32))
+                r_here = 0.5 * step + h_bin
+                if r_here > max_radius:
+                    max_radius = r_here
+            if not centers_list:
                 continue
-            idx = np.concatenate(cand_chunks)  # bins are disjoint, no dedupe needed
+            centers_cat = np.concatenate(centers_list, axis=0)
+            owners_cat = np.concatenate(owner_list)
+
+            # One big query per bin — enough work for the thread pool.
+            lists = tree.query_ball_point(centers_cat, r=max_radius, workers=-1)
+
+            # Distribute results back to their owning stars.
+            # lists[i] is a python list of local (in-bin) indices.
+            # Group by owner, dedupe, map to global indices.
+            # (cKDTree returns a numpy object array of lists.)
+            per_star_local = [[] for _ in range(n_stars)]
+            for i, lst in enumerate(lists):
+                if lst:
+                    per_star_local[owners_cat[i]].append(lst)
+            for s in range(n_stars):
+                if per_star_local[s]:
+                    local = np.unique(
+                        np.concatenate([np.asarray(l, dtype=np.int64) for l in per_star_local[s]])
+                    )
+                    if local.size:
+                        star_cands[s].append(bin_idx[local])
+
+        for s in range(n_stars):
+            if not star_cands[s]:
+                continue
+            idx = np.concatenate(star_cands[s])  # bins are disjoint
+            d_obs = d_obs_arr[s]
+            ray_dir = ray_dirs[s]
             rcand = xgas[idx] - xstar[s]
             tcand = rcand @ ray_dir
             r2 = np.einsum("ij,ij->i", rcand, rcand)
