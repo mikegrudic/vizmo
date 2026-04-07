@@ -98,14 +98,6 @@ def _additive_blend():
     }
 
 
-def _alpha_blend():
-    """Premultiplied alpha blending for star overlay."""
-    return {
-        "color": {"operation": "add", "src_factor": "one", "dst_factor": "one-minus-src-alpha"},
-        "alpha": {"operation": "add", "src_factor": "one", "dst_factor": "one-minus-src-alpha"},
-    }
-
-
 # Accumulation texture format.
 # r32float with additive blending requires "float32-blendable" feature (not on macOS Metal).
 # rgba16float is blendable by default everywhere. Shaders output vec4 so both formats work.
@@ -167,7 +159,10 @@ class WGPURenderer:
         self._accum_textures2 = None  # second set for composite mode
         self._accum_size = (0, 0)
         self._accum_size2 = (0, 0)
-        self._star_bufs = {}
+        # CPU-side star particle data, populated by upload_stars().
+        self.n_stars = 0
+        self._star_positions = None
+        self._star_masses = None
 
         # Colormap
         self._colormap_tex = None
@@ -191,15 +186,10 @@ class WGPURenderer:
             code=_load_wgsl("splat_subsample.wgsl", include_common=True))
         self._resolve_shader = dev.create_shader_module(code=_load_wgsl("resolve.wgsl"))
         self._composite_shader = dev.create_shader_module(code=_load_wgsl("composite.wgsl"))
-        self._star_shader = dev.create_shader_module(
-            code=_load_wgsl("star.wgsl", include_common=True))
 
         # Camera uniform: view + proj + viewport + kernel_id + pad = 144 B
         self._camera_buf = dev.create_buffer(
             size=144, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
-        # Star params (point_size, ...)
-        self._star_params_buf = dev.create_buffer(
-            size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
         # Resolve params (qty_min, qty_max, mode, log_scale)
         self._resolve_params_buf = dev.create_buffer(
             size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
@@ -216,27 +206,14 @@ class WGPURenderer:
             {"binding": 1, "visibility": V, "buffer": {"type": "uniform"}}])
         # bg1: pos / hsml / mass / qty per chunk
         self._splat_bgl1 = _storage_bgl(dev, 4, V)
-        # Star pipeline (always-on overlay for star particles, separate feature)
-        self._star_bgl0 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": V, "buffer": {"type": "uniform"}}])
-        self._star_bgl1 = _storage_bgl(dev, 2, V)
 
         self._splat_subsample_layout = dev.create_pipeline_layout(
             bind_group_layouts=[self._splat_subsample_bgl0, self._splat_bgl1])
-        self._star_layout = dev.create_pipeline_layout(
-            bind_group_layouts=[self._star_bgl0, self._star_bgl1])
 
         accum_targets = [{"format": self._accum_format, "blend": _additive_blend()}] * 3
         self._splat_subsample_pipeline = _make_render_pipeline(
             dev, self._splat_subsample_layout, self._splat_subsample_shader,
             accum_targets)
-        self._star_pipeline = _make_render_pipeline(
-            dev, self._star_layout, self._star_shader,
-            [{"format": self.present_format, "blend": _alpha_blend()}])
-
-        self._star_bg0 = _make_bind_group(
-            dev, self._star_bgl0, [self._camera_buf, self._star_params_buf])
 
         # Subsample state set later via set_subsample_chunks. The
         # cap-based auto-LOD is the sole LOD knob — there is no
@@ -528,19 +505,18 @@ class WGPURenderer:
                 ck["params_buf"], 0, cam_bytes + tail)
 
     def upload_stars(self, positions, masses):
-        """Upload star particle data."""
+        """Upload star particle data.
+
+        Keeps the CPU-side count and the position/mass arrays around so
+        a future star-rendering path can pick them up without changing
+        the call site. The GPU bind groups for the old dedicated star
+        shader pipeline have been removed.
+        """
         self.n_stars = len(masses)
         if self.n_stars == 0:
             return
-        dev = self.device
-        pos4 = np.zeros((self.n_stars, 4), dtype=np.float32)
-        pos4[:, :3] = positions.astype(np.float32)
-        self._star_bufs = {
-            "pos": dev.create_buffer_with_data(data=pos4, usage=wgpu.BufferUsage.STORAGE),
-            "mass": dev.create_buffer_with_data(data=masses.astype(np.float32), usage=wgpu.BufferUsage.STORAGE),
-        }
-        self._star_bg1 = _make_bind_group(dev, self._star_bgl1,
-                                          [self._star_bufs["pos"], self._star_bufs["mass"]])
+        self._star_positions = positions.astype(np.float32)
+        self._star_masses = masses.astype(np.float32)
 
     # ---- Accumulation textures ----
 
@@ -618,18 +594,15 @@ class WGPURenderer:
     # ---- Render passes ----
 
     def _encode_star_overlay(self, encoder, screen_view):
-        """Append a star overlay render pass to the given encoder."""
-        if self.n_stars == 0 or not self._star_bufs:
-            return
-        star_data = np.array([50.0, 0, 0, 0], dtype=np.float32)
-        self.device.queue.write_buffer(self._star_params_buf, 0, star_data.tobytes())
-        rp = encoder.begin_render_pass(
-            color_attachments=[{"view": screen_view, "load_op": "load", "store_op": "store"}])
-        rp.set_pipeline(self._star_pipeline)
-        rp.set_bind_group(0, self._star_bg0)
-        rp.set_bind_group(1, self._star_bg1)
-        rp.draw(4, self.n_stars, 0, 0)
-        rp.end()
+        """Append a star overlay render pass to the given encoder.
+
+        The dedicated star shader pipeline was removed; this is now a
+        no-op placeholder. Star particle data is still loaded by the
+        data manager and uploaded by upload_stars(), so a future
+        replacement (e.g. routing stars through the splat pipeline)
+        can re-introduce a draw here without re-plumbing the loop.
+        """
+        return
 
     def _render_accum(self, camera, width, height, accum_textures, encoder=None):
         """Render additive accumulation pass into given textures.
@@ -696,7 +669,8 @@ class WGPURenderer:
         if owns_encoder:
             dev.queue.submit([encoder.finish()])
 
-    def render(self, camera, width, height, encoder=None, screen_view=None):
+    def render(self, camera, width, height, encoder=None, screen_view=None,
+               skip_accum=False):
         """Render particle splats via additive accumulation + resolve.
 
         If `encoder` is provided, the accum + resolve passes are appended
@@ -704,6 +678,11 @@ class WGPURenderer:
         be supplied (the swapchain texture view to render into). When both
         are None the legacy path is used: this method creates its own
         encoder, acquires the current swapchain texture, and submits.
+
+        `skip_accum=True` reuses the prior frame's accumulation textures
+        (still resident on the GPU) and only re-runs the resolve pass.
+        Used by the main loop on UI-only dirty frames so typing into a
+        text field doesn't trigger an N-particle re-accum.
         """
         self._viewport_width = width
         if self._colormap_tex is None:
@@ -721,9 +700,12 @@ class WGPURenderer:
             current_tex = self.canvas_context.get_current_texture()
             screen_view = current_tex.create_view()
 
-        # Accum pass — appended to the shared encoder.
-        self._render_accum(camera, width, height, self._accum_textures,
-                           encoder=encoder)
+        # Accum pass — appended to the shared encoder. Skipped on
+        # UI-only dirty frames where the prior accum textures are still
+        # valid.
+        if not skip_accum:
+            self._render_accum(camera, width, height, self._accum_textures,
+                               encoder=encoder)
 
         import struct
         resolve_data = struct.pack("ffII", self.qty_min, self.qty_max,
@@ -1049,6 +1031,7 @@ class WGPURenderer:
         """Drop GPU resource references; wgpu garbage-collects them."""
         self._subsample_chunks = None
         self._slot_subsample_bgs = [None, None]
-        self._star_bufs = {}
+        self._star_positions = None
+        self._star_masses = None
         self._accum_textures = None
         self._accum_textures2 = None
