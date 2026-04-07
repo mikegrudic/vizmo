@@ -381,6 +381,9 @@ class DevOverlay(Panel):
             items.append(("slider", "PID Ki", renderer.pid_Ki, 0.0, 2.0, "pid_Ki"))
             items.append(("slider", "PID Kd", renderer.pid_Kd, 0.0, 2.0, "pid_Kd"))
         items.append(("slider", "Hsml Scale", renderer.hsml_scale, 0.1, 5.0, "hsml_scale"))
+        items.append(("slider", "Multigrid Levels",
+                      float(getattr(renderer, "multigrid_levels", 1)),
+                      1.0, 8.0, "multigrid_levels"))
         if getattr(renderer, "n_stars", 0) > 0:
             items.append(("slider", "Star Radius",
                           renderer.star_world_radius, 0.001, 5.0, "star_world_radius"))
@@ -427,6 +430,17 @@ class DevOverlay(Panel):
                     setattr(renderer, key, max(cur / factor, 1e-12))
                 else:
                     setattr(renderer, key, cur * factor)
+                return True
+            if key == "multigrid_levels":
+                # Integer slider; rebuilds bin state via the renderer
+                # so the change applies immediately on the next frame.
+                cur_i = int(round(cur))
+                new_i = cur_i - 1 if action == "slider_dec" else cur_i + 1
+                new_i = max(int(vmin), min(int(vmax), new_i))
+                if hasattr(renderer, "set_multigrid_levels"):
+                    renderer.set_multigrid_levels(new_i)
+                else:
+                    setattr(renderer, key, new_i)
                 return True
             step = max((vmax - vmin) / 20, 0.01)
             if action == "slider_dec":

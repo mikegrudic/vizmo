@@ -23,8 +23,12 @@ struct SubsampleParams {
     n_in_chunk: u32,
     h_scale: f32,
     mass_scale: f32,
-    _pad0: u32,
-    _pad1: u32,
+    level_index: u32,
+    n_levels: u32,
+    full_res_w: f32,
+    n_grid_kernel: f32,
+    _pad2: u32,
+    _pad3: u32,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -34,6 +38,8 @@ struct SubsampleParams {
 @group(1) @binding(1) var<storage, read> s_hsml: array<f32>;
 @group(1) @binding(2) var<storage, read> s_mass: array<f32>;
 @group(1) @binding(3) var<storage, read> s_qty: array<f32>;
+@group(1) @binding(4) var<storage, read> s_index: array<u32>;
+@group(1) @binding(5) var<storage, read> s_bases: array<u32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -68,10 +74,18 @@ fn vs_main(
     // K_chunk shuffled particles ARE the random K-subset — no hash, no
     // collisions, no source-order imprinting. Out-of-range indices (when
     // K_chunk doesn't divide n_in_chunk) emit degenerate quads.
-    let local_idx = ii;
-    if (local_idx >= sub.n_in_chunk) {
+    // ii indexes the per-chunk index buffer. For non-multigrid mode the
+    // index buffer is identity, so this collapses to local_idx = ii.
+    // For multigrid mode the binning compute pass scatters particle
+    // indices into [base[level], base[level]+count[level]) ranges and
+    // each per-level draw_indirect dispatches with first_instance=base
+    // and instance_count=count.
+    let base = s_bases[sub.level_index];
+    let abs_ii = base + ii;
+    if (abs_ii >= sub.n_in_chunk) {
         return degenerate(corner);
     }
+    let local_idx = s_index[abs_ii];
 
     let pos = s_pos[local_idx].xyz;
     let hsml = s_hsml[local_idx] * sub.h_scale;
