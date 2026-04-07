@@ -192,12 +192,20 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     def key_callback(win, key, scancode, action, mods):
         nonlocal _cmap_idx, needs_auto_range, ui_hidden
         nonlocal subsample_cap_ceiling, last_subsample_cap
-        nonlocal dirty, idle_streak
+        nonlocal dirty, ui_dirty, idle_streak
         if action in (glfw.PRESS, glfw.REPEAT):
-            dirty = True
             idle_streak = 0
+        # Keystrokes routed into the user_menu (text-field editing) only
+        # mutate UI state — no scene re-render needed. The main loop's
+        # ui-only dirty path will redraw the panel without re-running
+        # particle accumulation.
         if user_menu.on_key(key, action):
+            ui_dirty = True
             return
+        # Any other PRESS may mutate scene state (R, L, ',', '.', mode
+        # toggles, etc.), so force a full re-render.
+        if action == glfw.PRESS:
+            dirty = True
         if action == glfw.PRESS:
             if key == glfw.KEY_ESCAPE:
                 glfw.set_window_should_close(win, True)
@@ -400,16 +408,19 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         camera.on_cursor(x, y)
 
     def scroll_callback(win, xoffset, yoffset):
-        nonlocal dirty, idle_streak
-        dirty = True
+        nonlocal dirty, ui_dirty, idle_streak
         idle_streak = 0
         if user_menu.on_scroll(yoffset):
+            ui_dirty = True
             return
+        # Camera zoom: full re-render
+        dirty = True
         camera.on_scroll(yoffset)
 
     def char_callback(win, codepoint):
-        nonlocal dirty, idle_streak
-        dirty = True
+        nonlocal ui_dirty, idle_streak
+        # Text-field editing only mutates UI state — no scene re-render.
+        ui_dirty = True
         idle_streak = 0
         user_menu.on_char(codepoint, app_proxy)
 
@@ -438,7 +449,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     # slot params), the per-frame subsample cap (progressive refinement),
     # current LOD, and pending auto-range. When none changed we skip
     # render+overlay+submit entirely and sleep briefly.
+    # `dirty` forces a full scene re-render (accum + resolve). `ui_dirty`
+    # forces a UI-only redraw (resolve over the existing accum textures
+    # + overlay/menu repaint), which is cheap enough to be responsive
+    # even on 100M+ particle snapshots while text is being typed.
     dirty = True
+    ui_dirty = False
     prev_state_sig = None
     prev_cap = None
     prev_n_particles = None
@@ -540,7 +556,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         return sm, sq
 
     def _render_composite_frame(fb_w, fb_h, encoder=None, screen_view=None,
-                                skip_los_recompute=False):
+                                skip_los_recompute=False, skip_accum=False):
         """Render two fields into separate FBOs and composite them.
 
         If `encoder` and `screen_view` are provided, all sub-passes (two
@@ -561,31 +577,32 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         gpu_ready_now = gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False)
         accum_sets = [renderer._accum_textures, renderer._accum_textures2]
 
-        for i in range(2):
-            sl = _state["_slot"][i]
-            if gpu_ready_now:
-                # Subsample path: ensure the slot's sorted mass/qty is
-                # cached for the *current* camera direction (the cache
-                # key includes a quantized fwd for LOS slots), then
-                # upload to the slot's per-chunk buffers and render.
-                sorted_mass, sorted_qty = _ensure_slot_sorted(
-                    i, skip_los_recompute=skip_los_recompute)
-                slot_id = _slot_sorted[i][0]
-                slot_chunks = gpu_compute.upload_subsample_slot(
-                    i, slot_id, sorted_mass, sorted_qty)
-                renderer.set_subsample_slot_chunks(i, slot_chunks)
-                renderer.set_active_subsample_slot(i)
-                renderer.n_particles = min(renderer.n_total,
-                                           renderer._subsample_max_per_frame)
-            else:
-                w, q = app_proxy._compute_slot(sl)
-                renderer.update_weights(w, q)
+        if not skip_accum:
+            for i in range(2):
+                sl = _state["_slot"][i]
+                if gpu_ready_now:
+                    # Subsample path: ensure the slot's sorted mass/qty is
+                    # cached for the *current* camera direction (the cache
+                    # key includes a quantized fwd for LOS slots), then
+                    # upload to the slot's per-chunk buffers and render.
+                    sorted_mass, sorted_qty = _ensure_slot_sorted(
+                        i, skip_los_recompute=skip_los_recompute)
+                    slot_id = _slot_sorted[i][0]
+                    slot_chunks = gpu_compute.upload_subsample_slot(
+                        i, slot_id, sorted_mass, sorted_qty)
+                    renderer.set_subsample_slot_chunks(i, slot_chunks)
+                    renderer.set_active_subsample_slot(i)
+                    renderer.n_particles = min(renderer.n_total,
+                                               renderer._subsample_max_per_frame)
+                else:
+                    w, q = app_proxy._compute_slot(sl)
+                    renderer.update_weights(w, q)
 
-            renderer._write_camera_uniforms(camera, fb_w, fb_h)
-            renderer._render_accum(camera, fb_w, fb_h, accum_sets[i],
-                                   encoder=encoder)
-        # Reset active slot so non-composite passes use the default path.
-        renderer.set_active_subsample_slot(None)
+                renderer._write_camera_uniforms(camera, fb_w, fb_h)
+                renderer._render_accum(camera, fb_w, fb_h, accum_sets[i],
+                                       encoder=encoder)
+            # Reset active slot so non-composite passes use the default path.
+            renderer.set_active_subsample_slot(None)
 
         s0, s1 = _state["_slot"][0], _state["_slot"][1]
         renderer.render_composite(
@@ -797,7 +814,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         n_particles_now = renderer.n_particles
         fb_size_now = (fb_w, fb_h)
 
-        frame_dirty = (
+        scene_dirty = (
             dirty
             or moved
             or needs_auto_range
@@ -808,6 +825,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             or n_particles_now != prev_n_particles
             or fb_size_now != prev_fb_size
         )
+        # ui_dirty alone is enough to require a frame, but lets us skip
+        # the (very expensive on big snapshots) accum pass.
+        frame_dirty = scene_dirty or ui_dirty
+        skip_accum_this_frame = ui_dirty and not scene_dirty
 
         if not frame_dirty:
             # Require a few consecutive idle frames before we actually
@@ -855,11 +876,13 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     _render_composite_frame(
                         fb_w, fb_h,
                         encoder=_frame_encoder, screen_view=_frame_screen_view,
-                        skip_los_recompute=translated)
+                        skip_los_recompute=translated,
+                        skip_accum=skip_accum_this_frame)
                 else:
                     renderer.render(
                         camera, fb_w, fb_h,
-                        encoder=_frame_encoder, screen_view=_frame_screen_view)
+                        encoder=_frame_encoder, screen_view=_frame_screen_view,
+                        skip_accum=skip_accum_this_frame)
         except Exception as e:
             print(f"Render error: {e}")
             import traceback; traceback.print_exc()
@@ -995,6 +1018,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         prev_n_particles = n_particles_now
         prev_fb_size = fb_size_now
         dirty = False
+        ui_dirty = False
 
     # Cleanup
     renderer.release()

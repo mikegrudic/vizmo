@@ -696,7 +696,8 @@ class WGPURenderer:
         if owns_encoder:
             dev.queue.submit([encoder.finish()])
 
-    def render(self, camera, width, height, encoder=None, screen_view=None):
+    def render(self, camera, width, height, encoder=None, screen_view=None,
+               skip_accum=False):
         """Render particle splats via additive accumulation + resolve.
 
         If `encoder` is provided, the accum + resolve passes are appended
@@ -704,6 +705,11 @@ class WGPURenderer:
         be supplied (the swapchain texture view to render into). When both
         are None the legacy path is used: this method creates its own
         encoder, acquires the current swapchain texture, and submits.
+
+        `skip_accum=True` reuses the prior frame's accumulation textures
+        (still resident on the GPU) and only re-runs the resolve pass.
+        Used by the main loop on UI-only dirty frames so typing into a
+        text field doesn't trigger an N-particle re-accum.
         """
         self._viewport_width = width
         if self._colormap_tex is None:
@@ -721,9 +727,12 @@ class WGPURenderer:
             current_tex = self.canvas_context.get_current_texture()
             screen_view = current_tex.create_view()
 
-        # Accum pass — appended to the shared encoder.
-        self._render_accum(camera, width, height, self._accum_textures,
-                           encoder=encoder)
+        # Accum pass — appended to the shared encoder. Skipped on
+        # UI-only dirty frames where the prior accum textures are still
+        # valid.
+        if not skip_accum:
+            self._render_accum(camera, width, height, self._accum_textures,
+                               encoder=encoder)
 
         import struct
         resolve_data = struct.pack("ffII", self.qty_min, self.qty_max,
