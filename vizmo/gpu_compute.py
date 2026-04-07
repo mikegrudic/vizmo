@@ -23,7 +23,10 @@ class GPUCompute:
         self._slot_chunks = [None, None]
         self._slot_ids = [None, None]
         self._shuffle_perm = None
-        self._pos_offset = np.zeros(3, dtype=np.float32)
+        # Kept in float64 so the world-origin shift is exact: the
+        # subsequent hi/lo split (pos_hi/pos_lo) only recovers extra
+        # precision if the offset itself isn't already truncated.
+        self._pos_offset = np.zeros(3, dtype=np.float64)
         self._upload_ready = False
         # Legacy alias retained for code paths that touch _particle_bufs.
         self._particle_bufs = {}
@@ -46,9 +49,15 @@ class GPUCompute:
         # vertex-shader matrix multiply when stored as float32. Subtract
         # the bbox center on upload; the renderer subtracts it from the
         # camera position to match.
+        #
+        # The offset itself stays in float64; uploads are stored as a
+        # DSFUN90-style hi/lo pair (pos_hi, pos_lo) that the shader
+        # cancels against the camera's matching hi/lo pair, so neither
+        # the offset nor the per-particle position loses precision in
+        # the cast to f32.
         pmin = np.asarray(pos_src.min(axis=0), dtype=np.float64)
         pmax = np.asarray(pos_src.max(axis=0), dtype=np.float64)
-        self._pos_offset = ((pmin + pmax) * 0.5).astype(np.float32)
+        self._pos_offset = (pmin + pmax) * 0.5
 
         # Pre-shuffle the source arrays so a per-chunk dispatch of K
         # instances draws a uniformly random K-subset of the chunk via
@@ -73,13 +82,30 @@ class GPUCompute:
         self._chunk_bufs = []
         for start in range(0, n, chunk_n):
             cn = min(chunk_n, n - start)
+            # DSFUN90 hi/lo split, computed in f64:
+            #   shifted = pos - offset                       (f64)
+            #   pos_hi  = (f32)shifted                       (f32)
+            #   pos_lo  = (f32)(shifted - (f64)pos_hi)       (f32)
+            # Reconstruction: (f64)pos_hi + (f64)pos_lo == shifted
+            # to ~14 decimal digits.
+            shifted = (np.asarray(pos_src[start:start + cn], dtype=np.float64)
+                       - self._pos_offset)
+            pos_hi_xyz = shifted.astype(np.float32)
+            pos_lo_xyz = (shifted - pos_hi_xyz.astype(np.float64)).astype(np.float32)
+
             pos_buf = dev.create_buffer(
                 size=cn * 16, usage=usage, mapped_at_creation=True)
             pos4 = np.zeros((cn, 4), dtype=np.float32)
-            pos4[:, :3] = pos_src[start:start + cn]
-            pos4[:, :3] -= self._pos_offset
+            pos4[:, :3] = pos_hi_xyz
             pos_buf.write_mapped(pos4.tobytes())
             pos_buf.unmap()
+
+            pos_lo_buf = dev.create_buffer(
+                size=cn * 16, usage=usage, mapped_at_creation=True)
+            pos4_lo = np.zeros((cn, 4), dtype=np.float32)
+            pos4_lo[:, :3] = pos_lo_xyz
+            pos_lo_buf.write_mapped(pos4_lo.tobytes())
+            pos_lo_buf.unmap()
 
             hsml_buf = dev.create_buffer(
                 size=cn * 4, usage=usage, mapped_at_creation=True)
@@ -107,7 +133,7 @@ class GPUCompute:
             index_buf.unmap()
 
             self._chunk_bufs.append({
-                "pos": pos_buf, "hsml": hsml_buf,
+                "pos": pos_buf, "pos_lo": pos_lo_buf, "hsml": hsml_buf,
                 "mass": mass_buf, "qty": qty_buf, "index": index_buf,
                 "n": cn, "start": start,
             })

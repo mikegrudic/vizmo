@@ -7,6 +7,12 @@ struct Camera {
     viewport_size: vec2<f32>,
     kernel_id: u32,
     _pad: u32,
+    // Rotation-only view matrix (translation column zeroed). Used by
+    // the splat_subsample path together with a CPU-computed
+    // camera-relative offset (pos_hi/pos_lo + cam_pos/cam_pos_lo) so the
+    // view*pos multiply never sees the large absolute coordinate that
+    // would otherwise quantize at f32 precision on cosmological scales.
+    view_rot: mat4x4<f32>,
 };
 
 // Quad corners: vertex_index 0..3 maps to (-1,-1), (1,-1), (-1,1), (1,1)

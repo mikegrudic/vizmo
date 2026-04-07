@@ -82,19 +82,21 @@ def vizmo_surface_density(
     renderer.log_scale = 0
     renderer.multigrid_levels = multigrid_levels
 
-    pos32 = positions.astype(np.float32)
+    # Keep positions in f64 so the renderer's hi/lo precision split has
+    # the source precision to work with on huge-box scenes.
+    pos64 = np.asarray(positions, dtype=np.float64)
     hsml32 = hsml.astype(np.float32)
     mass32 = masses.astype(np.float32)
-    renderer.set_particles(pos32, hsml32, mass32)
+    renderer.set_particles(pos64, hsml32, mass32)
 
     gpu_compute = GPUCompute(device)
-    gpu_compute.upload_subsample_only(pos32, hsml32, mass32, mass32)
+    gpu_compute.upload_subsample_only(pos64, hsml32, mass32, mass32)
     renderer.set_subsample_chunks(gpu_compute.get_chunk_bufs(), world_offset=gpu_compute.get_pos_offset())
     # Render every particle once: cap = N, so eff_stride = 1 and h_scale = 1.
-    renderer.set_subsample_max_per_frame(len(pos32) + 1)
+    renderer.set_subsample_max_per_frame(len(pos64) + 1)
 
     camera = Camera(fov=fov, aspect=1.0)
-    camera.position = np.array([center[0], center[1], center[2] + camera_distance], dtype=np.float32)
+    camera.position = np.array([center[0], center[1], center[2] + camera_distance], dtype=np.float64)
     camera._forward = np.array([0, 0, -1], dtype=np.float32)
     camera._up = np.array([0, 1, 0], dtype=np.float32)
     camera._dirty = True
@@ -193,6 +195,63 @@ def test_surface_density_perspective(particle_data, multigrid_levels):
 
     assert correlation > 0.99, f"Log surface density correlation too low: {correlation:.3f}"
     assert median_log_ratio < 0.1, f"Median |log10(sinkvis/vizmo)| = {median_log_ratio:.3f}, " "expected < 0.1 dex"
+
+
+def test_surface_density_perspective_huge_offset(particle_data):
+    """Same as test_surface_density_perspective, but the unit-cube
+    scene is translated to live near (1e9, 1e9, 1e9). The footprint
+    (box size, hsml, camera distance) is unchanged, so per-pixel sigma
+    stays in the same range (no rgba16float underflow), but the
+    *absolute* coordinates are far enough out that f32 has only ~2
+    world-unit precision and any code path that truncates a position
+    or the world-origin offset to f32 will quantize particles into a
+    handful of grid points.
+
+    Without the DSFUN90 hi/lo split (or with a float32 _world_offset),
+    every particle collapses to ~1 of a few f32 cells and the rendered
+    map no longer matches the SinkVis reference. With the fix the
+    rendered map is bit-equivalent (within f32 splat precision) to
+    the unit-cube case.
+    """
+    positions, masses, hsml, boxsize = particle_data
+    OFFSET = 1e9
+    positions = positions + OFFSET
+    center = np.array([0.5, 0.5, 0.5]) + OFFSET
+    camera_distance = 1.0
+    res = 128
+    fov = 90
+
+    sigma_sinkvis = sinkvis_surface_density(
+        positions.copy(), masses.copy(), hsml.copy(),
+        center, camera_distance, res=res, fov=fov,
+    )
+    sigma_vizmo = vizmo_surface_density(
+        positions.copy(), masses.copy(), hsml.copy(),
+        center, camera_distance,
+        boxsize=boxsize, res=res, fov=fov, multigrid_levels=1,
+    )
+
+    pixel_area = (2 * fov / 90.0 / res) ** 2
+    total_sinkvis = sigma_sinkvis.sum() * pixel_area
+    total_vizmo = sigma_vizmo.sum() * pixel_area
+    assert total_vizmo > 0, "vizmo produced an empty map"
+    assert total_sinkvis > 0, "SinkVis produced an empty map"
+    mass_ratio = total_vizmo / total_sinkvis
+    assert 0.9 < mass_ratio < 1.1, (
+        f"Total mass mismatch: vizmo={total_vizmo:.4g}, "
+        f"sinkvis={total_sinkvis:.4g}, ratio={mass_ratio:.3f}"
+    )
+
+    mask = (sigma_sinkvis > 0) & (sigma_vizmo > 0)
+    assert mask.sum() > res * res * 0.5, "Too few overlapping pixels with signal"
+    log_sv = np.log10(sigma_sinkvis[mask])
+    log_df = np.log10(sigma_vizmo[mask])
+    correlation = np.corrcoef(log_sv, log_df)[0, 1]
+    median_log_ratio = np.median(np.abs(log_sv - log_df))
+    assert correlation > 0.99, f"Log surface density correlation too low: {correlation:.3f}"
+    assert median_log_ratio < 0.1, (
+        f"Median |log10(sinkvis/vizmo)| = {median_log_ratio:.3f}, expected < 0.1 dex"
+    )
 
 
 def _save_comparison(sigma_sv, sigma_df, correlation, median_log_ratio, mass_ratio):

@@ -204,8 +204,10 @@ class WGPURenderer:
         self._cascade_shader = dev.create_shader_module(code=_load_wgsl("cascade.wgsl"))
         self._mg_bin_shader = dev.create_shader_module(code=_load_wgsl("multigrid_bin.wgsl"))
 
-        # Camera uniform: view + proj + viewport + kernel_id + pad = 144 B
-        self._camera_buf = dev.create_buffer(size=144, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+        # Camera uniform: view + proj + viewport + kernel_id + pad
+        # + view_rot (rotation-only view matrix used by the
+        # precision-preserving splat path) = 208 B
+        self._camera_buf = dev.create_buffer(size=208, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
         # Resolve params (qty_min, qty_max, mode, log_scale)
         self._resolve_params_buf = dev.create_buffer(
             size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
@@ -225,8 +227,8 @@ class WGPURenderer:
                 {"binding": 1, "visibility": V, "buffer": {"type": "uniform"}},
             ]
         )
-        # bg1: pos / hsml / mass / qty / index / bases per chunk
-        self._splat_bgl1 = _storage_bgl(dev, 6, V)
+        # bg1: pos / hsml / mass / qty / index / bases / pos_lo per chunk
+        self._splat_bgl1 = _storage_bgl(dev, 7, V)
 
         self._splat_subsample_layout = dev.create_pipeline_layout(
             bind_group_layouts=[self._splat_subsample_bgl0, self._splat_bgl1]
@@ -530,7 +532,10 @@ class WGPURenderer:
         performed by GPUCompute.upload_subsample_only on the first
         canvas tick.
         """
-        self._all_pos = positions.astype(np.float32)
+        # Stored as float64 so the GPU upload path (which builds the
+        # DSFUN90 hi/lo position split) starts from full source
+        # precision rather than a pre-truncated f32 copy.
+        self._all_pos = np.asarray(positions, dtype=np.float64)
         self._all_hsml = hsml.astype(np.float32)
         self._all_mass = masses.astype(np.float32)
         if quantity is None:
@@ -567,7 +572,9 @@ class WGPURenderer:
             self._slot_subsample_bgs = [None, None]
             self._active_subsample_slot = None
             return
-        self._world_offset = np.asarray(world_offset, dtype=np.float32) if world_offset is not None else None
+        # Keep the offset in float64: the splat path's hi/lo precision
+        # split is undermined if the offset itself is truncated to f32.
+        self._world_offset = np.asarray(world_offset, dtype=np.float64) if world_offset is not None else None
         # Reset slot bindings whenever the base chunks change.
         self._slot_subsample_bgs = [None, None]
         self._active_subsample_slot = None
@@ -581,7 +588,8 @@ class WGPURenderer:
             params_bufs = []
             bg0s = []
             for _ in range(n_levels):
-                pb = dev.create_buffer(size=112, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+                # 128 B = 112 prior + 16 for cam_pos_lo (vec3 + pad).
+                pb = dev.create_buffer(size=128, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
                 params_bufs.append(pb)
                 bg0s.append(_make_bind_group(dev, self._splat_subsample_bgl0, [self._camera_buf, pb]))
             # Per-chunk multigrid binning state. Sized for MAX_LEVELS=16.
@@ -597,7 +605,8 @@ class WGPURenderer:
                 usage=(wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.INDIRECT | wgpu.BufferUsage.COPY_DST),
             )
             bg1 = _make_bind_group(
-                dev, self._splat_bgl1, [cb["pos"], cb["hsml"], cb["mass"], cb["qty"], cb["index"], bases_buf]
+                dev, self._splat_bgl1,
+                [cb["pos"], cb["hsml"], cb["mass"], cb["qty"], cb["index"], bases_buf, cb["pos_lo"]],
             )
             mg_bg = dev.create_bind_group(
                 layout=self._mg_bin_bgl,
@@ -619,6 +628,7 @@ class WGPURenderer:
                     "params_buf": params_bufs[0],
                     "params_bufs": params_bufs,
                     "pos": cb["pos"],
+                    "pos_lo": cb["pos_lo"],
                     "hsml": cb["hsml"],
                     "index": cb["index"],
                     "n": int(cb["n"]),
@@ -690,7 +700,7 @@ class WGPURenderer:
             bg = _make_bind_group(
                 self.device,
                 self._splat_bgl1,
-                [ck["pos"], ck["hsml"], sc["mass"], sc["qty"], ck["index"], ck["bases_buf"]],
+                [ck["pos"], ck["hsml"], sc["mass"], sc["qty"], ck["index"], ck["bases_buf"], ck["pos_lo"]],
             )
             bgs.append(bg)
         self._slot_subsample_bgs[slot_idx] = bgs
@@ -730,17 +740,23 @@ class WGPURenderer:
         h_scale = (ratio ** (1.0 / 3.0)) * float(self.hsml_scale)
         mass_scale = ratio  # each sampled particle stands in for `stride`
         fov_rad = float(np.radians(camera.fov))
-        # Apply the same world-origin shift as the view matrix.
+        # Apply the same world-origin shift as the view matrix, in
+        # f64, then split into a DSFUN90 hi/lo pair so the shader's
+        # `(pos_hi - cam_hi) + (pos_lo - cam_lo)` cancellation reaches
+        # ~14 digits of precision. Without the lo term, sub-f32-ULP
+        # camera moves vanish in the cast and the camera snaps to the
+        # same ~1e-7 * box_extent grid as the particles.
         offset = getattr(self, "_world_offset", None)
+        cam_pos_f64 = np.asarray(camera.position, dtype=np.float64)
         if offset is not None:
-            cam_pos = camera.position - offset
-        else:
-            cam_pos = camera.position
+            cam_pos_f64 = cam_pos_f64 - np.asarray(offset, dtype=np.float64)
+        cam_hi = cam_pos_f64.astype(np.float32)
+        cam_lo = (cam_pos_f64 - cam_hi.astype(np.float64)).astype(np.float32)
         cam_bytes = _struct.pack(
-            "fff f fff f fff f fff f",
-            float(cam_pos[0]),
-            float(cam_pos[1]),
-            float(cam_pos[2]),
+            "fff f fff f fff f fff f fff f",
+            float(cam_hi[0]),
+            float(cam_hi[1]),
+            float(cam_hi[2]),
             0.0,
             float(camera.forward[0]),
             float(camera.forward[1]),
@@ -753,6 +769,10 @@ class WGPURenderer:
             float(camera.up[0]),
             float(camera.up[1]),
             float(camera.up[2]),
+            0.0,
+            float(cam_lo[0]),
+            float(cam_lo[1]),
+            float(cam_lo[2]),
             0.0,
         )
         n_levels = int(getattr(self, "_subsample_n_levels", 1))
@@ -1180,22 +1200,33 @@ class WGPURenderer:
         offset = getattr(self, "_world_offset", None)
         if offset is not None:
             saved = camera.position
-            camera.position = saved - offset
+            camera.position = saved - np.asarray(offset, dtype=np.float64)
             try:
-                view = np.ascontiguousarray(camera.view_matrix().T, dtype=np.float32)
+                view_raw = camera.view_matrix()
             finally:
                 camera.position = saved
         else:
-            view = np.ascontiguousarray(camera.view_matrix().T, dtype=np.float32)
+            view_raw = camera.view_matrix()
+        view = np.ascontiguousarray(view_raw.T, dtype=np.float32)
+        # Rotation-only view matrix: the splat_subsample path feeds it
+        # a precision-preserving camera-relative offset (rel) instead of
+        # the absolute position, so the translation column must be
+        # zeroed. Built from the original (un-shifted) view matrix
+        # because rotation is independent of camera position.
+        view_rot_raw = camera.view_matrix().copy()
+        view_rot_raw[:3, 3] = 0.0  # zero translation column (column-major source)
+        view_rot = np.ascontiguousarray(view_rot_raw.T, dtype=np.float32)
         proj = np.ascontiguousarray(camera.projection_matrix().T, dtype=np.float32)
 
         kernel_id = self.KERNELS.index(self.kernel) if self.kernel in self.KERNELS else 0
 
-        data = np.zeros(36, dtype=np.float32)  # 144 bytes / 4
+        data = np.zeros(52, dtype=np.float32)  # 208 bytes / 4
         data[0:16] = view.ravel()
         data[16:32] = proj.ravel()
         data[32] = float(width)
         data[33] = float(height)
+        # view_rot at byte offset 144 → float index 36
+        data[36:52] = view_rot.ravel()
         # kernel_id and pad as uint32
         data_bytes = bytearray(data.tobytes())
         # Write kernel_id at offset 136 (byte 34*4=136)
