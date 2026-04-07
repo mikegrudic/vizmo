@@ -61,6 +61,7 @@ def main():
             fov=args.fov,
             fullscreen=args.fullscreen,
             screenshot=args.screenshot,
+            no_stars=args.no_stars,
         )
 
 
