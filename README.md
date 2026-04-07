@@ -2,7 +2,7 @@
 
 Real-time 3D fly-through explorer for unstructured simulation data. Loads HDF5 snapshots from GIZMO/Gadget simulations and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite CoolMap visualizations on the GPU via WebGPU.
 
-This is a **vibecoded** app. I have no idea how its front- or backends work, and am not sure if I could get it running for your 10 years from now! But I hope you enjoy it and please feel free to report bugs or request features.
+This is a **vibecoded** app. I have no idea how its front- or backends work, and am not sure if I could get it running for your 10 years from now! But it would not exist otherwise. Software is weird now. It is what it is. But I hope you enjoy it and please feel free to report bugs or request features.
 
 ## Installation
 
