@@ -234,7 +234,16 @@ class WGPURenderer:
         self._star_bgl0 = dev.create_bind_group_layout(entries=[
             {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
             {"binding": 1, "visibility": VF, "buffer": {"type": "uniform"}},
+            {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT,
+             "texture": {"sample_type": "float", "view_dimension": "2d-array"}},
+            {"binding": 3, "visibility": wgpu.ShaderStage.FRAGMENT,
+             "sampler": {"type": "filtering"}},
         ])
+        # Load baked UBVRI PSFs (5 layers × 162×162) and upload as a
+        # texture_2d_array. Falls back to a single-layer Gaussian if the
+        # asset is missing.
+        self._star_psf_tex, self._star_psf_view, self._star_psf_sampler = \
+            self._load_star_psf_texture()
         self._star_bgl1 = _storage_bgl(dev, 1, V)
         star_layout = dev.create_pipeline_layout(
             bind_group_layouts=[self._star_bgl0, self._star_bgl1])
@@ -256,8 +265,8 @@ class WGPURenderer:
         self._star_buf_dirty = True
 
         # Tunables — wired into the dev panel later.
-        self.star_pixel_radius = 6.0
-        self.star_intensity = 1.0
+        self.star_pixel_radius = 40.0
+        self.star_intensity = 20.0
         # UBVRI dust opacities (cm^2/g, MRN-style averages). Σ in
         # Msun/pc^2 → multiply by 2.0834e-4 to get code-unit κ such
         # that τ = κ_code * Σ.
@@ -269,19 +278,31 @@ class WGPURenderer:
             ("R", 140.0 * _S2C),
             ("I", 100.0 * _S2C),
         ]
+        # Index 5 is reserved for the RGB composite mode (I→R, V→G, B→B
+        # mapping — standard astronomy false-color recipe).
+        self.STAR_RGB_BANDS = (4, 2, 1)  # PSF/κ layer indices for (R, G, B)
         self.star_band_idx = 2  # default V
         self.star_extinction_kappa = self.STAR_BANDS[self.star_band_idx][1]
         self.star_extinction_enabled = True
+        # World-units distance at which a unit-luminosity star reaches
+        # its nominal screen brightness. Brightness scales as 1/d²,
+        # so halving the camera-to-star distance quadruples flux.
+        self.star_dist_ref = 1.0
+
+    N_STAR_MODES = 6  # 5 single-band + 1 RGB composite
 
     @property
     def star_band(self):
+        if self.star_band_idx >= len(self.STAR_BANDS):
+            return "RGB"
         return self.STAR_BANDS[self.star_band_idx][0]
 
     def cycle_star_band(self, step=1):
-        self.star_band_idx = (self.star_band_idx + step) % len(self.STAR_BANDS)
-        self.star_extinction_kappa = self.STAR_BANDS[self.star_band_idx][1]
+        self.star_band_idx = (self.star_band_idx + step) % self.N_STAR_MODES
+        if self.star_band_idx < len(self.STAR_BANDS):
+            self.star_extinction_kappa = self.STAR_BANDS[self.star_band_idx][1]
         self._star_buf_dirty = True
-        print(f"  [stars] band={self.star_band}  κ={self.star_extinction_kappa:.4g}")
+        print(f"  [stars] band={self.star_band}")
 
     def toggle_star_extinction(self):
         self.star_extinction_enabled = not self.star_extinction_enabled
@@ -637,58 +658,56 @@ class WGPURenderer:
         else:
             sightline = sightline / n
 
-        from scipy.spatial import KDTree
+        # Deterministic orthonormal basis with -sightline as +z. The
+        # original CrunchSnaps routine drew sx from np.random.normal,
+        # which made every recompute use a fresh 2D projection — the
+        # main source of column-density flicker as the camera moved.
+        # Here sx is derived from the world up axis (or world x axis
+        # when the sightline is nearly aligned with up).
+        z_axis = -sightline
+        up = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(z_axis, up)) > 0.9:
+            up = np.array([1.0, 0.0, 0.0])
+        sx = up - np.dot(up, z_axis) * z_axis
+        sx /= np.linalg.norm(sx)
+        sy = np.cross(z_axis, sx)
+        basis = np.c_[sx, sy, z_axis].T  # rows are basis vectors
 
         xstar = self._star_positions
         xgas = self._ext_xgas
         mgas = self._ext_mgas
-        hgas = self._ext_hgas
+        hgas2 = self._ext_hgas * self._ext_hgas
 
-        if not np.allclose(sightline, np.array([0.0, 0.0, -1.0])):
-            # Build an orthonormal basis with -sightline as +z.
-            sx = np.random.normal(size=(3,))
-            sx -= np.inner(sx, -sightline) * sightline
-            sx /= np.linalg.norm(sx)
-            sy = np.cross(-sightline, sx)
-            basis = np.c_[sx, sy, -sightline].T
-            xstar_b = xstar @ basis
-            xgas_b = xgas @ basis
-        else:
-            xstar_b = xstar
-            xgas_b = xgas
+        xstar_b = xstar @ basis
+        xgas_b = xgas @ basis
 
-        star_tree = KDTree(xstar_b[:, :2])
-        gas_ngb_dist, gas_ngb = star_tree.query(xgas_b[:, :2], workers=-1)
-        overlapping = (gas_ngb_dist < hgas) & (xstar_b[gas_ngb, 2] < xgas_b[:, 2])
-
-        xgas_o = xgas_b[overlapping]
-        mgas_o = mgas[overlapping]
-        hgas_o = hgas[overlapping]
-
-        ngb = star_tree.query_ball_point(xgas_o[:, :2], hgas_o, workers=-1)
-
-        columns = np.zeros(xstar_b.shape[0], dtype=np.float64)
-        for i, nbrs in enumerate(ngb):
-            if nbrs:
-                columns[nbrs] += mgas_o[i] / (np.pi * hgas_o[i] * hgas_o[i])
+        # Vectorized brute force: for each (small N) star, accumulate
+        # the smooth-kernel contribution from every gas particle.
+        # W(b/h) = (3/(π h²)) (1-q²)² with q = b/h, vanishes at q=1.
+        xs = xstar_b[:, 0:2]
+        zs = xstar_b[:, 2]
+        xg = xgas_b[:, 0:2]
+        zg = xgas_b[:, 2]
+        inv_pi = 1.0 / np.pi
+        n_stars = xstar_b.shape[0]
+        columns = np.zeros(n_stars, dtype=np.float64)
+        for s in range(n_stars):
+            dx = xg[:, 0] - xs[s, 0]
+            dy = xg[:, 1] - xs[s, 1]
+            b2 = dx * dx + dy * dy
+            mask = (b2 < hgas2) & (zs[s] < zg)
+            if not np.any(mask):
+                continue
+            b2m = b2[mask]
+            h2m = hgas2[mask]
+            q2 = b2m / h2m
+            w = 1.0 - q2
+            w = w * w  # (1-q²)²
+            columns[s] = np.sum(mgas[mask] * (3.0 * inv_pi / h2m) * w)
 
         self._star_columns = columns.astype(np.float32)
         self._star_columns_cam_pos = cam_pos.copy()
 
-        # Debug: report column-density stats and the resulting attenuation
-        # so we can sanity-check star_extinction_kappa for this snapshot.
-        c = self._star_columns
-        tau = self.star_extinction_kappa * c
-        atten = np.exp(-tau)
-        L = self._star_luminosity if self._star_luminosity is not None else self._star_masses
-        Latt = L.astype(np.float64) * atten
-        print(
-            f"  [stars] Σ: min={c.min():.3g} mean={c.mean():.3g} max={c.max():.3g}  "
-            f"τ: min={tau.min():.3g} mean={tau.mean():.3g} max={tau.max():.3g}  "
-            f"exp(-τ): min={atten.min():.3g} mean={atten.mean():.3g} max={atten.max():.3g}  "
-            f"L: min={L.min():.3g} mean={L.mean():.3g} max={L.max():.3g}  "
-            f"L·exp(-τ): min={Latt.min():.3g} mean={Latt.mean():.3g} max={Latt.max():.3g}"
-        )
 
     # ---- Accumulation textures ----
 
@@ -765,6 +784,51 @@ class WGPURenderer:
 
     # ---- Render passes ----
 
+    def _load_star_psf_texture(self):
+        """Load the baked UBVRI PSF stack into a 2D texture array.
+
+        Asset: dataflyer/assets/star_psf_ubvri.npy, shape (5, H, W) float32.
+        Falls back to a single-layer 2D Gaussian if the asset is missing.
+        """
+        dev = self.device
+        asset = Path(__file__).parent / "assets" / "star_psf_ubvri.npy"
+        if asset.exists():
+            psf = np.load(asset).astype(np.float32)  # (5, H, W)
+        else:
+            print(f"  [stars] PSF asset not found at {asset}; using Gaussian fallback")
+            H = 64
+            yy, xx = np.mgrid[-1:1:H*1j, -1:1:H*1j]
+            g = np.exp(-8.0 * (xx*xx + yy*yy)).astype(np.float32)
+            g /= g.sum()
+            psf = np.stack([g] * 5)
+        n_layers, H, W = psf.shape
+        # Per-layer normalization to peak=1 so star brightness is set
+        # by the shader's intensity*flux factor, not by the PSF energy.
+        peaks = psf.reshape(n_layers, -1).max(axis=1).reshape(n_layers, 1, 1)
+        psf = psf / np.where(peaks > 0, peaks, 1.0)
+
+        # r16float is universally filterable; r32float requires the
+        # float32-filterable feature (not present on this backend).
+        psf16 = psf.astype(np.float16)
+        tex = dev.create_texture(
+            size=(W, H, n_layers),
+            format="r16float",
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            dimension="2d",
+        )
+        dev.queue.write_texture(
+            {"texture": tex, "mip_level": 0, "origin": (0, 0, 0)},
+            psf16.tobytes(),
+            {"offset": 0, "bytes_per_row": W * 2, "rows_per_image": H},
+            (W, H, n_layers),
+        )
+        view = tex.create_view(dimension="2d-array")
+        sampler = dev.create_sampler(
+            mag_filter="linear", min_filter="linear",
+            address_mode_u="clamp-to-edge", address_mode_v="clamp-to-edge",
+        )
+        return tex, view, sampler
+
     def _ensure_star_buffer(self):
         """(Re)build the per-star storage buffer holding (xyz, attenuated L)."""
         n = getattr(self, "n_stars", 0)
@@ -784,23 +848,39 @@ class WGPURenderer:
             None if offset is None else np.asarray(offset, dtype=np.float64).copy()
         )
 
-        lum = self._star_luminosity.astype(np.float32, copy=True)
+        L0 = self._star_luminosity.astype(np.float32, copy=False)
         cols = getattr(self, "_star_columns", None)
-        if self.star_extinction_enabled and cols is not None and len(cols) == n:
-            tau = self.star_extinction_kappa * cols
-            lum *= np.exp(-tau).astype(np.float32)
-
-        data = np.empty((n, 4), dtype=np.float32)
-        data[:, 0:3] = pos.astype(np.float32)
-        data[:, 3] = lum
-
-        # One-shot diagnostic so we can verify positions/luminosity.
-        sample = data[0]
-        print(
-            f"  [stars] rebuild n={n} offset={offset} "
-            f"sample_pos={sample[0]:.3g},{sample[1]:.3g},{sample[2]:.3g} "
-            f"L_uploaded[min/mean/max]={lum.min():.3g}/{lum.mean():.3g}/{lum.max():.3g}"
+        have_ext = (
+            self.star_extinction_enabled
+            and cols is not None
+            and len(cols) == n
         )
+
+        # Single-band channel: uses the *currently selected* band's κ
+        # (or no extinction if disabled or in RGB mode where the single
+        # value is just the bolometric L for fallback display).
+        lum_single = L0.copy()
+        if have_ext and self.star_band_idx < len(self.STAR_BANDS):
+            tau = self.star_extinction_kappa * cols
+            lum_single = lum_single * np.exp(-tau).astype(np.float32)
+
+        # RGB triple: always computed using the fixed (I, V, B) → (R, G, B)
+        # mapping so cycling into composite mode is instantaneous.
+        rgb = np.empty((n, 3), dtype=np.float32)
+        for ch, layer in enumerate(self.STAR_RGB_BANDS):
+            kappa_ch = self.STAR_BANDS[layer][1]
+            l = L0.copy()
+            if have_ext:
+                l = l * np.exp(-kappa_ch * cols).astype(np.float32)
+            rgb[:, ch] = l
+
+        # Layout: two vec4 per star.
+        # vec4[0] = (x, y, z, lum_single)
+        # vec4[1] = (lum_R, lum_G, lum_B, 0)
+        data = np.zeros((n, 8), dtype=np.float32)
+        data[:, 0:3] = pos.astype(np.float32)
+        data[:, 3] = lum_single
+        data[:, 4:7] = rgb
 
         nbytes = data.nbytes
         if self._star_buf is None or self._star_buf.size < nbytes:
@@ -821,6 +901,8 @@ class WGPURenderer:
                 entries=[
                     {"binding": 0, "resource": {"buffer": self._camera_buf}},
                     {"binding": 1, "resource": {"buffer": self._star_params_buf}},
+                    {"binding": 2, "resource": self._star_psf_view},
+                    {"binding": 3, "resource": self._star_psf_sampler},
                 ],
             )
         self._star_buf_dirty = False
@@ -866,7 +948,8 @@ class WGPURenderer:
             "ffff",
             float(self.star_pixel_radius),
             float(self.star_intensity),
-            0.0, 0.0,
+            float(self.star_band_idx),
+            float(self.star_dist_ref),
         )
         self.device.queue.write_buffer(self._star_params_buf, 0, params)
 
