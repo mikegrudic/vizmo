@@ -6,7 +6,11 @@ import glfw
 
 class Camera:
     def __init__(self, position=None, fov=90.0, aspect=16 / 9, near=1e-6, far=1e6):
-        self.position = np.array(position if position is not None else [0, 0, 0], dtype=np.float32)
+        # Stored as float64 so sub-f32-ULP movement at large absolute
+        # coordinates (cosmological scenes) isn't quantized at the
+        # source. The renderer's splat path packs this into a hi/lo
+        # f32 pair before sending to the GPU.
+        self.position = np.array(position if position is not None else [0, 0, 0], dtype=np.float64)
         self.fov = fov
         self.aspect = aspect
         self.near = near
@@ -99,7 +103,7 @@ class Camera:
         # Don't reset _moving here -- mouse rotation sets it during poll_events()
         moved = self._moving
         self._moving = False
-        velocity = np.zeros(3, dtype=np.float32)
+        velocity = np.zeros(3, dtype=np.float64)
 
         if glfw.KEY_W in self._keys:
             velocity += self.forward
@@ -204,7 +208,7 @@ class Camera:
             sub_w = np.asarray(masses[::step], dtype=np.float64)
         else:
             sub_w = np.ones(len(sub_pos), dtype=np.float64)
-        center = np.empty(3, dtype=np.float32)
+        center = np.empty(3, dtype=np.float64)
         for axis in range(3):
             order = np.argsort(sub_pos[:, axis])
             cw = np.cumsum(sub_w[order])
@@ -213,7 +217,7 @@ class Camera:
             center[axis] = float(sub_pos[order[idx], axis])
 
         # Start at top of data looking down -z
-        self.position = np.array([center[0], center[1], pmax[2]], dtype=np.float32)
+        self.position = np.array([center[0], center[1], pmax[2]], dtype=np.float64)
         self._forward = np.array([0, 0, -1], dtype=np.float32)
         self._up = np.array([0, 1, 0], dtype=np.float32)
         self._dirty = True
