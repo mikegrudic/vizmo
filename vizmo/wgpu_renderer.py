@@ -844,38 +844,52 @@ class WGPURenderer:
         columns = np.zeros(n_stars, dtype=np.float64)
 
         # Per-star line-of-sight integration. Each star uses its own
-        # ray (star → camera); a parallel projection along a single
-        # direction would rotate all gas positions in lockstep as the
-        # camera moves and produce correlated brightness flicker.
-        #
-        # For each gas particle g, compute its impact parameter b
-        # against the ray and the along-ray coordinate t:
-        #     r       = g − star
-        #     t       = r · ray_dir         (positive = toward camera)
+        # ray (star → camera). For each gas particle g and star s:
+        #     r       = g − star_s
+        #     t       = r · ray_dir_s        (positive = toward camera)
         #     b²      = |r|² − t²            (perpendicular to ray)
-        # The particle contributes when:
-        #     0 < t < |star − camera|       (lies between star and obs)
-        #     b < h_g                       (impact parameter inside h)
-        # using the smooth W(q) = (3/(π h²)) (1-q²)² deposit.
-        for s in range(n_stars):
-            ray = cam_pos - xstar[s]
-            d_obs = float(np.linalg.norm(ray))
-            if d_obs == 0.0:
+        # Particle contributes when 0 < t < |star−cam| and b < h_g,
+        # with smooth W(q) = (3/(π h²)) (1−q²)² deposit.
+        #
+        # Vectorized over chunks of stars to bound memory:
+        # peak intermediate is (chunk × n_gas) float64.
+        n_gas = xgas.shape[0]
+        # ~256 MB cap for the (chunk, n_gas) scratch arrays.
+        chunk = max(1, int(32 * 1024 * 1024 / max(n_gas, 1)))
+        for s0 in range(0, n_stars, chunk):
+            s1 = min(s0 + chunk, n_stars)
+            xs = xstar[s0:s1]                        # (C, 3)
+            ray = cam_pos[None, :] - xs              # (C, 3)
+            d_obs = np.linalg.norm(ray, axis=1)      # (C,)
+            safe = d_obs > 0.0
+            if not np.any(safe):
                 continue
-            ray_dir = ray / d_obs
-            r = xgas - xstar[s]  # (n_gas, 3)
-            t = r @ ray_dir  # (n_gas,)
-            r2 = np.einsum("ij,ij->i", r, r)  # |r|²
+            ray_dir = np.zeros_like(ray)
+            ray_dir[safe] = ray[safe] / d_obs[safe, None]
+
+            # r[c, g, :] = xgas[g] - xs[c]
+            # t[c, g] = r · ray_dir[c]
+            # |r|² = |xgas|² - 2 xgas·xs + |xs|²
+            xs_dot_xs = np.einsum("ij,ij->i", xs, xs)             # (C,)
+            xg_dot_xg = np.einsum("ij,ij->i", xgas, xgas)         # (n_gas,)
+            xg_dot_xs = xgas @ xs.T                                # (n_gas, C)
+            r2 = (xg_dot_xg[:, None] - 2.0 * xg_dot_xs + xs_dot_xs[None, :]).T  # (C, n_gas)
+
+            # t = (xgas - xs) · ray_dir = xgas·ray_dir - xs·ray_dir
+            xs_dot_dir = np.einsum("ij,ij->i", xs, ray_dir)        # (C,)
+            xg_dot_dir = xgas @ ray_dir.T                           # (n_gas, C)
+            t = (xg_dot_dir - xs_dot_dir[None, :]).T                # (C, n_gas)
+
             b2 = np.maximum(r2 - t * t, 0.0)
-            mask = (t > 0.0) & (t < d_obs) & (b2 < hgas2)
+            mask = (t > 0.0) & (t < d_obs[:, None]) & (b2 < hgas2[None, :])
+            mask &= safe[:, None]
             if not np.any(mask):
                 continue
-            b2m = b2[mask]
-            h2m = hgas2[mask]
-            q2 = b2m / h2m
+            q2 = np.where(mask, b2 / hgas2[None, :], 0.0)
             w = 1.0 - q2
-            w = w * w  # (1-q²)²
-            columns[s] = np.sum(mgas[mask] * (3.0 * inv_pi / h2m) * w)
+            w = w * w
+            contrib = np.where(mask, mgas[None, :] * (3.0 * inv_pi / hgas2[None, :]) * w, 0.0)
+            columns[s0:s1] = contrib.sum(axis=1)
 
         self._star_columns = columns.astype(np.float32)
         self._star_columns_cam_pos = cam_pos.copy()

@@ -17,6 +17,7 @@ def main():
         help="Render one frame to OUT (PNG) after GPU init " "+ auto-range complete, then exit",
     )
     parser.add_argument("--fullscreen", action="store_true", help="Run in fullscreen mode at specified resolution")
+    parser.add_argument("--no-stars", action="store_true", help="Disable star particle rendering")
     parser.add_argument(
         "--profile",
         type=str,
@@ -42,6 +43,7 @@ def main():
                 fov=args.fov,
                 fullscreen=args.fullscreen,
                 screenshot=args.screenshot,
+                no_stars=args.no_stars,
             )
         finally:
             pr.disable()

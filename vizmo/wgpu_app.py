@@ -25,7 +25,7 @@ from .field_ops import (
 )
 
 
-def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=False, screenshot=None):
+def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=False, screenshot=None, no_stars=False):
     """Run the vizmo application with the wgpu backend.
 
     If `screenshot` is set to a path, the canvas loop runs just long
@@ -150,6 +150,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
     _slot = _s["slot"]
 
     # Stars
+    if no_stars:
+        data.n_stars = 0
     if data.n_stars > 0:
         renderer.upload_stars(data.star_positions, data.star_masses, luminosity=getattr(data, "star_luminosity", None))
         if data.n_particles > 0:
