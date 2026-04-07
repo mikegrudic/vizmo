@@ -56,7 +56,7 @@ class SnapshotData:
             # only recovers detail that was present at upload time, so
             # truncating here would re-introduce the box-extent ULP
             # quantization on cosmological-scale snapshots.
-            self.positions = self._read_field("PartType0", "Coordinates").astype(np.float64)
+            self.positions = self._read_field("PartType0", "Coordinates")
             self.masses = self._read_field("PartType0", "Masses").astype(np.float32)
             self.hsml = self._read_field("PartType0", "KernelMaxRadius").astype(np.float32)
             self.n_particles = len(self.masses)
@@ -114,8 +114,11 @@ class SnapshotData:
 
         # Cache as float32 so subsequent get_field/get_vector_field calls
         # don't have to re-cast (Velocities is ~1.5 GB at float32 — doing
-        # it twice doubles the cost of every reweight).
-        if data.dtype != np.float32:
+        # it twice doubles the cost of every reweight). Coordinates are
+        # the exception: the splat path's hi/lo precision split needs
+        # full source precision to avoid quantizing particle positions
+        # at the box-extent f32 ULP.
+        if field != "Coordinates" and data.dtype != np.float32:
             data = data.astype(np.float32)
 
         self._cache[key] = data
