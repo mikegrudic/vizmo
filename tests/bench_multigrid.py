@@ -15,10 +15,10 @@ import numpy as np
 import wgpu
 from meshoid import Meshoid
 
-from dataflyer.camera import Camera
-from dataflyer.colormaps import colormap_to_texture_data
-from dataflyer.gpu_compute import GPUCompute
-from dataflyer.wgpu_renderer import WGPURenderer
+from vizmo.camera import Camera
+from vizmo.colormaps import colormap_to_texture_data
+from vizmo.gpu_compute import GPUCompute
+from vizmo.wgpu_renderer import WGPURenderer
 
 
 def make_particles(n, seed=0):
@@ -77,17 +77,17 @@ def main():
     p.add_argument("--n", type=int, default=2_000_000)
     p.add_argument("--res", type=int, default=1024)
     p.add_argument("--frames", type=int, default=20)
-    p.add_argument("--multigrid", type=int, default=1,
-                   help="number of multigrid levels (1 = disabled)")
-    p.add_argument("--hsml-scale", type=float, default=1.0,
-                   help="multiplier on smoothing length (drives fragment cost)")
+    p.add_argument("--multigrid", type=int, default=1, help="number of multigrid levels (1 = disabled)")
+    p.add_argument(
+        "--hsml-scale", type=float, default=1.0, help="multiplier on smoothing length (drives fragment cost)"
+    )
     args = p.parse_args()
 
     print(f"benchmark: N={args.n} res={args.res} multigrid_levels={args.multigrid}")
     pos, mass, hsml = make_particles(args.n)
-    device, r, cam = setup_renderer(pos, mass, hsml, args.res,
-                                    multigrid_levels=args.multigrid,
-                                    hsml_scale=args.hsml_scale)
+    device, r, cam = setup_renderer(
+        pos, mass, hsml, args.res, multigrid_levels=args.multigrid, hsml_scale=args.hsml_scale
+    )
 
     print(f"{'cap':>10} {'stride':>8} {'ms/frame':>12}")
     for cap_frac in (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.0156, 0.0078):

@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dataflyer"
+name = "vizmo"
 version = "0.1.0"
 description = "Real-time 3D fly-through explorer for SPH simulation data"
 readme = "README.md"
@@ -20,4 +20,4 @@ dependencies = [
 ]
 
 [project.scripts]
-dataflyer = "dataflyer.app:main"
+vizmo = "vizmo.app:main"

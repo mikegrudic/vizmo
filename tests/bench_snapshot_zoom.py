@@ -31,10 +31,10 @@ import wgpu
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SNAPSHOT = REPO_ROOT / "snapshot_600.hdf5"
 
-from dataflyer.camera import Camera
-from dataflyer.colormaps import colormap_to_texture_data
-from dataflyer.gpu_compute import GPUCompute
-from dataflyer.wgpu_renderer import WGPURenderer
+from vizmo.camera import Camera
+from vizmo.colormaps import colormap_to_texture_data
+from vizmo.gpu_compute import GPUCompute
+from vizmo.wgpu_renderer import WGPURenderer
 
 
 def load_snapshot(path):
@@ -57,6 +57,7 @@ def load_snapshot(path):
 
     print("  computing smoothing lengths (one-time)...")
     from meshoid import Meshoid
+
     hsml = Meshoid(pos.astype(np.float64)).SmoothingLength().astype(np.float32)
     try:
         np.save(cache, hsml)
@@ -105,8 +106,7 @@ def setup(pos, mass, hsml, res, multigrid_levels):
     return device, r, cam
 
 
-def run(label, device, r, cam, target, res, n_frames, dt, tau, stop_dist,
-        cap):
+def run(label, device, r, cam, target, res, n_frames, dt, tau, stop_dist, cap):
     """Step the camera exponentially toward target. Returns list of
     (distance, ms_per_frame) records.
     """
@@ -146,22 +146,21 @@ def run(label, device, r, cam, target, res, n_frames, dt, tau, stop_dist,
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--snap", default=str(DEFAULT_SNAPSHOT),
-                   help=f"HDF5 snapshot path (default: {DEFAULT_SNAPSHOT.name} in repo root)")
+    p.add_argument(
+        "--snap",
+        default=str(DEFAULT_SNAPSHOT),
+        help=f"HDF5 snapshot path (default: {DEFAULT_SNAPSHOT.name} in repo root)",
+    )
     p.add_argument("--res", type=int, default=2048)
     p.add_argument("--multigrid", type=int, nargs="+", default=[1, 6])
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--tau", type=float, default=3.0)
-    p.add_argument("--stop", type=float, default=10.0,
-                   help="stop distance in same units as snapshot (kpc)")
+    p.add_argument("--stop", type=float, default=10.0, help="stop distance in same units as snapshot (kpc)")
     p.add_argument("--cap", type=int, default=4_000_000)
     args = p.parse_args()
 
     if not Path(args.snap).exists():
-        sys.exit(
-            f"snapshot not found: {args.snap}\n"
-            f"pass --snap PATH or place snapshot_600.hdf5 in {REPO_ROOT}"
-        )
+        sys.exit(f"snapshot not found: {args.snap}\n" f"pass --snap PATH or place snapshot_600.hdf5 in {REPO_ROOT}")
 
     pos, mass, hsml = load_snapshot(args.snap)
     target = mass_weighted_median(pos, mass)
@@ -175,16 +174,16 @@ def main():
     for ml in args.multigrid:
         print(f"\n=== multigrid_levels={ml} ===")
         device, r, cam = setup(pos, mass, hsml, args.res, ml)
-        recs = run(f"ml={ml}", device, r, cam, target, args.res, n_frames,
-                   dt, args.tau, args.stop, args.cap)
+        recs = run(f"ml={ml}", device, r, cam, target, args.res, n_frames, dt, args.tau, args.stop, args.cap)
         ds = np.array([d for d, _ in recs])
         ms = np.array([m for _, m in recs])
         print(f"  {'frame':>6} {'dist':>12} {'ms':>10}")
         step = max(1, len(recs) // 15)
         for i in range(0, len(recs), step):
             print(f"  {i:>6d} {ds[i]:>12.2f} {ms[i]:>10.3f}")
-        print(f"  total {ms.sum():>8.1f} ms / {len(recs)} frames "
-              f"| mean {ms.mean():.2f} | median {np.median(ms):.2f}")
+        print(
+            f"  total {ms.sum():>8.1f} ms / {len(recs)} frames " f"| mean {ms.mean():.2f} | median {np.median(ms):.2f}"
+        )
         summary.append((ml, ms.mean(), np.median(ms), ms.sum(), len(recs)))
         r.release()
 
@@ -195,8 +194,7 @@ def main():
     if len(summary) >= 2:
         base = summary[0][1]
         for ml, mean, *_ in summary[1:]:
-            print(f"  speedup levels={ml} vs levels={summary[0][0]}: "
-                  f"{base / mean:.2f}x")
+            print(f"  speedup levels={ml} vs levels={summary[0][0]}: " f"{base / mean:.2f}x")
 
 
 if __name__ == "__main__":

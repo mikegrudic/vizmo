@@ -1,4 +1,4 @@
-# DataFlyer
+# vizmo
 
 Real-time 3D fly-through explorer for unstructured simulation data. Loads HDF5 snapshots from GIZMO/Gadget simulations and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite CoolMap visualizations on the GPU via WebGPU.
 
@@ -19,10 +19,10 @@ pip install -e .
 
 ## Quickstart
 
-Point `dataflyer` at an HDF5 snapshot file:
+Point `vizmo` at an HDF5 snapshot file:
 
 ```bash
-dataflyer path/to/snapshot.hdf5
+vizmo path/to/snapshot.hdf5
 ```
 
 The snapshot must contain gas particle data (`PartType0`) with at minimum `Coordinates`, `Masses`, and `KernelMaxRadius` (or `SmoothingLength`) fields. Star particles (`PartType5`) are also supported if present.
@@ -30,14 +30,14 @@ The snapshot must contain gas particle data (`PartType0`) with at minimum `Coord
 ### CLI options
 
 ```
-dataflyer snapshot.hdf5 [--width 1920] [--height 1080] [--fov 90]
+vizmo snapshot.hdf5 [--width 1920] [--height 1080] [--fov 90]
                         [--fullscreen] [--screenshot OUT.png]
                         [--profile OUT.pstats]
 ```
 
 ## Rendering backend
 
-DataFlyer uses a WebGPU backend ([wgpu-py](https://github.com/pygfx/wgpu-py)) with GPU-resident particle data. Compute shaders perform frustum culling, LOD selection, and per-cell summary gathering with zero CPU↔GPU per-frame transfer. On unified-memory systems (Apple Silicon) field switches are also near-zero copy.
+vizmo uses a WebGPU backend ([wgpu-py](https://github.com/pygfx/wgpu-py)) with GPU-resident particle data. Compute shaders perform frustum culling, LOD selection, and per-cell summary gathering with zero CPU↔GPU per-frame transfer. On unified-memory systems (Apple Silicon) field switches are also near-zero copy.
 
 The renderer uses progressive refinement and an auto-LOD subsample cap that adapts within a user-controlled ceiling to keep interaction smooth during motion and sharpen on idle.
 
@@ -83,7 +83,7 @@ Select from the **Mode** dropdown in the user menu:
 ## Architecture
 
 ```
-dataflyer/
+vizmo/
   app.py            - CLI entry point
   wgpu_app.py       - Main loop, key actions, progressive refinement, auto-LOD
   wgpu_renderer.py  - WGPURenderer: RenderMode, accumulate + resolve + composite passes
