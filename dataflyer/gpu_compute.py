@@ -181,8 +181,10 @@ class GPUCompute:
             qty_f32 = np.ascontiguousarray(qty, dtype=np.float32)
             if perm is not None:
                 qty_f32 = qty_f32[perm]
-        # Pace each chunk with a small read so Metal's staging buffer
-        # doesn't accumulate the entire ~1 GB upload at once.
+        # Queue all writes, then a single blocking read on the LAST
+        # chunk to drain the staging queue. Per-chunk reads serialize
+        # the upload and turn it into a multi-second beachball; one
+        # final sync is enough because Metal's queue is FIFO.
         for cb in self._chunk_bufs:
             start, cn = cb["start"], cb["n"]
             dev.queue.write_buffer(
@@ -190,7 +192,7 @@ class GPUCompute:
             if not qty_is_mass:
                 dev.queue.write_buffer(
                     cb["qty"], 0, qty_f32[start:start + cn].tobytes())
-            dev.queue.read_buffer(cb["mass"], size=4)
+        dev.queue.read_buffer(self._chunk_bufs[-1]["mass"], size=4)
         # The next dispatch in either composite slot will see different
         # data, so invalidate the slot caches.
         self._slot_ids = [None, None]

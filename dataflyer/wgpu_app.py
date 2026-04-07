@@ -336,9 +336,17 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 renderer.resolve_mode = 0
 
             renderer.update_weights(weights, qty)
+            print(f"  [diag] mode={mode} n_total={renderer.n_total} "
+                  f"n_particles={renderer.n_particles} "
+                  f"lod_pixels={renderer.lod_pixels:.1f} "
+                  f"resolve_mode={renderer.resolve_mode} "
+                  f"chunks={renderer._subsample_chunks is not None} "
+                  f"max_per_frame={renderer._subsample_max_per_frame}", flush=True)
             if gpu_compute is not None:
+                _t = time.perf_counter()
                 gpu_compute.upload_weights(
                     renderer._all_mass, renderer._all_qty)
+                print(f"  [diag] upload_weights: {(time.perf_counter()-_t)*1000:.0f}ms", flush=True)
                 # GPU LOS projection isn't wired into the subsample path
                 # (would need to update qty across every per-chunk buffer
                 # per camera rotation). The CPU _project_field above
@@ -399,6 +407,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     last_time = time.perf_counter()
     frame_count = 0
     fps_time = time.perf_counter()
+    # Wall-clock duration of the previous renderer.render() call. This is
+    # the only signal that reflects real GPU latency (encode/submit are
+    # async). Used by the subsample cap-growth gate so we don't overshoot
+    # into a backlogged swapchain.
+    last_render_ms = 0.0
+    smooth_render_ms = 0.0  # EMA of last_render_ms
     fps = 0.0
 
     # Progressive refinement / auto-LOD state
@@ -611,31 +625,40 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         # at least once and only when the previous frame met its target
         # (so we never over-extend with no FPS history to validate).
         target_ms = 1000.0 / max(renderer.target_fps, 1.0)
+        # Smoothed render-time EMA, fed by last_render_ms (not dt). dt
+        # measures how often Python loops; render-time measures how
+        # long the GPU actually takes to retire each frame.
+        if last_render_ms > 0:
+            smooth_render_ms = (0.85 * smooth_render_ms + 0.15 * last_render_ms
+                                if smooth_render_ms > 0 else last_render_ms)
         if moved:
             has_moved_ever = True
             if not was_moving:
                 renderer.set_subsample_max_per_frame(last_subsample_cap)
-            if smooth_frame_ms > 0:
+            if smooth_render_ms > 0:
                 cur_cap = renderer._subsample_max_per_frame
-                if smooth_frame_ms < target_ms * 0.9:
-                    last_subsample_cap = min(64_000_000, int(cur_cap * 1.1) + 1)
+                if smooth_render_ms < target_ms * 0.9:
+                    last_subsample_cap = min(16_000_000, int(cur_cap * 1.1) + 1)
                     renderer.set_subsample_max_per_frame(last_subsample_cap)
-                elif smooth_frame_ms > target_ms * 1.2:
+                elif smooth_render_ms > target_ms * 1.2:
                     last_subsample_cap = max(500_000, int(cur_cap * 0.85))
                     renderer.set_subsample_max_per_frame(last_subsample_cap)
                 else:
                     last_subsample_cap = cur_cap
         elif has_moved_ever:
             # Stopped after at least one motion: refine progressively.
-            # Grow the cap as long as the last frame stayed within a
-            # refinement budget; stop growing once individual frames
-            # cross that budget.
+            # The growth gate uses last_render_ms (wall-clock duration of
+            # the previous renderer.render() call), which captures real
+            # GPU latency via get_current_texture's swapchain block.
+            # Python's `dt` is a useless signal here — Metal queues
+            # encode/submit asynchronously and Python keeps racing
+            # ahead, so dt stays small even when the GPU is buried.
             cur = renderer._subsample_max_per_frame
-            MAX_CAP = 200_000_000
-            REFINE_FRAME_MS = 500.0
-            last_ms = dt * 1000.0 if dt > 0 else 0.0
-            if 0 < last_ms <= REFINE_FRAME_MS and cur < MAX_CAP:
-                renderer.set_subsample_max_per_frame(min(cur * 2, MAX_CAP))
+            MAX_CAP = 16_000_000
+            REFINE_FRAME_MS = 100.0
+            if 0 < last_render_ms <= REFINE_FRAME_MS and cur < MAX_CAP:
+                renderer.set_subsample_max_per_frame(
+                    min(int(cur * 1.4) + 1, MAX_CAP))
 
         # LOS projection is computed on the CPU at _apply_render_mode
         # time (subsample mode has no GPU LOS path). Re-fire it when the
@@ -823,7 +846,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             win_w, _ = glfw.get_window_size(window)
             renderer._viewport_width = win_w  # LOD uses window size, not retina
 
-        # Render
+        # Render. Time the call wall-clock — most of this is
+        # get_current_texture blocking on the swapchain present, which
+        # is the only signal that reflects real GPU latency (Python's
+        # encode + submit are async w.r.t. the GPU).
+        _t_render = time.perf_counter()
         try:
             if _state["_composite"]:
                 _render_composite_frame(fb_w, fb_h)
@@ -837,6 +864,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 renderer.render(camera, fb_w, fb_h)
             except Exception:
                 pass
+        last_render_ms = (time.perf_counter() - _t_render) * 1000.0
         # Auto-range on first frame
         if pending_auto_range_frames > 0:
             pending_auto_range_frames -= 1
