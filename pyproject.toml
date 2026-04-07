@@ -11,6 +11,7 @@ license = "MIT"
 requires-python = ">=3.9"
 dependencies = [
     "numpy",
+    "scipy",
     "h5py",
     "glfw>=2.5",
     "matplotlib",

@@ -811,6 +811,9 @@ class WGPURenderer:
         self._ext_xgas = np.ascontiguousarray(positions, dtype=np.float64)
         self._ext_mgas = np.ascontiguousarray(masses, dtype=np.float64)
         self._ext_hgas = np.ascontiguousarray(hsml, dtype=np.float64)
+        self._ext_tree = None
+        self._ext_bins = None  # list of (idx, tree, h_max_in_bin)
+        self._ext_hmax = float(self._ext_hgas.max()) if self._ext_hgas.size else 0.0
         self._star_columns = None
         self._star_columns_cam_pos = None
 
@@ -835,6 +838,58 @@ class WGPURenderer:
         if self._star_columns is not None and prev is not None and np.array_equal(prev, cam_pos):
             return  # rotation-only frame — cached columns are still valid
 
+        # Try the tree-accelerated path (scipy required); fall back to brute force.
+        try:
+            columns = self._star_columns_tree(cam_pos)
+        except ImportError:
+            columns = self._star_columns_brute(cam_pos)
+
+        self._star_columns = columns.astype(np.float32)
+        self._star_columns_cam_pos = cam_pos.copy()
+
+    def _build_ext_hbins(self):
+        """Bin gas by smoothing length into octave-wide bins and build a
+        KDTree per bin. This keeps the per-bin h_max within ~2x of the
+        bin's h_min, so segment queries don't degenerate when a small
+        number of outlier particles have huge h."""
+        from scipy.spatial import cKDTree
+
+        h = self._ext_hgas
+        if h.size == 0:
+            self._ext_bins = []
+            return
+        pos_h = h[h > 0.0]
+        if pos_h.size == 0:
+            self._ext_bins = []
+            return
+        h_min = float(pos_h.min())
+        h_max = float(h.max())
+        n_oct = max(1, int(np.ceil(np.log2(max(h_max / h_min, 1.0)))) + 1)
+        edges = h_min * (2.0 ** np.arange(n_oct + 1))
+        edges[-1] = max(edges[-1], h_max * 1.0001)
+        bins = []
+        for i in range(n_oct):
+            lo, hi = edges[i], edges[i + 1]
+            idx = np.where((h >= lo) & (h < hi))[0]
+            if idx.size == 0:
+                continue
+            tree = cKDTree(self._ext_xgas[idx])
+            bins.append((idx, tree, float(h[idx].max())))
+        self._ext_bins = bins
+
+    def _star_columns_tree(self, cam_pos):
+        """KDTree-accelerated per-star column densities.
+
+        Gas is binned by h (octave-wide). For each star and each bin,
+        subdivide (star → cam) into pieces of length ~2*h_bin and run
+        a multi-point ball query at the bin's tight radius. This keeps
+        the candidate set local even when global h_max is huge.
+        """
+        if self._ext_bins is None:
+            self._build_ext_hbins()
+        if not self._ext_bins:
+            return np.zeros(self._star_positions.shape[0], dtype=np.float64)
+
         xstar = self._star_positions
         xgas = self._ext_xgas
         mgas = self._ext_mgas
@@ -843,16 +898,65 @@ class WGPURenderer:
         n_stars = xstar.shape[0]
         columns = np.zeros(n_stars, dtype=np.float64)
 
-        # Per-star line-of-sight integration. Each star uses its own
-        # ray (star → camera). For each gas particle g and star s:
-        #     r       = g − star_s
-        #     t       = r · ray_dir_s        (positive = toward camera)
-        #     b²      = |r|² − t²            (perpendicular to ray)
-        # Particle contributes when 0 < t < |star−cam| and b < h_g,
-        # with smooth W(q) = (3/(π h²)) (1−q²)² deposit.
-        #
-        # Vectorized over chunks of stars to bound memory:
-        # peak intermediate is (chunk × n_gas) float64.
+        for s in range(n_stars):
+            ray = cam_pos - xstar[s]
+            d_obs = float(np.linalg.norm(ray))
+            if d_obs == 0.0:
+                continue
+            ray_dir = ray / d_obs
+            cand_chunks = []
+            for bin_idx, tree, h_bin in self._ext_bins:
+                seg_len = max(2.0 * h_bin, 1e-30)
+                n_chunks = max(1, int(np.ceil(d_obs / seg_len)))
+                # Cap subdivisions: a single star can otherwise spawn
+                # millions of query points if h_bin << d_obs.
+                if n_chunks > 4096:
+                    n_chunks = 4096
+                step = d_obs / n_chunks
+                ts = (np.arange(n_chunks) + 0.5) * step
+                centers = xstar[s][None, :] + ts[:, None] * ray_dir[None, :]
+                radius = 0.5 * step + h_bin
+                idx_lists = tree.query_ball_point(centers, r=radius)
+                # Flatten + dedupe within this bin, then map to global indices.
+                flat = []
+                for lst in idx_lists:
+                    if lst:
+                        flat.append(lst)
+                if not flat:
+                    continue
+                local = np.unique(np.concatenate([np.asarray(l, dtype=np.int64) for l in flat]))
+                if local.size:
+                    cand_chunks.append(bin_idx[local])
+            if not cand_chunks:
+                continue
+            idx = np.concatenate(cand_chunks)  # bins are disjoint, no dedupe needed
+            rcand = xgas[idx] - xstar[s]
+            tcand = rcand @ ray_dir
+            r2 = np.einsum("ij,ij->i", rcand, rcand)
+            b2 = np.maximum(r2 - tcand * tcand, 0.0)
+            h2c = hgas2[idx]
+            mask = (tcand > 0.0) & (tcand < d_obs) & (b2 < h2c)
+            if not np.any(mask):
+                continue
+            b2m = b2[mask]
+            h2m = h2c[mask]
+            q2 = b2m / h2m
+            w = 1.0 - q2
+            w = w * w
+            columns[s] = np.sum(mgas[idx][mask] * (3.0 * inv_pi / h2m) * w)
+
+        return columns
+
+    def _star_columns_brute(self, cam_pos):
+        """Brute-force fallback: chunk-vectorized over stars."""
+        xstar = self._star_positions
+        xgas = self._ext_xgas
+        mgas = self._ext_mgas
+        hgas2 = self._ext_hgas * self._ext_hgas
+        inv_pi = 1.0 / np.pi
+        n_stars = xstar.shape[0]
+        columns = np.zeros(n_stars, dtype=np.float64)
+
         n_gas = xgas.shape[0]
         # ~256 MB cap for the (chunk, n_gas) scratch arrays.
         chunk = max(1, int(32 * 1024 * 1024 / max(n_gas, 1)))
@@ -891,8 +995,7 @@ class WGPURenderer:
             contrib = np.where(mask, mgas[None, :] * (3.0 * inv_pi / hgas2[None, :]) * w, 0.0)
             columns[s0:s1] = contrib.sum(axis=1)
 
-        self._star_columns = columns.astype(np.float32)
-        self._star_columns_cam_pos = cam_pos.copy()
+        return columns
 
     # ---- Accumulation textures ----
 
