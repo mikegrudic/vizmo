@@ -52,7 +52,11 @@ class SnapshotData:
 
         # Eagerly load core gas fields
         if self._gas:
-            self.positions = self._read_field("PartType0", "Coordinates").astype(np.float32)
+            # Kept as float64: the splat path's hi/lo precision split
+            # only recovers detail that was present at upload time, so
+            # truncating here would re-introduce the box-extent ULP
+            # quantization on cosmological-scale snapshots.
+            self.positions = self._read_field("PartType0", "Coordinates").astype(np.float64)
             self.masses = self._read_field("PartType0", "Masses").astype(np.float32)
             self.hsml = self._read_field("PartType0", "KernelMaxRadius").astype(np.float32)
             self.n_particles = len(self.masses)
