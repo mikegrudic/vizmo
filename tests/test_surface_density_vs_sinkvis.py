@@ -51,7 +51,7 @@ def sinkvis_surface_density(positions, masses, hsml, center, camera_distance,
 # ---------------------------------------------------------------------------
 
 def dataflyer_surface_density(positions, masses, hsml, center, camera_distance,
-                              boxsize=1.0, res=128, fov=90):
+                              boxsize=1.0, res=128, fov=90, multigrid_levels=1):
     """Render the surface density (denominator accumulation texture)
     using the wgpu splat path, with the camera matched to SinkVis.
     """
@@ -72,6 +72,7 @@ def dataflyer_surface_density(positions, masses, hsml, center, camera_distance,
     renderer.kernel = "cubic_spline"
     renderer.resolve_mode = 0
     renderer.log_scale = 0
+    renderer.multigrid_levels = multigrid_levels
 
     pos32 = positions.astype(np.float32)
     hsml32 = hsml.astype(np.float32)
@@ -127,7 +128,8 @@ def particle_data():
     return positions, masses, hsml, boxsize
 
 
-def test_surface_density_perspective(particle_data):
+@pytest.mark.parametrize("multigrid_levels", [1, 4])
+def test_surface_density_perspective(particle_data, multigrid_levels):
     """The dataflyer wgpu surface density should agree with SinkVis's
     perspective projection at fov=90, camera_distance=1, to within a
     few percent on integrated mass and ~0.1 dex per pixel."""
@@ -144,6 +146,7 @@ def test_surface_density_perspective(particle_data):
     sigma_dataflyer = dataflyer_surface_density(
         positions.copy(), masses.copy(), hsml.copy(),
         center, camera_distance, boxsize=boxsize, res=res, fov=fov,
+        multigrid_levels=multigrid_levels,
     )
 
     # Same units (mass per unit world area on the unit-distance plane), so

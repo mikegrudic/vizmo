@@ -96,9 +96,19 @@ class GPUCompute:
             qty_buf.write_mapped(qty_src[start:start + cn].tobytes())
             qty_buf.unmap()
 
+            # Identity index buffer. The splat vertex shader reads
+            # local_idx = s_index[ii], so the default identity behaves
+            # exactly like the old direct ii lookup. The multigrid bin
+            # compute pass overwrites this buffer per frame to scatter
+            # particles by their (camera-dependent) level.
+            index_buf = dev.create_buffer(
+                size=cn * 4, usage=usage, mapped_at_creation=True)
+            index_buf.write_mapped(np.arange(cn, dtype=np.uint32).tobytes())
+            index_buf.unmap()
+
             self._chunk_bufs.append({
                 "pos": pos_buf, "hsml": hsml_buf,
-                "mass": mass_buf, "qty": qty_buf,
+                "mass": mass_buf, "qty": qty_buf, "index": index_buf,
                 "n": cn, "start": start,
             })
 

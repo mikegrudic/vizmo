@@ -642,8 +642,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
     while not glfw.window_should_close(window):
         now = time.perf_counter()
-        dt = now - last_time
+        dt_raw = now - last_time
         last_time = now
+        # Clamp dt so a single slow frame can't catapult the camera by
+        # 10x the normal step. The auto-LOD PID can briefly oscillate
+        # frame time on cost-curve discontinuities (e.g. multigrid level
+        # boundaries), and an unclamped dt turns that into visible
+        # position lurches. 1/15 s matches the default target FPS.
+        dt = min(dt_raw, 1.0 / 15.0)
 
         # FPS
         frame_count += 1

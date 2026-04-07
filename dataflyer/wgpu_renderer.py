@@ -142,6 +142,13 @@ class WGPURenderer:
         self.pid_Kd = 0.0
         self.skip_vsync = False
         self.hsml_scale = 1.0
+        # Multigrid LOD: 1 = disabled (single-level, original behavior).
+        # When > 1, particles are routed to a pyramid of accum textures
+        # (level 0 = full res, level k = full_res / 2^k) by their kernel
+        # screen radius, and a cascade upsample folds coarser levels back
+        # into the finest before resolve.
+        self.multigrid_levels = 6
+        self.multigrid_n_grid_kernel = 4.0
 
         # Timing
         self._last_cull_ms = 0.0
@@ -159,6 +166,12 @@ class WGPURenderer:
         self._accum_textures2 = None  # second set for composite mode
         self._accum_size = (0, 0)
         self._accum_size2 = (0, 0)
+        # Multigrid pyramid: list of accum-texture dicts, level 0 unused
+        # (it aliases self._accum_textures); level k has res/2^k.
+        # Rebuilt by _ensure_fbo when multigrid_levels or size changes.
+        self._accum_pyramid = []
+        self._accum_pyramid_levels = 0
+        self._cascade_bgs = []  # bind groups, one per non-zero level
         # CPU-side star particle data, populated by upload_stars().
         self.n_stars = 0
         self._star_positions = None
@@ -186,6 +199,9 @@ class WGPURenderer:
             code=_load_wgsl("splat_subsample.wgsl", include_common=True))
         self._resolve_shader = dev.create_shader_module(code=_load_wgsl("resolve.wgsl"))
         self._composite_shader = dev.create_shader_module(code=_load_wgsl("composite.wgsl"))
+        self._cascade_shader = dev.create_shader_module(code=_load_wgsl("cascade.wgsl"))
+        self._mg_bin_shader = dev.create_shader_module(
+            code=_load_wgsl("multigrid_bin.wgsl"))
 
         # Camera uniform: view + proj + viewport + kernel_id + pad = 144 B
         self._camera_buf = dev.create_buffer(
@@ -204,8 +220,8 @@ class WGPURenderer:
         self._splat_subsample_bgl0 = dev.create_bind_group_layout(entries=[
             {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
             {"binding": 1, "visibility": V, "buffer": {"type": "uniform"}}])
-        # bg1: pos / hsml / mass / qty per chunk
-        self._splat_bgl1 = _storage_bgl(dev, 4, V)
+        # bg1: pos / hsml / mass / qty / index / bases per chunk
+        self._splat_bgl1 = _storage_bgl(dev, 6, V)
 
         self._splat_subsample_layout = dev.create_pipeline_layout(
             bind_group_layouts=[self._splat_subsample_bgl0, self._splat_bgl1])
@@ -214,6 +230,56 @@ class WGPURenderer:
         self._splat_subsample_pipeline = _make_render_pipeline(
             dev, self._splat_subsample_layout, self._splat_subsample_shader,
             accum_targets)
+
+        # Cascade pipeline: reads 3 coarse accum textures, additively
+        # blends bilinear samples into the next-finer level.
+        F = wgpu.ShaderStage.FRAGMENT
+        self._cascade_bgl = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": F,
+             "texture": {"sample_type": "unfilterable-float"
+                         if self._accum_format == "r32float"
+                         else "float"}},
+            {"binding": 1, "visibility": F,
+             "texture": {"sample_type": "unfilterable-float"
+                         if self._accum_format == "r32float"
+                         else "float"}},
+            {"binding": 2, "visibility": F,
+             "texture": {"sample_type": "unfilterable-float"
+                         if self._accum_format == "r32float"
+                         else "float"}},
+        ])
+        cascade_layout = dev.create_pipeline_layout(
+            bind_group_layouts=[self._cascade_bgl])
+        # Multigrid binning compute pipelines.
+        C = wgpu.ShaderStage.COMPUTE
+        self._mg_bin_bgl = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": C, "buffer": {"type": "uniform"}},
+            {"binding": 1, "visibility": C, "buffer": {"type": "read-only-storage"}},
+            {"binding": 2, "visibility": C, "buffer": {"type": "read-only-storage"}},
+            {"binding": 3, "visibility": C, "buffer": {"type": "storage"}},
+            {"binding": 4, "visibility": C, "buffer": {"type": "storage"}},
+            {"binding": 5, "visibility": C, "buffer": {"type": "storage"}},
+            {"binding": 6, "visibility": C, "buffer": {"type": "storage"}},
+        ])
+        mg_layout = dev.create_pipeline_layout(
+            bind_group_layouts=[self._mg_bin_bgl])
+        self._mg_count_pipeline = dev.create_compute_pipeline(
+            layout=mg_layout,
+            compute={"module": self._mg_bin_shader, "entry_point": "cs_count"})
+        self._mg_build_pipeline = dev.create_compute_pipeline(
+            layout=mg_layout,
+            compute={"module": self._mg_bin_shader, "entry_point": "cs_build"})
+        self._mg_scatter_pipeline = dev.create_compute_pipeline(
+            layout=mg_layout,
+            compute={"module": self._mg_bin_shader, "entry_point": "cs_scatter"})
+
+        self._cascade_pipeline = dev.create_render_pipeline(
+            layout=cascade_layout,
+            vertex={"module": self._cascade_shader, "entry_point": "vs_main", "buffers": []},
+            primitive={"topology": "triangle-list"},
+            fragment={"module": self._cascade_shader, "entry_point": "fs_main",
+                      "targets": accum_targets},
+        )
 
         # Subsample state set later via set_subsample_chunks. The
         # cap-based auto-LOD is the sole LOD knob — there is no
@@ -496,19 +562,113 @@ class WGPURenderer:
         self._active_subsample_slot = None
         dev = self.device
         out = []
+        n_levels = max(1, int(self.multigrid_levels))
         for cb in chunks:
-            params_buf = dev.create_buffer(
-                size=96, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
-            bg0 = _make_bind_group(dev, self._splat_subsample_bgl0,
-                                   [self._camera_buf, params_buf])
-            bg1 = _make_bind_group(dev, self._splat_bgl1,
-                                   [cb["pos"], cb["hsml"], cb["mass"], cb["qty"]])
+            # One params buffer (and bg0) per multigrid level. With
+            # n_levels=1 this collapses to the original single-level
+            # binding.
+            params_bufs = []
+            bg0s = []
+            for _ in range(n_levels):
+                pb = dev.create_buffer(
+                    size=112, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+                params_bufs.append(pb)
+                bg0s.append(_make_bind_group(
+                    dev, self._splat_subsample_bgl0,
+                    [self._camera_buf, pb]))
+            # Per-chunk multigrid binning state. Sized for MAX_LEVELS=16.
+            MAX_LV = 16
+            bin_params_buf = dev.create_buffer(
+                size=64,
+                usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+            counts_buf = dev.create_buffer(
+                size=MAX_LV * 4,
+                usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+            bases_buf = dev.create_buffer(
+                size=MAX_LV * 4,
+                usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+            # Identity bases (all zero) for the n_levels==1 path so the
+            # default splat shader binding works without the bin pass.
+            dev.queue.write_buffer(bases_buf, 0, b"\x00" * (MAX_LV * 4))
+            indirect_buf = dev.create_buffer(
+                size=MAX_LV * 16,
+                usage=(wgpu.BufferUsage.STORAGE
+                       | wgpu.BufferUsage.INDIRECT
+                       | wgpu.BufferUsage.COPY_DST))
+            bg1 = _make_bind_group(
+                dev, self._splat_bgl1,
+                [cb["pos"], cb["hsml"], cb["mass"], cb["qty"],
+                 cb["index"], bases_buf])
+            mg_bg = dev.create_bind_group(
+                layout=self._mg_bin_bgl,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": bin_params_buf}},
+                    {"binding": 1, "resource": {"buffer": cb["pos"]}},
+                    {"binding": 2, "resource": {"buffer": cb["hsml"]}},
+                    {"binding": 3, "resource": {"buffer": counts_buf}},
+                    {"binding": 4, "resource": {"buffer": bases_buf}},
+                    {"binding": 5, "resource": {"buffer": cb["index"]}},
+                    {"binding": 6, "resource": {"buffer": indirect_buf}},
+                ],
+            )
             out.append({
-                "bg0": bg0, "bg1": bg1, "params_buf": params_buf,
-                "pos": cb["pos"], "hsml": cb["hsml"],
+                "bg0": bg0s[0], "bg0s": bg0s, "bg1": bg1,
+                "params_buf": params_bufs[0], "params_bufs": params_bufs,
+                "pos": cb["pos"], "hsml": cb["hsml"], "index": cb["index"],
                 "n": int(cb["n"]), "start": int(cb["start"]),
+                "bin_params_buf": bin_params_buf,
+                "counts_buf": counts_buf,
+                "bases_buf": bases_buf,
+                "indirect_buf": indirect_buf,
+                "mg_bg": mg_bg,
             })
         self._subsample_chunks = out
+        self._subsample_n_levels = n_levels
+        # Stash the raw source chunks so set_multigrid_levels() can
+        # rebuild the per-level bind groups without the caller having
+        # to re-upload.
+        self._subsample_source_chunks = list(chunks)
+        self._subsample_source_offset = world_offset
+
+    def set_multigrid_levels(self, n_levels):
+        """Change the multigrid level count and rebuild the per-chunk
+        bin state. Cheap (only allocates a few small uniform/storage
+        buffers per chunk) and safe to call between frames.
+
+        Preserves slot bind groups across the rebuild — the underlying
+        source pos/hsml/mass/qty buffers are unchanged, so the app's
+        composite-slot mass/qty bind groups remain valid; we just need
+        to rebuild the parallel bgs that reference the (new) chunk
+        objects' pos/hsml/index/bases buffers.
+        """
+        n_levels = max(1, int(n_levels))
+        if n_levels == int(getattr(self, "_subsample_n_levels", 1)):
+            self.multigrid_levels = n_levels
+            return
+        self.multigrid_levels = n_levels
+        if getattr(self, "_subsample_source_chunks", None) is None:
+            return
+
+        # Capture the active slot index before set_subsample_chunks wipes it.
+        prev_active = self._active_subsample_slot
+        # Drop the previous chunk dicts and rebuild fresh — this gives
+        # us new bases_buf storage initialized to all zeros, which is
+        # critical when going from multigrid back to n_levels=1 (the
+        # splat shader reads s_bases[0] and would otherwise see stale
+        # base offsets left over from the prior bin pass).
+        self.set_subsample_chunks(self._subsample_source_chunks,
+                                  world_offset=self._subsample_source_offset)
+        if self._accum_size[0] > 0:
+            self._ensure_pyramid(*self._accum_size)
+        # Restore active slot index so the next set_subsample_slot_chunks
+        # call (or render) sees the prior selection.
+        self._active_subsample_slot = prev_active
+        # NOTE: prev_slot_bgs intentionally dropped — the bg1 layout is
+        # unchanged but the bgs reference the OLD chunk dicts' pos/hsml/
+        # index/bases buffers. If we kept them, vertex shader reads of
+        # s_index/s_bases would see stale (freed) buffers. The caller
+        # must re-issue set_subsample_slot_chunks() after this returns;
+        # data_manager.py does so on its next render-state refresh.
 
     def set_subsample_slot_chunks(self, slot_idx, slot_chunks):
         """Bind a composite slot's mass/qty per-chunk buffers. Pos+hsml
@@ -522,7 +682,8 @@ class WGPURenderer:
         for ck, sc in zip(self._subsample_chunks, slot_chunks):
             bg = _make_bind_group(
                 self.device, self._splat_bgl1,
-                [ck["pos"], ck["hsml"], sc["mass"], sc["qty"]])
+                [ck["pos"], ck["hsml"], sc["mass"], sc["qty"],
+                 ck["index"], ck["bases_buf"]])
             bgs.append(bg)
         self._slot_subsample_bgs[slot_idx] = bgs
 
@@ -577,14 +738,21 @@ class WGPURenderer:
             float(camera.up[0]), float(camera.up[1]),
             float(camera.up[2]), 0.0,
         )
+        n_levels = int(getattr(self, "_subsample_n_levels", 1))
+        full_res_w = float(self._accum_size[0]) if self._accum_size[0] > 0 else 1.0
+        n_grid_kernel = float(self.multigrid_n_grid_kernel)
         for ck in self._subsample_chunks:
-            tail = _struct.pack(
-                "ffII ffII",
-                fov_rad, float(camera.aspect), int(stride), int(ck["n"]),
-                h_scale, mass_scale, 0, 0,
-            )
-            self.device.queue.write_buffer(
-                ck["params_buf"], 0, cam_bytes + tail)
+            for lvl in range(n_levels):
+                tail = _struct.pack(
+                    "ffII ffII fff f",
+                    fov_rad, float(camera.aspect), int(stride), int(ck["n"]),
+                    h_scale, mass_scale,
+                    int(lvl), int(n_levels),
+                    full_res_w, n_grid_kernel,
+                    0.0, 0.0,
+                )
+                pbs = ck.get("params_bufs", [ck["params_buf"]])
+                self.device.queue.write_buffer(pbs[lvl], 0, cam_bytes + tail)
 
     def upload_stars(self, positions, masses, luminosity=None):
         """Upload star particle data.
@@ -704,6 +872,10 @@ class WGPURenderer:
                 # Resolve bind group references slot-1 accum views.
                 self._resolve_bg = None
                 self._composite_bg = None
+                self._accum_pyramid = []
+                self._accum_pyramid_levels = 0
+                self._cascade_bgs = []
+            self._ensure_pyramid(width, height)
         else:
             if self._accum_size2 == (width, height) and self._accum_textures2 is not None:
                 return
@@ -711,6 +883,95 @@ class WGPURenderer:
             self._accum_size2 = (width, height)
             # Composite bind group references slot-2 accum views.
             self._composite_bg = None
+
+    def _dispatch_multigrid_bin(self, camera, encoder, budget, n_total_chunks):
+        """Run count → build → scatter for every chunk so each level's
+        draw_indirect args and per-level index ranges are ready before
+        the splat passes begin.
+        """
+        import struct as _struct
+        dev = self.device
+        n_levels = int(self._subsample_n_levels)
+        full_res_w = float(self._accum_size[0]) if self._accum_size[0] > 0 else 1.0
+        n_grid_kernel = float(self.multigrid_n_grid_kernel)
+        offset = getattr(self, "_world_offset", None)
+        cam_pos = camera.position - offset if offset is not None else camera.position
+        proj = camera.projection_matrix()
+        proj11 = float(proj[1, 1])
+        # Reuse the same h_scale derivation as the splat path so the
+        # binner sees the kernel size the splat will actually draw.
+        ratio = max(n_total_chunks / max(budget, 1), 1.0)
+        h_scale = (ratio ** (1.0 / 3.0)) * float(self.hsml_scale)
+
+        zero_counts = b"\x00" * (16 * 4)
+        for ck in self._subsample_chunks:
+            n_to_consider = max(1, int(round(budget * ck["n"] / n_total_chunks)))
+            n_to_consider = min(n_to_consider, int(ck["n"]))
+            params = _struct.pack(
+                "fff f fff f I I f f f f f f",
+                float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]), 0.0,
+                float(camera.forward[0]), float(camera.forward[1]),
+                float(camera.forward[2]), 0.0,
+                int(n_to_consider), int(n_levels),
+                full_res_w, n_grid_kernel,
+                proj11, h_scale, 0.0, 0.0,
+            )
+            dev.queue.write_buffer(ck["bin_params_buf"], 0, params)
+            dev.queue.write_buffer(ck["counts_buf"], 0, zero_counts)
+
+        # Workgroup count cap is 65535 per dimension; with 256-thread
+        # groups that's ~16.7 M particles per dispatch. Use a 2D grid
+        # so chunks of up to ~4G particles fit in one dispatch.
+        for ck in self._subsample_chunks:
+            n_to_consider = max(1, int(round(budget * ck["n"] / n_total_chunks)))
+            n_to_consider = min(n_to_consider, int(ck["n"]))
+            n_groups = (n_to_consider + 255) // 256
+            gx = min(n_groups, 65535)
+            gy = (n_groups + 65535 - 1) // 65535
+            cp = encoder.begin_compute_pass()
+            cp.set_bind_group(0, ck["mg_bg"])
+            cp.set_pipeline(self._mg_count_pipeline)
+            cp.dispatch_workgroups(gx, gy, 1)
+            cp.set_pipeline(self._mg_build_pipeline)
+            cp.dispatch_workgroups(1, 1, 1)
+            cp.set_pipeline(self._mg_scatter_pipeline)
+            cp.dispatch_workgroups(gx, gy, 1)
+            cp.end()
+
+    def _ensure_pyramid(self, width, height):
+        """Build (or rebuild) the multigrid pyramid for slot-1 accum.
+
+        Levels [1..n_levels-1] are coarser than the full-res slot-1
+        accum textures (which serve as level 0). Bind groups for the
+        cascade pass are built here too — each binds level k's textures
+        as inputs (the cascade fragment shader writes additively into
+        level k-1, which is the bound render target).
+        """
+        n_levels = max(1, int(self.multigrid_levels))
+        if (n_levels == self._accum_pyramid_levels
+                and self._accum_pyramid is not None
+                and len(self._accum_pyramid) == max(0, n_levels - 1)
+                and self._accum_size == (width, height)):
+            return
+        self._accum_pyramid = []
+        self._cascade_bgs = []
+        for k in range(1, n_levels):
+            w = max(1, width >> k)
+            h = max(1, height >> k)
+            self._accum_pyramid.append(self._create_accum_textures(w, h))
+        # Build per-level cascade bind groups: input = level k textures.
+        for k in range(1, n_levels):
+            tex = self._accum_pyramid[k - 1]["views"]
+            bg = self.device.create_bind_group(
+                layout=self._cascade_bgl,
+                entries=[
+                    {"binding": 0, "resource": tex[0]},
+                    {"binding": 1, "resource": tex[1]},
+                    {"binding": 2, "resource": tex[2]},
+                ],
+            )
+            self._cascade_bgs.append(bg)
+        self._accum_pyramid_levels = n_levels
 
     def _create_accum_textures(self, width, height):
         """Create a triple of accumulation textures (num, den, sq)."""
@@ -990,34 +1251,75 @@ class WGPURenderer:
         if owns_encoder:
             encoder = dev.create_command_encoder()
 
-        views = accum_textures["views"]
-        render_pass = encoder.begin_render_pass(color_attachments=[
-            {"view": views[0], "clear_value": (0, 0, 0, 0),
-             "load_op": "clear", "store_op": "store"},
-            {"view": views[1], "clear_value": (0, 0, 0, 0),
-             "load_op": "clear", "store_op": "store"},
-            {"view": views[2], "clear_value": (0, 0, 0, 0),
-             "load_op": "clear", "store_op": "store"},
-        ])
+        n_levels = max(1, int(getattr(self, "_subsample_n_levels", 1)))
 
-        if self._subsample_chunks is not None:
-            # Compute-driven splat: one draw per chunk. Per-chunk dispatch
-            # count is proportional to the global instance budget.
-            slot = self._active_subsample_slot
-            slot_bgs = (self._slot_subsample_bgs[slot]
-                        if slot is not None
-                        and self._slot_subsample_bgs[slot] is not None
-                        else None)
-            render_pass.set_pipeline(self._splat_subsample_pipeline)
-            for i, ck in enumerate(self._subsample_chunks):
-                # Proportional share of the budget for this chunk.
-                instances = max(1, int(round(budget * ck["n"] / n_total_chunks)))
-                instances = min(instances, ck["n"])
-                render_pass.set_bind_group(0, ck["bg0"])
-                bg1 = slot_bgs[i] if slot_bgs is not None else ck["bg1"]
-                render_pass.set_bind_group(1, bg1)
-                render_pass.draw(4, instances, 0, 0)
-        render_pass.end()
+        # Multigrid: bin pass writes per-chunk index buffer + indirect
+        # args. Must run before begin_render_pass.
+        if (n_levels > 1
+                and self._subsample_chunks is not None
+                and accum_textures is self._accum_textures):
+            self._dispatch_multigrid_bin(camera, encoder, budget, n_total_chunks)
+
+        # Pre-resolve the slot bg list once.
+        slot = self._active_subsample_slot
+        slot_bgs = (self._slot_subsample_bgs[slot]
+                    if slot is not None
+                    and self._slot_subsample_bgs[slot] is not None
+                    else None)
+
+        # Build a list of per-level (views, bg0_index) pairs. Level 0
+        # is the supplied accum_textures (full res); higher levels come
+        # from the multigrid pyramid attached to the slot-1 set.
+        level_views = [accum_textures["views"]]
+        if n_levels > 1 and accum_textures is self._accum_textures:
+            for lvl in range(1, n_levels):
+                level_views.append(self._accum_pyramid[lvl - 1]["views"])
+        elif n_levels > 1:
+            # Composite slot or other accum target: fall back to single
+            # level for now (multigrid only wired into slot-1 path).
+            n_levels = 1
+
+        for lvl in range(n_levels):
+            views = level_views[lvl]
+            render_pass = encoder.begin_render_pass(color_attachments=[
+                {"view": views[0], "clear_value": (0, 0, 0, 0),
+                 "load_op": "clear", "store_op": "store"},
+                {"view": views[1], "clear_value": (0, 0, 0, 0),
+                 "load_op": "clear", "store_op": "store"},
+                {"view": views[2], "clear_value": (0, 0, 0, 0),
+                 "load_op": "clear", "store_op": "store"},
+            ])
+            if self._subsample_chunks is not None:
+                render_pass.set_pipeline(self._splat_subsample_pipeline)
+                for i, ck in enumerate(self._subsample_chunks):
+                    instances = max(1, int(round(budget * ck["n"] / n_total_chunks)))
+                    instances = min(instances, ck["n"])
+                    bg0 = ck.get("bg0s", [ck["bg0"]])[lvl]
+                    render_pass.set_bind_group(0, bg0)
+                    bg1 = slot_bgs[i] if slot_bgs is not None else ck["bg1"]
+                    render_pass.set_bind_group(1, bg1)
+                    if n_levels > 1:
+                        render_pass.draw_indirect(
+                            ck["indirect_buf"], lvl * 16)
+                    else:
+                        render_pass.draw(4, instances, 0, 0)
+            render_pass.end()
+
+        # Cascade: fold coarser levels into finer ones, ending at level 0
+        # which the resolve pass consumes.
+        if n_levels > 1:
+            for lvl in range(n_levels - 1, 0, -1):
+                target_views = level_views[lvl - 1]
+                rp = encoder.begin_render_pass(color_attachments=[
+                    {"view": target_views[0], "load_op": "load", "store_op": "store"},
+                    {"view": target_views[1], "load_op": "load", "store_op": "store"},
+                    {"view": target_views[2], "load_op": "load", "store_op": "store"},
+                ])
+                rp.set_pipeline(self._cascade_pipeline)
+                rp.set_bind_group(0, self._cascade_bgs[lvl - 1])
+                rp.draw(3, 1, 0, 0)
+                rp.end()
+
         if owns_encoder:
             dev.queue.submit([encoder.finish()])
 
