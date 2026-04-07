@@ -180,38 +180,31 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         fb_w_, fb_h_ = glfw.get_framebuffer_size(window)
 
         if gpu_ready_now and renderer._grid is not None:
-            # GPU path: write sorted arrays directly, dispatch, render, read back
+            # GPU subsample path: upload this slot's mass/qty into the
+            # composite slot's per-chunk buffers, bind them as the active
+            # slot, and let _render_accum dispatch the splat draws.
             sorted_mass, sorted_qty = _ensure_slot_sorted(slot_idx)
-            device.queue.write_buffer(gpu_compute._particle_bufs["mass"], 0, sorted_mass.tobytes())
-
-            sl = _state["_slot"][slot_idx]
-            is_los_vec = (sl.get("proj") == "LOS" and
-                          sl["mode"] in ("WeightedAverage", "WeightedVariance") and
-                          sl["data"] in _state["_vector_fields"])
-            if is_los_vec:
-                if not gpu_compute.has_los_field() or getattr(gpu_compute, '_los_field_name', '') != sl["data"]:
-                    gpu_compute.upload_vector_field(renderer._grid, sl["data"], data)
-                gpu_compute.dispatch_los_project(camera)
-            else:
-                device.queue.write_buffer(gpu_compute._particle_bufs["qty"], 0, sorted_qty.tobytes())
-
-            n_out, _, summary_data = gpu_compute.dispatch_cull(
-                camera, renderer.max_render_particles,
-                lod_pixels=renderer.lod_pixels,
-                viewport_width=renderer._viewport_width,
-                summary_overlap=renderer.summary_overlap,
-            )
-            renderer.set_particle_buffers_from_gpu(gpu_compute.get_output_buffers(), n_out)
+            slot_id = _slot_sorted[slot_idx][0]
+            slot_chunks = gpu_compute.upload_subsample_slot(
+                slot_idx, slot_id, sorted_mass, sorted_qty)
+            renderer.set_subsample_slot_chunks(slot_idx, slot_chunks)
+            renderer.set_active_subsample_slot(slot_idx)
+            renderer.n_particles = int(
+                renderer.n_total // max(renderer._subsample_stride, 1))
         else:
-            # CPU fallback
+            # CPU fallback (subsample mode keeps the renderer empty here;
+            # the GPU path is required to actually see anything)
             w, q = app_proxy._compute_slot(s)
             renderer.update_weights(w, q)
-            renderer.update_visible(camera)
 
         renderer._ensure_fbo(fb_w_, fb_h_, which=1)
         renderer._write_camera_uniforms(camera, fb_w_, fb_h_)
         renderer._render_accum(camera, fb_w_, fb_h_, renderer._accum_textures)
-        lo, hi = renderer.read_accum_range()
+        # Lightness (slot 0): mass-weighted entropy, so the surface density
+        # range is set by where the actual mass is. Color (slot 1): raw
+        # entropy on field values, so the dynamic range is the full spread
+        # of the field itself rather than wherever it happens to be dense.
+        lo, hi = renderer.read_accum_range(mass_weighted=(slot_idx == 0))
         s["min"] = lo
         s["max"] = hi
         print(f"Auto-range {label}: {lo:.3g} .. {hi:.3g}")
@@ -371,8 +364,20 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             renderer.update_weights(weights, qty)
             if gpu_compute is not None and renderer._grid is not None:
                 gpu_compute.upload_weights(renderer._grid)
-                _uses_los = (_state["_vector_projection"] == "LOS" and
-                             _state.get("_wa_data_field", "") in _state["_vector_fields"])
+                # GPU LOS projection isn't wired into the subsample path
+                # (would need to update qty across every per-chunk buffer
+                # per camera rotation). The CPU _project_field above
+                # already produced the right LOS-projected qty for the
+                # current camera orientation; subsequent rotations will
+                # render with stale qty until the user re-applies the
+                # render mode. Acceptable for now.
+                in_subsample = (
+                    getattr(renderer, "lod_strategy", "geometric")
+                    == "subsample")
+                _uses_los = (
+                    not in_subsample
+                    and _state["_vector_projection"] == "LOS"
+                    and _state.get("_wa_data_field", "") in _state["_vector_fields"])
                 if _uses_los:
                     gpu_compute.upload_vector_field(renderer._grid,
                                                    _state["_wa_data_field"], data)
@@ -441,6 +446,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     # Don't grow the cap before the user has moved the camera at least
     # once — startup has no FPS history to validate growth against.
     has_moved_ever = False
+    # Frames to wait before firing the post-init auto-range. Set when
+    # GPU subsample chunks are first wired up; counts down each frame
+    # so the GPU has time to actually render new data into the FBO
+    # before we read it back.
+    pending_auto_range_frames = 0
     smooth_frame_ms = 0.0
     smooth_fps_ema = 0.0
     last_lod_adjust = 0.0
@@ -464,20 +474,36 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     def _ensure_slot_sorted(slot_idx):
         """Ensure sorted mass/qty arrays are cached for this slot. Returns (mass, qty).
 
-        For LOS vector qty fields, qty is a placeholder — GPU projection handles it.
-        Only the weight (mass) array needs to be sorted on CPU.
+        For LOS vector qty fields, qty was historically a placeholder — the
+        GPU LOS projection path filled it in. The subsample-mode pipeline
+        doesn't run GPU LOS projection, so we always compute qty on the CPU
+        here. The result is correct at the current camera orientation and
+        becomes stale on rotation; the canvas loop calls _apply_render_mode
+        again when LOS staleness is detected.
         """
         sl = _state["_slot"][slot_idx]
+        # When the slot uses an LOS-projected vector field, the cached
+        # projection depends on the camera direction — include a
+        # quantized forward in the cache key so a rotation invalidates
+        # the entry.
+        is_los_vec = (sl.get("proj") == "LOS"
+                      and (sl["weight"] in _state["_vector_fields"]
+                           or sl.get("weight2", "None") in _state["_vector_fields"]
+                           or (sl["mode"] in ("WeightedAverage", "WeightedVariance")
+                               and sl["data"] in _state["_vector_fields"])))
+        if is_los_vec:
+            fwd_key = tuple(int(round(c * 256)) for c in camera.forward)
+        else:
+            fwd_key = None
         slot_id = (sl["weight"], sl.get("weight2", "None"), sl.get("op", "*"),
-                   sl["mode"], sl["data"], sl.get("proj", "LOS"))
+                   sl["mode"], sl["data"], sl.get("proj", "LOS"), fwd_key)
         cached = _slot_sorted[slot_idx]
         if cached is not None and cached[0] == slot_id:
             return cached[1], cached[2]
 
-        # Only compute the weight field — skip qty for LOS (GPU handles it)
-        is_los_qty = (sl.get("proj") == "LOS" and
-                      sl["mode"] in ("WeightedAverage", "WeightedVariance") and
-                      sl["data"] in _state["_vector_fields"])
+        # Always compute the qty field on the CPU in subsample mode (no GPU
+        # LOS projection wired up).
+        is_los_qty = False
 
         # Compute weight using shared helpers
         proj = sl.get("proj", "LOS")
@@ -488,14 +514,23 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             w2 = resolve_field(w2_name, vf, data, proj, camera.forward)
             w = combine_fields(w, w2, sl.get("op", "*"))
 
-        so = renderer._grid.sort_order
-        sm = w[so].astype(np.float32)
+        # In subsample-only mode the grid never builds the Morton sort,
+        # so sort_order is None and we use the raw particle order. The
+        # subsample upload path uses raw arrays too, so this matches.
+        so = getattr(renderer._grid, "sort_order", None)
+        if so is not None:
+            sm = w[so].astype(np.float32)
+        else:
+            sm = w.astype(np.float32)
 
         if is_los_qty:
             sq = sm  # placeholder — GPU LOS projection will fill qty buffer
         elif sl["mode"] in ("WeightedAverage", "WeightedVariance"):
             q = resolve_field(sl["data"], vf, data, proj, camera.forward)
-            sq = q[so].astype(np.float32)
+            if so is not None:
+                sq = q[so].astype(np.float32)
+            else:
+                sq = q.astype(np.float32)
         else:
             sq = sm
 
@@ -512,48 +547,27 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         for i in range(2):
             sl = _state["_slot"][i]
-
-            cache_ready = _slot_sorted[i] is not None
-            if gpu_ready_now and renderer._grid is not None and cache_ready:
-                sorted_mass, sorted_qty = _slot_sorted[i][1], _slot_sorted[i][2]
+            if gpu_ready_now and renderer._grid is not None:
+                # Subsample path: ensure the slot's sorted mass/qty is
+                # cached for the *current* camera direction (the cache
+                # key includes a quantized fwd for LOS slots), then
+                # upload to the slot's per-chunk buffers and render.
+                sorted_mass, sorted_qty = _ensure_slot_sorted(i)
                 slot_id = _slot_sorted[i][0]
-
-                # Upload to persistent per-slot GPU buffers (no-op if unchanged)
-                gpu_compute.upload_slot_data(i, slot_id, sorted_mass, sorted_qty)
-
-                # GPU-to-GPU copy from slot buffers to active particle buffers (~1ms)
-                gpu_compute.activate_slot(i)
-
-                # For LOS vector fields: overwrite qty with GPU projection
-                is_los_vec = (sl.get("proj") == "LOS" and
-                              sl["mode"] in ("WeightedAverage", "WeightedVariance") and
-                              sl["data"] in _state["_vector_fields"])
-                if is_los_vec:
-                    if not gpu_compute.has_los_field() or getattr(gpu_compute, '_los_field_name', '') != sl["data"]:
-                        gpu_compute.upload_vector_field(renderer._grid, sl["data"], data)
-                    gpu_compute.dispatch_los_project(camera)
-
-                n_out, n_vis, summary_data = gpu_compute.dispatch_cull(
-                    camera, renderer.max_render_particles,
-                    lod_pixels=renderer.lod_pixels,
-                    viewport_width=renderer._viewport_width,
-                    summary_overlap=renderer.summary_overlap,
-                )
-                renderer.set_particle_buffers_from_gpu(gpu_compute.get_output_buffers(), n_out)
-                s_pos, s_hsml, s_mass, s_qty, s_cov = summary_data
-                if renderer.use_aniso_summaries and len(s_pos) > 0:
-                    renderer._upload_aniso_summaries(s_pos, s_mass, s_qty, s_cov)
-                else:
-                    renderer._upload_aniso_summaries(
-                        np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                        np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
+                slot_chunks = gpu_compute.upload_subsample_slot(
+                    i, slot_id, sorted_mass, sorted_qty)
+                renderer.set_subsample_slot_chunks(i, slot_chunks)
+                renderer.set_active_subsample_slot(i)
+                renderer.n_particles = int(
+                    renderer.n_total // max(renderer._subsample_stride, 1))
             else:
                 w, q = app_proxy._compute_slot(sl)
                 renderer.update_weights(w, q)
-                renderer.update_visible(camera)
 
             renderer._write_camera_uniforms(camera, fb_w, fb_h)
             renderer._render_accum(camera, fb_w, fb_h, accum_sets[i])
+        # Reset active slot so non-composite passes use the default path.
+        renderer.set_active_subsample_slot(None)
 
         s0, s1 = _state["_slot"][0], _state["_slot"][1]
         renderer.render_composite(
@@ -680,10 +694,16 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         # GPU compute init (blocking upload once grid is available)
         gpu_ready = getattr(gpu_compute, '_upload_ready', False)
-        # Only use GPU compute for datasets large enough to benefit (>10M particles)
+        # Subsample mode always uses the GPU path (no CPU fallback). For
+        # other strategies, only initialize GPU compute on datasets large
+        # enough to benefit.
         GPU_COMPUTE_THRESHOLD = 10_000_000
+        in_subsample_mode = (
+            getattr(renderer, 'lod_strategy', 'geometric') == 'subsample')
+        gpu_threshold_met = (in_subsample_mode
+                             or renderer.n_total >= GPU_COMPUTE_THRESHOLD)
         if (not gpu_ready and gpu_compute is None and renderer._grid is not None
-                and renderer.n_total >= GPU_COMPUTE_THRESHOLD):
+                and gpu_threshold_met):
             is_adaptive = getattr(renderer._grid, 'is_adaptive', False)
             in_subsample = (
                 getattr(renderer, 'lod_strategy', 'geometric') == 'subsample')
@@ -693,9 +713,25 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     gpu_compute.upload_subsample_only(
                         renderer._grid,
                         max_output=int(renderer.max_render_particles))
-                    renderer.set_subsample_chunks(gpu_compute.get_chunk_bufs())
+                    renderer.set_subsample_chunks(
+                        gpu_compute.get_chunk_bufs(),
+                        world_offset=gpu_compute.get_pos_offset())
                     renderer.set_subsample_stride(int(max(renderer.lod_pixels, 1)))
+                    # Prime renderer.n_particles with a non-zero count
+                    # so the first render() call doesn't early-out. The
+                    # auto-LOD controller adjusts it on subsequent
+                    # frames once the camera moves.
+                    do_cull()
                     print("  GPU subsample pipeline initialized (zero-copy)")
+                    # Defer auto-range a few frames so the GPU actually
+                    # has rendered the new chunk bind groups into the FBO
+                    # before we read it back. The earlier auto-range that
+                    # fired when the bg grid completed ran against an
+                    # empty FBO (chunks weren't bound yet) so its
+                    # qty_min/qty_max are garbage. needs_auto_range fires
+                    # again once the deferral elapses.
+                    pending_auto_range_frames = 3
+                    needs_auto_range = False
                 else:
                     gpu_compute.upload_snapshot(
                         renderer._grid,
@@ -1006,6 +1042,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             except Exception:
                 pass
         # Auto-range on first frame
+        if pending_auto_range_frames > 0:
+            pending_auto_range_frames -= 1
+            if pending_auto_range_frames == 0:
+                needs_auto_range = True
         if needs_auto_range and not _state["_composite"]:
             lo, hi = renderer.read_accum_range()
             renderer.qty_min = lo

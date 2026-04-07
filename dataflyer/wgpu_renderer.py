@@ -676,7 +676,7 @@ class WGPURenderer:
 
         self._set_identity_sort_index(n_particles)
 
-    def set_subsample_chunks(self, chunks):
+    def set_subsample_chunks(self, chunks, world_offset=None):
         """Configure compute-driven splat: render directly from per-chunk
         source particle buffers, with hash-stride + frustum cull happening
         in the vertex shader.
@@ -684,10 +684,24 @@ class WGPURenderer:
         Args:
             chunks: list of dicts {"pos","hsml","mass","qty","n","start"}
                 from GPUCompute, or None to disable.
+            world_offset: (3,) float32. Subtracted from camera position
+                before building view matrix and cull params, to match the
+                world-origin shift applied to particle positions on
+                upload (avoids float32 precision loss for cosmological
+                snapshots).
         """
         if chunks is None:
             self._subsample_chunks = None
+            self._world_offset = None
+            self._slot_subsample_bgs = [None, None]
+            self._active_subsample_slot = None
             return
+        self._world_offset = (
+            np.asarray(world_offset, dtype=np.float32)
+            if world_offset is not None else None)
+        # Reset slot bindings whenever the base chunks change.
+        self._slot_subsample_bgs = [None, None]
+        self._active_subsample_slot = None
         dev = self.device
         out = []
         for cb in chunks:
@@ -699,6 +713,7 @@ class WGPURenderer:
                                    [cb["pos"], cb["hsml"], cb["mass"], cb["qty"]])
             out.append({
                 "bg0": bg0, "bg1": bg1, "params_buf": params_buf,
+                "pos": cb["pos"], "hsml": cb["hsml"],
                 "n": int(cb["n"]), "start": int(cb["start"]),
             })
         self._subsample_chunks = out
@@ -706,6 +721,29 @@ class WGPURenderer:
     def set_subsample_stride(self, stride):
         """Set the stride used by the compute-driven splat path."""
         self._subsample_stride = max(int(stride), 1)
+
+    def set_subsample_slot_chunks(self, slot_idx, slot_chunks):
+        """Bind a composite slot's mass/qty per-chunk buffers. Pos+hsml
+        come from the shared self._subsample_chunks; only mass+qty are
+        per-slot. Builds a parallel set of bg1 bind groups; the active
+        slot is selected via set_active_subsample_slot().
+        """
+        if not hasattr(self, "_slot_subsample_bgs"):
+            self._slot_subsample_bgs = [None, None]
+        bgs = []
+        for ck, sc in zip(self._subsample_chunks, slot_chunks):
+            bg = _make_bind_group(
+                self.device, self._splat_bgl1,
+                [ck["pos"], ck["hsml"], sc["mass"], sc["qty"]])
+            bgs.append(bg)
+        self._slot_subsample_bgs[slot_idx] = bgs
+
+    def set_active_subsample_slot(self, slot_idx):
+        """Pick which composite slot's mass/qty bind groups the next
+        _render_accum will use. Pass None for the default (chunks' own
+        mass/qty, used outside composite mode).
+        """
+        self._active_subsample_slot = slot_idx
 
     def set_subsample_max_per_frame(self, max_inst):
         """Set the per-frame instance cap for the compute-driven splat
@@ -717,6 +755,12 @@ class WGPURenderer:
     def _write_subsample_params(self, camera, stride):
         """Write each chunk's params uniform. Must be called BEFORE
         beginning the render pass (write_buffer cannot run mid-pass).
+
+        `stride` is the (possibly fractional) coarsening factor:
+            stride = n_total / budget
+        where budget is the total number of instances dispatched across
+        all chunks. Each rendered particle stands in for `stride`
+        particles' worth of mass.
         """
         if self._subsample_chunks is None:
             return
@@ -725,10 +769,16 @@ class WGPURenderer:
         h_scale = ratio ** (1.0 / 3.0)
         mass_scale = ratio  # each sampled particle stands in for `stride`
         fov_rad = float(np.radians(camera.fov))
+        # Apply the same world-origin shift as the view matrix.
+        offset = getattr(self, "_world_offset", None)
+        if offset is not None:
+            cam_pos = camera.position - offset
+        else:
+            cam_pos = camera.position
         cam_bytes = _struct.pack(
             "fff f fff f fff f fff f",
-            float(camera.position[0]), float(camera.position[1]),
-            float(camera.position[2]), 0.0,
+            float(cam_pos[0]), float(cam_pos[1]),
+            float(cam_pos[2]), 0.0,
             float(camera.forward[0]), float(camera.forward[1]),
             float(camera.forward[2]), 0.0,
             float(camera.right[0]), float(camera.right[1]),
@@ -832,8 +882,20 @@ class WGPURenderer:
 
     def _write_camera_uniforms(self, camera, width, height):
         """Write camera data to the uniform buffer."""
-        # view and proj are column-major in WGSL (same as OpenGL)
-        view = np.ascontiguousarray(camera.view_matrix().T, dtype=np.float32)
+        # view and proj are column-major in WGSL (same as OpenGL).
+        # Apply the world-origin shift (subsample mode pre-translates
+        # particles by self._world_offset to avoid float32 precision loss
+        # in the view-matrix multiply on cosmological-scale snapshots).
+        offset = getattr(self, "_world_offset", None)
+        if offset is not None:
+            saved = camera.position
+            camera.position = saved - offset
+            try:
+                view = np.ascontiguousarray(camera.view_matrix().T, dtype=np.float32)
+            finally:
+                camera.position = saved
+        else:
+            view = np.ascontiguousarray(camera.view_matrix().T, dtype=np.float32)
         proj = np.ascontiguousarray(camera.projection_matrix().T, dtype=np.float32)
 
         kernel_id = self.KERNELS.index(self.kernel) if self.kernel in self.KERNELS else 0
@@ -914,28 +976,39 @@ class WGPURenderer:
             # Compute-driven splat: one draw per chunk, dispatching only
             # ceil(n / stride) instances. The vertex shader picks one
             # particle per instance via hash and frustum-tests it.
+            slot = getattr(self, "_active_subsample_slot", None)
+            slot_bgs = (self._slot_subsample_bgs[slot]
+                        if slot is not None
+                        and self._slot_subsample_bgs[slot] is not None
+                        else None)
             #
             # Hard cap on per-frame instances: 32M point splats overwhelm
             # Apple Metal's vertex stage. Honor the LOD-controlled stride
             # but raise it further if the budget would still exceed the
             # cap. mass_scale must be raised to match so the visualization
             # stays unbiased.
+            # Compute the global budget from the (possibly fractional)
+            # stride and clamp it to the per-frame instance cap. The
+            # effective stride is then n_total / budget — fractional in
+            # general — and per-chunk dispatch counts are proportional
+            # to chunk size so the per-chunk sample is representative.
             cap = self._subsample_max_per_frame
-            stride = max(self._subsample_stride, 1)
+            stride = max(float(self._subsample_stride), 1.0)
             n_total = sum(ck["n"] for ck in self._subsample_chunks)
-            requested = (n_total + stride - 1) // stride
-            if requested > cap:
-                stride = max(stride, (n_total + cap - 1) // cap)
-                # Re-pack params with the bumped stride so mass_scale matches.
-                self._subsample_stride = stride
-                self._write_subsample_params(camera, stride)
+            budget = max(1, int(round(n_total / stride)))
+            if budget > cap:
+                budget = cap
+            # Effective fractional stride after capping.
+            eff_stride = max(n_total / max(budget, 1), 1.0)
+            self._write_subsample_params(camera, eff_stride)
             render_pass.set_pipeline(self._splat_subsample_pipeline)
-            for ck in self._subsample_chunks:
-                instances = (ck["n"] + stride - 1) // stride
-                if instances == 0:
-                    continue
+            for i, ck in enumerate(self._subsample_chunks):
+                # Proportional share of the budget for this chunk.
+                instances = max(1, int(round(budget * ck["n"] / n_total)))
+                instances = min(instances, ck["n"])
                 render_pass.set_bind_group(0, ck["bg0"])
-                render_pass.set_bind_group(1, ck["bg1"])
+                bg1 = slot_bgs[i] if slot_bgs is not None else ck["bg1"]
+                render_pass.set_bind_group(1, bg1)
                 render_pass.draw(4, instances, 0, 0)
         elif self.n_particles > 0 and self._particle_bufs and hasattr(self, "_sort_bg"):
             render_pass.set_pipeline(self._splat_pipeline)
@@ -1128,12 +1201,20 @@ class WGPURenderer:
         else:
             return np.frombuffer(data, dtype=np.float32)
 
-    def read_accum_range(self):
+    def read_accum_range(self, mass_weighted=True):
         """Read back accumulation textures and compute percentile range.
 
         Reads BOTH the full-resolution (particles) and half-resolution
         (summary splats) accumulation textures so the auto-range reflects
         the union of all rendered content.
+
+        Args:
+            mass_weighted: when True the entropy maximization weights bins
+                by accumulated mass (used for surface-density / lightness
+                slots so very dense regions dominate the level choice).
+                When False the entropy is computed on raw value counts
+                (better for color slots where we want the dynamic range
+                of the field itself, not where the mass piles up).
         """
         if self._accum_textures is None:
             return self.qty_min, self.qty_max
@@ -1216,7 +1297,8 @@ class WGPURenderer:
             lim_hi = float(partitioned[k_hi])
         else:
             from dataflyer.field_ops import max_entropy_limits
-            lim_lo, lim_hi = max_entropy_limits(vals, mass)
+            entropy_weights = mass if mass_weighted else np.ones_like(vals)
+            lim_lo, lim_hi = max_entropy_limits(vals, entropy_weights)
 
         if self.log_scale and not has_negative:
             if lim_lo <= 0:

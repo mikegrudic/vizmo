@@ -75,13 +75,16 @@ fn vs_main(
 ) -> VertexOutput {
     let corner = quad_corner(vi);
 
-    // Pick a particle deterministically from this chunk via hashed index.
-    // Caller dispatches ceil(n_in_chunk / stride) instances per chunk, so
-    // each invocation samples one particle. Hash collisions yield a
-    // sample with replacement; on average each particle is sampled with
-    // probability 1/stride, matching the legacy hash-stride filter but
-    // costing O(n/stride) instead of O(n).
-    let local_idx = hash_idx(ii) % sub.n_in_chunk;
+    // Source arrays are pre-shuffled on upload (gpu_compute. The caller
+    // dispatches K_chunk instances per chunk, where K_chunk is a fraction
+    // of n_in_chunk equal to the global budget fraction. The first
+    // K_chunk shuffled particles ARE the random K-subset — no hash, no
+    // collisions, no source-order imprinting. Out-of-range indices (when
+    // K_chunk doesn't divide n_in_chunk) emit degenerate quads.
+    let local_idx = ii;
+    if (local_idx >= sub.n_in_chunk) {
+        return degenerate(corner);
+    }
 
     let pos = s_pos[local_idx].xyz;
     let hsml = s_hsml[local_idx] * sub.h_scale;

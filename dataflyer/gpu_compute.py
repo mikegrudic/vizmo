@@ -121,6 +121,33 @@ class GPUCompute:
         self._n_particles = n
         self._max_output = max_output  # legacy field; unused by splat path
 
+        # World-origin shift: subtract the bounding-box center from every
+        # particle position before uploading. Cosmological snapshots have
+        # absolute coordinates ~10^4-10^5, and the shader's view-matrix
+        # multiply (r·(pos - cam_pos)) loses several decimal digits of
+        # precision in float32 when both operands are that large. After
+        # the shift, positions are ~box_radius around the origin, and
+        # the camera position passed to the shader is also shifted, so
+        # the matrix multiply works in single precision.
+        pmin = np.asarray(pos_src.min(axis=0), dtype=np.float64)
+        pmax = np.asarray(pos_src.max(axis=0), dtype=np.float64)
+        self._pos_offset = ((pmin + pmax) * 0.5).astype(np.float32)
+
+        # Pre-shuffle the source arrays so that drawing the first K
+        # particles of a chunk yields a uniformly random K-subset. The
+        # GPU splat dispatches `K_chunk` instances per chunk and the
+        # vertex shader uses the instance index directly — no hash, no
+        # collisions, no source-order imprinting. The shuffle is also
+        # the basis for upload_weights/upload_subsample_slot getting
+        # the right ordering, so the shuffle perm is stored on the
+        # grid (or computed per-snapshot) and reused.
+        perm = np.random.default_rng(0).permutation(n)
+        self._shuffle_perm = perm
+        pos_src = np.ascontiguousarray(pos_src[perm])
+        hsml_src = np.ascontiguousarray(hsml_src[perm])
+        mass_src = np.ascontiguousarray(mass_src[perm])
+        qty_src = np.ascontiguousarray(qty_src[perm])
+
         # 256 MB per binding cap → 16 M particles per chunk for pos.
         SAFE_CHUNK_BYTES = 256 * 1024 * 1024
         chunk_n = SAFE_CHUNK_BYTES // 16
@@ -138,6 +165,7 @@ class GPUCompute:
                 size=cn * 16, usage=particle_usage, mapped_at_creation=True)
             pos4 = np.zeros((cn, 4), dtype=np.float32)
             pos4[:, :3] = pos_src[start:start + cn]
+            pos4[:, :3] -= self._pos_offset
             pos_buf.write_mapped(pos4.tobytes())
             pos_buf.unmap()
 
@@ -171,6 +199,72 @@ class GPUCompute:
         splat path. Each entry is a dict with keys pos/hsml/mass/qty/n/start.
         """
         return getattr(self, "_chunk_bufs", None)
+
+    def get_pos_offset(self):
+        """World-origin shift applied to particle positions on upload.
+        The renderer must subtract this from camera.position before
+        building the view matrix and the cull params, or the rendered
+        coordinates will be wrong.
+        """
+        return getattr(self, "_pos_offset", np.zeros(3, dtype=np.float32))
+
+    def get_or_create_slot_chunks(self, slot_idx):
+        """Lazily allocate per-chunk mass+qty buffers for a composite
+        slot. pos+hsml stay shared with self._chunk_bufs. Returns the
+        list of dicts (one per chunk) {mass, qty, n, start}.
+        """
+        if not hasattr(self, "_slot_chunks"):
+            self._slot_chunks = [None, None]
+        if self._slot_chunks[slot_idx] is not None:
+            return self._slot_chunks[slot_idx]
+        dev = self.device
+        usage = (wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST
+                 | wgpu.BufferUsage.COPY_SRC)
+        out = []
+        for cb in self._chunk_bufs:
+            cn = cb["n"]
+            out.append({
+                "mass": dev.create_buffer(size=cn * 4, usage=usage),
+                "qty": dev.create_buffer(size=cn * 4, usage=usage),
+                "n": cn, "start": cb["start"],
+            })
+        self._slot_chunks[slot_idx] = out
+        return out
+
+    def upload_subsample_slot(self, slot_idx, slot_id, mass, qty):
+        """Upload mass/qty arrays into a composite slot's per-chunk
+        buffers. Caches by slot_id so re-uploading the same slot is a
+        no-op. Returns the slot's chunk list.
+        """
+        if not hasattr(self, "_slot_ids"):
+            self._slot_ids = [None, None]
+        slot_chunks = self.get_or_create_slot_chunks(slot_idx)
+        if self._slot_ids[slot_idx] == slot_id:
+            return slot_chunks
+        dev = self.device
+        # Apply the source-array shuffle so mass/qty align with the
+        # already-shuffled pos/hsml chunks.
+        perm = getattr(self, "_shuffle_perm", None)
+        mass_f32 = np.ascontiguousarray(mass, dtype=np.float32)
+        if perm is not None:
+            mass_f32 = mass_f32[perm]
+        qty_is_mass = qty is mass or qty is None
+        if not qty_is_mass:
+            qty_f32 = np.ascontiguousarray(qty, dtype=np.float32)
+            if perm is not None:
+                qty_f32 = qty_f32[perm]
+        for sc in slot_chunks:
+            start, cn = sc["start"], sc["n"]
+            dev.queue.write_buffer(
+                sc["mass"], 0, mass_f32[start:start + cn].tobytes())
+            if not qty_is_mass:
+                dev.queue.write_buffer(
+                    sc["qty"], 0, qty_f32[start:start + cn].tobytes())
+        # Final sync so the next render doesn't wedge behind a staging
+        # backlog (matches upload_weights pattern).
+        dev.queue.read_buffer(slot_chunks[-1]["mass"], size=4)
+        self._slot_ids[slot_idx] = slot_id
+        return slot_chunks
 
     def upload_snapshot(self, grid, max_output=4_000_000):
         """Upload grid structure and sorted particle data to GPU (blocking)."""
@@ -392,8 +486,15 @@ class GPUCompute:
         # buffer's element size.
         mass_src = grid.sorted_mass if grid.sorted_mass is not None else grid._raw_mass
         qty_src = grid.sorted_qty if grid.sorted_qty is not None else grid._raw_qty
-        mass_f32 = np.ascontiguousarray(mass_src, dtype=np.float32)
-        qty_f32 = np.ascontiguousarray(qty_src, dtype=np.float32)
+        # Apply the same shuffle as upload_subsample_only so the values
+        # land in the same row order as the corresponding pos/hsml.
+        perm = getattr(self, "_shuffle_perm", None)
+        if perm is not None:
+            mass_f32 = np.ascontiguousarray(mass_src, dtype=np.float32)[perm]
+            qty_f32 = np.ascontiguousarray(qty_src, dtype=np.float32)[perm]
+        else:
+            mass_f32 = np.ascontiguousarray(mass_src, dtype=np.float32)
+            qty_f32 = np.ascontiguousarray(qty_src, dtype=np.float32)
 
         # Subsample-only mode splits particles across multiple per-chunk
         # buffers. Write each chunk's slice into its own buffer; otherwise
@@ -723,7 +824,14 @@ class GPUCompute:
         """
         dev = self.device
         vec = data_manager.get_vector_field(field_name)  # (N, 3) float32
-        sorted_vec = vec[grid.sort_order].astype(np.float32)
+        # In subsample-only mode the grid never builds sort_order, and the
+        # particle buffers were uploaded in raw order — so use the raw
+        # vector field directly to match.
+        so = getattr(grid, "sort_order", None)
+        if so is not None:
+            sorted_vec = vec[so].astype(np.float32)
+        else:
+            sorted_vec = np.ascontiguousarray(vec, dtype=np.float32)
 
         # Pack as vec4 for alignment
         n = len(sorted_vec)
