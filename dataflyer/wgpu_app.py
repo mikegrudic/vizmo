@@ -192,6 +192,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
     def key_callback(win, key, scancode, action, mods):
         nonlocal user_lod, user_budget, _cmap_idx, needs_auto_range, ui_hidden
+        nonlocal subsample_cap_ceiling, last_subsample_cap
         if user_menu.on_key(key, action):
             return
         if action == glfw.PRESS:
@@ -220,19 +221,27 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 user_lod = renderer.lod_pixels
                 print(f"LOD: {renderer.lod_pixels}px (faster)")
             elif key == glfw.KEY_PERIOD:
-                # Cap max budget at 128M particles to stay within safe
-                # GPU buffer / dispatch limits on commodity hardware.
-                MAX_BUDGET = 128_000_000
-                renderer.max_render_particles = min(
-                    renderer.n_total, MAX_BUDGET,
-                    int(renderer.max_render_particles * 2))
-                user_budget = renderer.max_render_particles
-                print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
+                # Raise the auto-LOD subsample-cap ceiling. The cap
+                # itself adapts within [floor, ceiling]; this knob is
+                # the ceiling. SUBSAMPLE_CAP_HARD_LIMIT is the hard
+                # upper bound for safe GPU buffer / dispatch limits.
+                subsample_cap_ceiling = min(
+                    SUBSAMPLE_CAP_HARD_LIMIT,
+                    int(subsample_cap_ceiling * 2))
+                print(f"Subsample cap ceiling: "
+                      f"{subsample_cap_ceiling/1e6:.1f}M")
             elif key == glfw.KEY_COMMA:
-                renderer.max_render_particles = max(
-                    1_000, renderer.max_render_particles // 2)
-                user_budget = renderer.max_render_particles
-                print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
+                subsample_cap_ceiling = max(
+                    500_000, subsample_cap_ceiling // 2)
+                # Clamp the running cap so the change is felt
+                # immediately, not just at the next motion frame.
+                last_subsample_cap = min(last_subsample_cap,
+                                         subsample_cap_ceiling)
+                renderer.set_subsample_max_per_frame(
+                    min(renderer._subsample_max_per_frame,
+                        subsample_cap_ceiling))
+                print(f"Subsample cap ceiling: "
+                      f"{subsample_cap_ceiling/1e6:.1f}M")
             elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
                 _adjust_range(renderer, 0.8)
             elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
@@ -264,6 +273,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         "_vector_fields": _vector_fields,
         "_vector_projection": _vector_projection,
         "_los_camera_fwd": _los_camera_fwd,
+        "_los_camera_pos": None,
         "_cmap_idx": _cmap_idx,
         "_slot": _slot,
         "_needs_auto_range": False,
@@ -286,24 +296,31 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         def _project_field(self, field_name):
             if field_name in _state["_vector_fields"] and _state["_vector_projection"] == "LOS":
                 _state["_los_camera_fwd"] = camera.forward.copy()
+                _state["_los_camera_pos"] = camera.position.copy()
             return resolve_field(field_name, _state["_vector_fields"], data,
-                                 _state["_vector_projection"], camera.forward)
+                                 _state["_vector_projection"], camera.forward,
+                                 camera_position=camera.position)
 
         def _compute_weights(self):
             if _state["_sd_field"] in _state["_vector_fields"] and _state["_vector_projection"] == "LOS":
                 _state["_los_camera_fwd"] = camera.forward.copy()
+                _state["_los_camera_pos"] = camera.position.copy()
             return compute_weights(
                 _state["_sd_field"], _state.get("_sd_field2", "None"),
                 _state.get("_sd_op", "*"), _state["_vector_fields"], data,
-                _state["_vector_projection"], camera.forward)
+                _state["_vector_projection"], camera.forward,
+                camera_position=camera.position)
 
         def _compute_slot(self, slot):
             """Compute weights and qty for a composite slot dict."""
-            return compute_slot_fields(slot, _state["_vector_fields"], data, camera.forward)
+            return compute_slot_fields(slot, _state["_vector_fields"], data,
+                                       camera.forward,
+                                       camera_position=camera.position)
 
         def _apply_render_mode(self, auto_range=True):
             nonlocal _render_mode, needs_auto_range, refine_budget, refine_saved_lod, refine_saved_budget
             _state["_los_camera_fwd"] = None
+            _state["_los_camera_pos"] = None
             refine_budget = 0
             refine_saved_lod = None
             refine_saved_budget = None
@@ -440,6 +457,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     # final image is fresh.
     last_los_recompute_time = 0.0
     LOS_MOVING_THROTTLE_S = 0.15
+    # Tracks the camera position from the previous frame so we can
+    # detect translations independently of rotations. Per-particle LOS
+    # is invariant under rotation, so only translations should freeze
+    # the slot LOS cache.
+    prev_camera_pos = camera.position.copy()
 
     # Progressive refinement / auto-LOD state
     was_moving = False
@@ -448,6 +470,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     # Per-frame instance cap for the compute-driven splat path. Initialized
     # to 4M; afterwards adapted to the highest cap that sustained target FPS.
     last_subsample_cap = 4_000_000
+    # Auto-LOD ceiling for the per-frame subsample cap. The cap adapts
+    # within [floor, ceiling]; the , / . keys halve / double this.
+    # SUBSAMPLE_CAP_HARD_LIMIT is the upper bound (safe GPU dispatch /
+    # buffer headroom on commodity hardware).
+    SUBSAMPLE_CAP_HARD_LIMIT = 200_000_000
+    subsample_cap_ceiling = 16_000_000
     # Don't grow the cap before the user has moved the camera at least
     # once — startup has no FPS history to validate growth against.
     has_moved_ever = False
@@ -497,11 +525,13 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                            or (sl["mode"] in ("WeightedAverage", "WeightedVariance")
                                and sl["data"] in _state["_vector_fields"])))
         if is_los_vec and not freeze_los_key:
-            fwd_key = tuple(int(round(c * 256)) for c in camera.forward)
+            # Per-particle LOS depends only on camera *position*
+            # (rotation leaves the camera→particle direction unchanged).
+            pos_key = tuple(int(round(float(c) * 1000)) for c in camera.position)
         else:
-            fwd_key = None
+            pos_key = None
         slot_id = (sl["weight"], sl.get("weight2", "None"), sl.get("op", "*"),
-                   sl["mode"], sl["data"], sl.get("proj", "LOS"), fwd_key)
+                   sl["mode"], sl["data"], sl.get("proj", "LOS"), pos_key)
         cached = _slot_sorted[slot_idx]
         if cached is not None and cached[0] == slot_id:
             return cached[1], cached[2]
@@ -511,15 +541,18 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         # applied here.
         proj = sl.get("proj", "LOS")
         vf = _state["_vector_fields"]
-        w = resolve_field(sl["weight"], vf, data, proj, camera.forward)
+        w = resolve_field(sl["weight"], vf, data, proj, camera.forward,
+                          camera_position=camera.position)
         w2_name = sl.get("weight2", "None")
         if w2_name != "None":
-            w2 = resolve_field(w2_name, vf, data, proj, camera.forward)
+            w2 = resolve_field(w2_name, vf, data, proj, camera.forward,
+                               camera_position=camera.position)
             w = combine_fields(w, w2, sl.get("op", "*"))
         sm = w.astype(np.float32)
 
         if sl["mode"] in ("WeightedAverage", "WeightedVariance"):
-            q = resolve_field(sl["data"], vf, data, proj, camera.forward)
+            q = resolve_field(sl["data"], vf, data, proj, camera.forward,
+                              camera_position=camera.position)
             sq = q.astype(np.float32)
         else:
             sq = sm
@@ -667,6 +700,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         # Camera movement
         moved = camera.update(dt)
+        # Per-particle LOS depends on camera position only, not on
+        # orientation, so detect translation separately from rotation.
+        translated = bool(np.any(camera.position != prev_camera_pos))
+        prev_camera_pos = camera.position.copy()
 
         # Subsample per-frame instance cap. Init to 4M (used only at the
         # very first frame); after that the cap learns the highest value
@@ -689,7 +726,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             if smooth_render_ms > 0:
                 cur_cap = renderer._subsample_max_per_frame
                 if smooth_render_ms < target_ms * 0.9:
-                    last_subsample_cap = min(16_000_000, int(cur_cap * 1.1) + 1)
+                    last_subsample_cap = min(subsample_cap_ceiling, int(cur_cap * 1.1) + 1)
                     renderer.set_subsample_max_per_frame(last_subsample_cap)
                 elif smooth_render_ms > target_ms * 1.2:
                     last_subsample_cap = max(500_000, int(cur_cap * 0.85))
@@ -705,22 +742,25 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             # encode/submit asynchronously and Python keeps racing
             # ahead, so dt stays small even when the GPU is buried.
             cur = renderer._subsample_max_per_frame
-            MAX_CAP = 16_000_000
             REFINE_FRAME_MS = 100.0
-            if 0 < last_render_ms <= REFINE_FRAME_MS and cur < MAX_CAP:
+            if 0 < last_render_ms <= REFINE_FRAME_MS and cur < subsample_cap_ceiling:
                 renderer.set_subsample_max_per_frame(
-                    min(int(cur * 1.4) + 1, MAX_CAP))
+                    min(int(cur * 1.4) + 1, subsample_cap_ceiling))
 
-        # LOS projection is computed on the CPU at _apply_render_mode
-        # time (subsample mode has no GPU LOS path). Re-fire it only on
-        # stationary frames — _apply_render_mode is too expensive (full
-        # CPU LOS pass over every particle) to run during motion on
-        # large snapshots.
-        if not moved:
+        # Per-particle LOS depends only on camera position, so the
+        # cached projection is invalid only when the camera has
+        # *translated* (rotation is free). Skip the recompute while
+        # translation is in progress — it's too expensive (full CPU LOS
+        # pass over every particle) to run mid-flight on large
+        # snapshots; once the user stops translating, the gate opens
+        # and the next frame refreshes once.
+        if not translated:
             if is_los_stale(_state["_render_mode_name"], _state["_wa_data_field"],
                             _state["_sd_field"], _state.get("_sd_field2", "None"),
                             _vector_fields, _state["_vector_projection"],
-                            _state.get("_los_camera_fwd"), camera.forward):
+                            _state.get("_los_camera_fwd"), camera.forward,
+                            los_camera_pos=_state.get("_los_camera_pos"),
+                            camera_position=camera.position):
                 app_proxy._apply_render_mode(auto_range=True)
                 last_los_recompute_time = now
                 dirty = True
@@ -924,6 +964,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 _state.get("_sd_op"),
                 _state.get("_vector_projection"),
                 renderer.qty_min, renderer.qty_max, renderer.log_scale,
+                renderer.hsml_scale,
                 ui_hidden,
             )
         except Exception:
@@ -992,7 +1033,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     _render_composite_frame(
                         fb_w, fb_h,
                         encoder=_frame_encoder, screen_view=_frame_screen_view,
-                        freeze_los_key=moved)
+                        freeze_los_key=translated)
                 else:
                     renderer.render(
                         camera, fb_w, fb_h,

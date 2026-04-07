@@ -504,7 +504,10 @@ class WGPURenderer:
             return
         import struct as _struct
         ratio = float(stride)
-        h_scale = ratio ** (1.0 / 3.0)
+        # User-controlled hsml multiplier (overlay slider) composes with
+        # the stride-derived scaling so each splat both fills its share
+        # of the subsample volume and honors the manual size knob.
+        h_scale = (ratio ** (1.0 / 3.0)) * float(self.hsml_scale)
         mass_scale = ratio  # each sampled particle stands in for `stride`
         fov_rad = float(np.radians(camera.fov))
         # Apply the same world-origin shift as the view matrix.

@@ -112,32 +112,68 @@ def uses_vector_field(render_mode_name, wa_data_field, sd_field, sd_field2, vect
 
 
 def is_los_stale(render_mode_name, wa_data_field, sd_field, sd_field2,
-                 vector_fields, vector_projection, los_camera_fwd, camera_forward):
-    """Check if the LOS projection needs recomputing due to camera rotation."""
+                 vector_fields, vector_projection, los_camera_fwd, camera_forward,
+                 los_camera_pos=None, camera_position=None,
+                 pos_threshold=None):
+    """Check if the LOS projection needs recomputing.
+
+    The LOS vector field projects each particle's vector onto the unit
+    vector from the *camera position* to that particle. That direction
+    is invariant under pure camera rotation — only translation
+    invalidates it. So when `camera_position` and `los_camera_pos` are
+    available, we ignore orientation and check only translation.
+
+    `pos_threshold` is the maximum tolerated translation in world units
+    before the cache is considered stale; if None it falls back to 1.0.
+    """
     if not uses_vector_field(render_mode_name, wa_data_field, sd_field, sd_field2,
                              vector_fields):
         return False
     if vector_projection != "LOS":
         return False
+    # Per-particle LOS: only translation matters.
+    if camera_position is not None:
+        if los_camera_pos is None:
+            return True
+        thr = pos_threshold if pos_threshold is not None else 1.0
+        return float(np.linalg.norm(np.asarray(camera_position)
+                                    - np.asarray(los_camera_pos))) > thr
+    # Legacy global-direction LOS: orientation matters.
     if los_camera_fwd is None:
         return True
-    dot = float(np.dot(los_camera_fwd, camera_forward))
-    return dot < 0.9998
+    return float(np.dot(los_camera_fwd, camera_forward)) < 0.9998
 
 
-def project_vector(vec, projection, camera_forward):
+def project_vector(vec, projection, camera_forward,
+                   camera_position=None, positions=None):
     """Project an (N, 3) vector field to a scalar array.
 
     Args:
         vec: (N, 3) float array.
         projection: "LOS", "|v|", or "|v|^2".
-        camera_forward: (3,) unit vector for LOS projection.
+        camera_forward: (3,) unit vector. Used as the LOS direction
+            when `camera_position` and `positions` are not both supplied.
+        camera_position: optional (3,) float array. When provided
+            together with `positions`, the LOS direction is computed
+            per-particle as the unit vector from the camera to each
+            particle (instead of using the global `camera_forward`).
+        positions: optional (N, 3) float array of particle positions.
 
     Returns:
         (N,) float32 array.
     """
     if projection == "LOS":
-        out = vec @ camera_forward
+        if camera_position is not None and positions is not None:
+            # Per-particle line-of-sight: dot the vector field with the
+            # unit vector from the camera to each particle.
+            d = positions.astype(np.float32, copy=False) - np.asarray(
+                camera_position, dtype=np.float32)
+            inv_len = 1.0 / np.maximum(
+                np.linalg.norm(d, axis=1), np.float32(1e-30))
+            d *= inv_len[:, None]
+            out = (vec * d).sum(axis=1)
+        else:
+            out = vec @ camera_forward
     elif projection == "|v|":
         out = np.linalg.norm(vec, axis=1)
     else:  # |v|^2
@@ -172,7 +208,8 @@ def combine_fields(w, w2, op):
     return w * w2
 
 
-def resolve_field(field_name, vector_fields, data_manager, projection, camera_forward):
+def resolve_field(field_name, vector_fields, data_manager, projection,
+                  camera_forward, camera_position=None):
     """Load a field and project to scalar if it's a vector field.
 
     Args:
@@ -181,6 +218,11 @@ def resolve_field(field_name, vector_fields, data_manager, projection, camera_fo
         data_manager: SnapshotData instance.
         projection: "LOS", "|v|", or "|v|^2".
         camera_forward: (3,) unit vector.
+        camera_position: optional (3,) float. When provided and the
+            projection is "LOS", the line-of-sight is computed
+            per-particle (vector dotted with the unit vector from the
+            camera to the particle) instead of using a single global
+            forward direction.
 
     Returns:
         (N,) float32 array.
@@ -189,25 +231,38 @@ def resolve_field(field_name, vector_fields, data_manager, projection, camera_fo
         return data_manager.get_field(field_name)
 
     # Cache the projected scalar so repeat reweights at the same camera
-    # angle (e.g. switching Field 2 between two vector fields) don't
+    # pose (e.g. switching Field 2 between two vector fields) don't
     # recompute a 134M-element dot product every time.
     cache = getattr(data_manager, "_projected_cache", None)
     if cache is None:
         cache = {}
         data_manager._projected_cache = cache
     if projection == "LOS":
-        # Quantize camera forward to defeat trivial float jitter.
-        q = tuple(int(round(c * 10000)) for c in camera_forward)
-        key = (field_name, "LOS", q)
+        if camera_position is not None:
+            # Per-particle LOS depends only on the camera *position*
+            # (the direction from camera to each particle is invariant
+            # under camera rotation). Quantize so trivial float jitter
+            # doesn't invalidate the entry.
+            qp = tuple(int(round(float(c) * 1000)) for c in camera_position)
+            key = (field_name, "LOS_pp", qp)
+        else:
+            qf = tuple(int(round(c * 10000)) for c in camera_forward)
+            key = (field_name, "LOS", qf)
     else:
         key = (field_name, projection)
     hit = cache.get(key)
     if hit is not None:
         return hit
     vec = data_manager.get_vector_field(field_name)
-    out = project_vector(vec, projection, camera_forward)
+    if projection == "LOS" and camera_position is not None:
+        positions = data_manager.get_vector_field("Coordinates")
+        out = project_vector(vec, projection, camera_forward,
+                             camera_position=camera_position,
+                             positions=positions)
+    else:
+        out = project_vector(vec, projection, camera_forward)
     cache[key] = out
-    # Bound the cache to avoid unbounded growth from camera angles.
+    # Bound the cache to avoid unbounded growth from camera poses.
     if len(cache) > 32:
         # Drop an arbitrary old entry.
         cache.pop(next(iter(cache)))
@@ -215,20 +270,23 @@ def resolve_field(field_name, vector_fields, data_manager, projection, camera_fo
 
 
 def compute_weights(sd_field, sd_field2, sd_op, vector_fields, data_manager,
-                    projection, camera_forward):
+                    projection, camera_forward, camera_position=None):
     """Compute the final weight array from primary + optional secondary field.
 
     Returns:
         (N,) float32 array.
     """
-    w = resolve_field(sd_field, vector_fields, data_manager, projection, camera_forward)
+    w = resolve_field(sd_field, vector_fields, data_manager, projection,
+                      camera_forward, camera_position=camera_position)
     if sd_field2 != "None":
-        w2 = resolve_field(sd_field2, vector_fields, data_manager, projection, camera_forward)
+        w2 = resolve_field(sd_field2, vector_fields, data_manager, projection,
+                           camera_forward, camera_position=camera_position)
         w = combine_fields(w, w2, sd_op)
     return w
 
 
-def compute_slot_fields(slot, vector_fields, data_manager, camera_forward):
+def compute_slot_fields(slot, vector_fields, data_manager, camera_forward,
+                        camera_position=None):
     """Compute weights and qty for a composite slot dict.
 
     Args:
@@ -236,6 +294,8 @@ def compute_slot_fields(slot, vector_fields, data_manager, camera_forward):
         vector_fields: set of field names that are vectors.
         data_manager: SnapshotData instance.
         camera_forward: (3,) unit vector.
+        camera_position: optional (3,) float; when given, LOS becomes
+            per-particle (camera-to-particle direction).
 
     Returns:
         (weights, qty) where qty is None for SurfaceDensity mode.
@@ -244,17 +304,20 @@ def compute_slot_fields(slot, vector_fields, data_manager, camera_forward):
     proj = slot.get("proj", "LOS")
 
     # Weight field
-    weights = resolve_field(slot["weight"], vector_fields, data_manager, proj, camera_forward)
+    weights = resolve_field(slot["weight"], vector_fields, data_manager, proj,
+                            camera_forward, camera_position=camera_position)
 
     # Optional second weight field
     w2_name = slot.get("weight2", "None")
     if w2_name != "None":
-        w2 = resolve_field(w2_name, vector_fields, data_manager, proj, camera_forward)
+        w2 = resolve_field(w2_name, vector_fields, data_manager, proj,
+                           camera_forward, camera_position=camera_position)
         weights = combine_fields(weights, w2, slot.get("op", "*"))
 
     # Data (qty) field for weighted average / variance
     if slot["mode"] in ("WeightedAverage", "WeightedVariance"):
-        qty = resolve_field(slot["data"], vector_fields, data_manager, proj, camera_forward)
+        qty = resolve_field(slot["data"], vector_fields, data_manager, proj,
+                            camera_forward, camera_position=camera_position)
     else:
         qty = None
 
