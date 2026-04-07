@@ -8,17 +8,42 @@ RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance", "Compos
 VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
 
 
-def max_entropy_limits(vals, weights, n_bins=64, n_search=20):
-    """Find (lo, hi) that maximize mass-weighted Shannon entropy of the color histogram.
+def max_entropy_limits(vals, weights, n_bins=128, n_search=32, log_scale=False):
+    """Find (lo, hi) that maximize mass-weighted Shannon entropy of the
+    color histogram.
 
-    Fully vectorized search over candidate clipping fractions of the
-    mass-weighted CDF.
+    The search runs on the *displayed* axis: when `log_scale=True`, the
+    objective is the entropy of the log10(value) histogram, and the
+    returned limits are still in linear units (the caller log-transforms
+    them itself).
+
+    Args:
+        vals: (N,) value array.
+        weights: (N,) per-sample weight (e.g. accumulated mass).
+        n_bins: histogram bin count.
+        n_search: grid resolution per axis (lo, hi).
+        log_scale: when True, transform vals to log10 before searching
+            and return exp10 of the optimal limits.
     """
-    # Subsample to cap sort cost
+    vals = np.asarray(vals)
+    weights = np.asarray(weights)
+
+    if log_scale:
+        pos = vals > 0
+        if not pos.any():
+            return float(vals.min()) if len(vals) else 0.0, \
+                   float(vals.max()) if len(vals) else 1.0
+        vals = np.log10(vals[pos])
+        weights = weights[pos]
+
+    # Random subsample to cap sort cost. Strided subsampling is biased on
+    # spatially-coherent inputs (the accum buffer is row-major), so use a
+    # seeded RNG for reproducibility without ordering artifacts.
     if len(vals) > 100_000:
-        step = len(vals) // 100_000
-        vals = vals[::step]
-        weights = weights[::step]
+        rng = np.random.default_rng(0)
+        idx = rng.choice(len(vals), size=100_000, replace=False)
+        vals = vals[idx]
+        weights = weights[idx]
 
     order = np.argsort(vals)
     sv = vals[order]
@@ -26,12 +51,19 @@ def max_entropy_limits(vals, weights, n_bins=64, n_search=20):
     cw = np.cumsum(sw)
     total = cw[-1]
     if total <= 0:
-        return float(sv[0]), float(sv[-1])
+        lo_lin = float(sv[0])
+        hi_lin = float(sv[-1])
+        if log_scale:
+            return float(10 ** lo_lin), float(10 ** hi_lin)
+        return lo_lin, hi_lin
     cw /= total
 
-    # Candidate lo/hi values from mass-weighted CDF fractions
-    lo_fracs = np.linspace(0.0, 0.25, n_search)
-    hi_fracs = np.linspace(0.75, 1.0, n_search)
+    # Candidate lo/hi values from mass-weighted CDF fractions.
+    # Wider window than the original [0,.25]/[.75,1] so the search can
+    # reach the optimum on heavy-tailed / skewed fields, where the true
+    # best lo/hi can sit well past the 25/75 percentiles.
+    lo_fracs = np.linspace(0.0, 0.45, n_search)
+    hi_fracs = np.linspace(0.55, 1.0, n_search)
     lo_vals = np.interp(lo_fracs, cw, sv)
     hi_vals = np.interp(hi_fracs, cw, sv)
 
@@ -55,11 +87,15 @@ def max_entropy_limits(vals, weights, n_bins=64, n_search=20):
         log_p = np.where(p > 0, np.log2(p), 0.0)
     H = -np.sum(p * log_p, axis=2)
 
-    # Mask invalid pairs
+    # Mask invalid pairs (hi <= lo)
     H[hi_vals[None, :] <= lo_vals[:, None]] = -np.inf
 
     i, j = np.unravel_index(H.argmax(), H.shape)
-    return float(lo_vals[i]), float(hi_vals[j])
+    lo_opt = float(lo_vals[i])
+    hi_opt = float(hi_vals[j])
+    if log_scale:
+        return float(10 ** lo_opt), float(10 ** hi_opt)
+    return lo_opt, hi_opt
 
 
 def make_default_app_state(data):

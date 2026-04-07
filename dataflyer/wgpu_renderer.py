@@ -1031,7 +1031,8 @@ class WGPURenderer:
         else:
             from dataflyer.field_ops import max_entropy_limits
             entropy_weights = mass if mass_weighted else np.ones_like(vals)
-            lim_lo, lim_hi = max_entropy_limits(vals, entropy_weights)
+            lim_lo, lim_hi = max_entropy_limits(
+                vals, entropy_weights, log_scale=bool(self.log_scale))
 
         if self.log_scale and not has_negative:
             if lim_lo <= 0:

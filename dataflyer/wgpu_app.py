@@ -193,6 +193,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     def key_callback(win, key, scancode, action, mods):
         nonlocal user_lod, user_budget, _cmap_idx, needs_auto_range, ui_hidden
         nonlocal subsample_cap_ceiling, last_subsample_cap
+        nonlocal dirty, idle_streak
+        if action in (glfw.PRESS, glfw.REPEAT):
+            dirty = True
+            idle_streak = 0
         if user_menu.on_key(key, action):
             return
         if action == glfw.PRESS:
@@ -394,6 +398,13 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         return cx * fw / max(ww, 1), cy * fh / max(wh, 1)
 
     def mouse_button_callback(win, button, action, mods):
+        nonlocal dirty, idle_streak
+        # Any mouse click can mutate UI-internal state (open a dropdown,
+        # focus a text field, drag a slider) that isn't reflected in
+        # `state_sig`. Force at least the next frame to render so the
+        # idle short-circuit doesn't swallow the visible response.
+        dirty = True
+        idle_streak = 0
         if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
             x, y = _cursor_to_fb(win)
             if user_menu.on_click(x, y, app_proxy):
@@ -406,11 +417,17 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         camera.on_cursor(x, y)
 
     def scroll_callback(win, xoffset, yoffset):
+        nonlocal dirty, idle_streak
+        dirty = True
+        idle_streak = 0
         if user_menu.on_scroll(yoffset):
             return
         camera.on_scroll(yoffset)
 
     def char_callback(win, codepoint):
+        nonlocal dirty, idle_streak
+        dirty = True
+        idle_streak = 0
         user_menu.on_char(codepoint, app_proxy)
 
     glfw.set_mouse_button_callback(window, mouse_button_callback)
