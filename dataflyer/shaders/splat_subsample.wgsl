@@ -43,19 +43,6 @@ struct VertexOutput {
     @location(3) quantity: f32,
 };
 
-// 32-bit avalanche hash, matches the legacy compute shader's hash_idx.
-fn hash_idx(i: u32) -> u32 {
-    var x: u32 = i;
-    x = x ^ (x >> 17u);
-    x = x * 0xed5ad4bbu;
-    x = x ^ (x >> 11u);
-    x = x * 0xac4c1b51u;
-    x = x ^ (x >> 15u);
-    x = x * 0x31848babu;
-    x = x ^ (x >> 14u);
-    return x;
-}
-
 fn degenerate(corner: vec2<f32>) -> VertexOutput {
     var out: VertexOutput;
     // Place behind the near plane: clip removes the entire quad with zero

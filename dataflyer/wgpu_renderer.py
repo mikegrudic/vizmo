@@ -177,8 +177,14 @@ class WGPURenderer:
 
         # Colormap
         self._colormap_tex = None
+        self._colormap_tex_view = None
         self._colormap_sampler = None
         self.colormap_tex = None
+
+        # Cached bind groups for resolve / composite passes. Invalidated
+        # whenever the FBO triple is recreated or the colormap is reloaded.
+        self._resolve_bg = None
+        self._composite_bg = None
 
         self._init_pipelines()
 
@@ -260,6 +266,11 @@ class WGPURenderer:
             format="rgba8unorm",
             usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
         )
+        self._colormap_tex_view = self._colormap_tex.create_view()
+        # Invalidate any cached resolve/composite bind groups that
+        # referenced the previous colormap.
+        self._resolve_bg = None
+        self._composite_bg = None
         dev.queue.write_texture(
             {"texture": self._colormap_tex, "mip_level": 0, "origin": (0, 0, 0)},
             rgba_data.tobytes(),
@@ -545,11 +556,16 @@ class WGPURenderer:
             if self._accum_size != (width, height) or self._accum_textures is None:
                 self._accum_textures = self._create_accum_textures(width, height)
                 self._accum_size = (width, height)
+                # Resolve bind group references slot-1 accum views.
+                self._resolve_bg = None
+                self._composite_bg = None
         else:
             if self._accum_size2 == (width, height) and self._accum_textures2 is not None:
                 return
             self._accum_textures2 = self._create_accum_textures(width, height)
             self._accum_size2 = (width, height)
+            # Composite bind group references slot-2 accum views.
+            self._composite_bg = None
 
     def _create_accum_textures(self, width, height):
         """Create a triple of accumulation textures (num, den, sq)."""
@@ -621,12 +637,17 @@ class WGPURenderer:
         rp.draw(4, self.n_stars, 0, 0)
         rp.end()
 
-    def _render_accum(self, camera, width, height, accum_textures):
+    def _render_accum(self, camera, width, height, accum_textures, encoder=None):
         """Render additive accumulation pass into given textures.
 
         Renders:
           - real particles + anisotropic summaries → full-res `accum_textures`
           - isotropic summary splats → half-res `_accum_textures_lo`
+
+        If `encoder` is None, a fresh command encoder is created and
+        submitted at the end of the call (legacy path used by screenshot).
+        Otherwise the accum pass is appended to the supplied encoder and
+        the caller is responsible for submission.
         """
         self._write_camera_uniforms(camera, width, height)
 
@@ -635,7 +656,9 @@ class WGPURenderer:
             self._write_subsample_params(camera, self._subsample_stride)
 
         dev = self.device
-        encoder = dev.create_command_encoder()
+        owns_encoder = encoder is None
+        if owns_encoder:
+            encoder = dev.create_command_encoder()
 
         views = accum_textures["views"]
         render_pass = encoder.begin_render_pass(color_attachments=[
@@ -674,10 +697,18 @@ class WGPURenderer:
                 render_pass.set_bind_group(1, bg1)
                 render_pass.draw(4, instances, 0, 0)
         render_pass.end()
-        dev.queue.submit([encoder.finish()])
+        if owns_encoder:
+            dev.queue.submit([encoder.finish()])
 
-    def render(self, camera, width, height):
-        """Render particle splats via additive accumulation + resolve."""
+    def render(self, camera, width, height, encoder=None, screen_view=None):
+        """Render particle splats via additive accumulation + resolve.
+
+        If `encoder` is provided, the accum + resolve passes are appended
+        to it and the caller owns submission. `screen_view` must then also
+        be supplied (the swapchain texture view to render into). When both
+        are None the legacy path is used: this method creates its own
+        encoder, acquires the current swapchain texture, and submits.
+        """
         self._viewport_width = width
         if self._colormap_tex is None:
             return
@@ -685,32 +716,37 @@ class WGPURenderer:
             return
 
         self._ensure_fbo(width, height, which=1)
-        self._render_accum(camera, width, height, self._accum_textures)
 
-        if self.canvas_context is None:
-            return
+        owns_encoder = encoder is None
+        if owns_encoder:
+            if self.canvas_context is None:
+                return
+            encoder = self.device.create_command_encoder()
+            current_tex = self.canvas_context.get_current_texture()
+            screen_view = current_tex.create_view()
 
-        current_tex = self.canvas_context.get_current_texture()
-        screen_view = current_tex.create_view()
+        # Accum pass — appended to the shared encoder.
+        self._render_accum(camera, width, height, self._accum_textures,
+                           encoder=encoder)
 
         import struct
         resolve_data = struct.pack("ffII", self.qty_min, self.qty_max,
                                    self.resolve_mode, self.log_scale)
         self.device.queue.write_buffer(self._resolve_params_buf, 0, resolve_data)
 
-        resolve_bg = self.device.create_bind_group(
-            layout=self._resolve_bgl,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._resolve_params_buf}},
-                {"binding": 1, "resource": self._accum_textures["views"][0]},
-                {"binding": 2, "resource": self._accum_textures["views"][1]},
-                {"binding": 3, "resource": self._accum_textures["views"][2]},
-                {"binding": 4, "resource": self._colormap_tex.create_view()},
-                {"binding": 5, "resource": self._colormap_sampler},
-            ],
-        )
+        if self._resolve_bg is None:
+            self._resolve_bg = self.device.create_bind_group(
+                layout=self._resolve_bgl,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": self._resolve_params_buf}},
+                    {"binding": 1, "resource": self._accum_textures["views"][0]},
+                    {"binding": 2, "resource": self._accum_textures["views"][1]},
+                    {"binding": 3, "resource": self._accum_textures["views"][2]},
+                    {"binding": 4, "resource": self._colormap_tex_view},
+                    {"binding": 5, "resource": self._colormap_sampler},
+                ],
+            )
 
-        encoder = self.device.create_command_encoder()
         render_pass = encoder.begin_render_pass(
             color_attachments=[
                 {
@@ -722,45 +758,55 @@ class WGPURenderer:
             ],
         )
         render_pass.set_pipeline(self._resolve_pipeline)
-        render_pass.set_bind_group(0, resolve_bg)
+        render_pass.set_bind_group(0, self._resolve_bg)
         render_pass.draw(3, 1, 0, 0)  # fullscreen triangle
         render_pass.end()
         self._encode_star_overlay(encoder, screen_view)
-        self.device.queue.submit([encoder.finish()])
+        if owns_encoder:
+            self.device.queue.submit([encoder.finish()])
 
-    def render_composite(self, camera, width, height, mode1, min1, max1, log1, mode2, min2, max2, log2):
-        """Composite two pre-filled FBOs."""
+    def render_composite(self, camera, width, height, mode1, min1, max1, log1,
+                         mode2, min2, max2, log2,
+                         encoder=None, screen_view=None):
+        """Composite two pre-filled FBOs.
+
+        Like `render()`, accepts an optional external encoder + swapchain
+        view so the caller can bundle this pass with overlay/UI passes
+        into a single submit.
+        """
         self._viewport_width = width
         self._ensure_fbo(width, height, which=1)
         self._ensure_fbo(width, height, which=2)
 
-        if self.canvas_context is None:
-            return
-
-        current_tex = self.canvas_context.get_current_texture()
-        screen_view = current_tex.create_view()
+        owns_encoder = encoder is None
+        if owns_encoder:
+            if self.canvas_context is None:
+                return
+            current_tex = self.canvas_context.get_current_texture()
+            screen_view = current_tex.create_view()
+            encoder = self.device.create_command_encoder()
 
         import struct
 
         comp_data = struct.pack("ffIIffII", min1, max1, mode1, log1, min2, max2, mode2, log2)
         self.device.queue.write_buffer(self._composite_params_buf, 0, comp_data)
 
-        composite_bg = self.device.create_bind_group(
-            layout=self._composite_bgl,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._composite_params_buf}},
-                {"binding": 1, "resource": self._accum_textures["views"][0]},
-                {"binding": 2, "resource": self._accum_textures["views"][1]},
-                {"binding": 3, "resource": self._accum_textures["views"][2]},
-                {"binding": 4, "resource": self._accum_textures2["views"][0]},
-                {"binding": 5, "resource": self._accum_textures2["views"][1]},
-                {"binding": 6, "resource": self._accum_textures2["views"][2]},
-                {"binding": 7, "resource": self._colormap_tex.create_view()},
-                {"binding": 8, "resource": self._colormap_sampler},
-            ],
-        )
+        if self._composite_bg is None:
+            self._composite_bg = self.device.create_bind_group(
+                layout=self._composite_bgl,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": self._composite_params_buf}},
+                    {"binding": 1, "resource": self._accum_textures["views"][0]},
+                    {"binding": 2, "resource": self._accum_textures["views"][1]},
+                    {"binding": 3, "resource": self._accum_textures["views"][2]},
+                    {"binding": 4, "resource": self._accum_textures2["views"][0]},
+                    {"binding": 5, "resource": self._accum_textures2["views"][1]},
+                    {"binding": 6, "resource": self._accum_textures2["views"][2]},
+                    {"binding": 7, "resource": self._colormap_tex_view},
+                    {"binding": 8, "resource": self._colormap_sampler},
+                ],
+            )
 
-        encoder = self.device.create_command_encoder()
         render_pass = encoder.begin_render_pass(
             color_attachments=[
                 {
@@ -772,11 +818,12 @@ class WGPURenderer:
             ],
         )
         render_pass.set_pipeline(self._composite_pipeline)
-        render_pass.set_bind_group(0, composite_bg)
+        render_pass.set_bind_group(0, self._composite_bg)
         render_pass.draw(3, 1, 0, 0)
         render_pass.end()
         self._encode_star_overlay(encoder, screen_view)
-        self.device.queue.submit([encoder.finish()])
+        if owns_encoder:
+            self.device.queue.submit([encoder.finish()])
 
     def screenshot(self, path, width, height, camera, composite_args=None):
         """Render one frame at (width, height) into an offscreen RGBA8
@@ -844,7 +891,7 @@ class WGPURenderer:
                     {"binding": 4, "resource": self._accum_textures2["views"][0]},
                     {"binding": 5, "resource": self._accum_textures2["views"][1]},
                     {"binding": 6, "resource": self._accum_textures2["views"][2]},
-                    {"binding": 7, "resource": self._colormap_tex.create_view()},
+                    {"binding": 7, "resource": self._colormap_tex_view},
                     {"binding": 8, "resource": self._colormap_sampler},
                 ],
             )
@@ -861,7 +908,7 @@ class WGPURenderer:
                     {"binding": 1, "resource": self._accum_textures["views"][0]},
                     {"binding": 2, "resource": self._accum_textures["views"][1]},
                     {"binding": 3, "resource": self._accum_textures["views"][2]},
-                    {"binding": 4, "resource": self._colormap_tex.create_view()},
+                    {"binding": 4, "resource": self._colormap_tex_view},
                     {"binding": 5, "resource": self._colormap_sampler},
                 ],
             )

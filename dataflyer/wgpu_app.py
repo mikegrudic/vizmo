@@ -415,6 +415,19 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     smooth_render_ms = 0.0  # EMA of last_render_ms
     fps = 0.0
 
+    # Idle-frame short-circuit. We re-render only when something visible
+    # could have changed. Tracked: camera movement, framebuffer resize,
+    # _state mutations (qty range, log, render mode, colormap, composite
+    # slot params), the per-frame subsample cap (progressive refinement),
+    # current LOD, and pending auto-range. When none changed we skip
+    # render+overlay+submit entirely and sleep briefly.
+    dirty = True
+    prev_state_sig = None
+    prev_cap = None
+    prev_lod_pixels = None
+    prev_n_particles = None
+    prev_fb_size = (0, 0)
+
     # Progressive refinement / auto-LOD state
     was_moving = False
     user_lod = renderer.lod_pixels
@@ -493,8 +506,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         _slot_sorted[slot_idx] = (slot_id, sm, sq)
         return sm, sq
 
-    def _render_composite_frame(fb_w, fb_h):
-        """Render two fields into separate FBOs and composite them."""
+    def _render_composite_frame(fb_w, fb_h, encoder=None, screen_view=None):
+        """Render two fields into separate FBOs and composite them.
+
+        If `encoder` and `screen_view` are provided, all sub-passes (two
+        accum passes + one composite resolve) are appended to the shared
+        encoder and the caller submits. Otherwise the legacy path runs
+        each sub-call with its own encoder+submit.
+        """
         renderer._ensure_fbo(fb_w, fb_h, which=1)
         renderer._ensure_fbo(fb_w, fb_h, which=2)
 
@@ -521,7 +540,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 renderer.update_weights(w, q)
 
             renderer._write_camera_uniforms(camera, fb_w, fb_h)
-            renderer._render_accum(camera, fb_w, fb_h, accum_sets[i])
+            renderer._render_accum(camera, fb_w, fb_h, accum_sets[i],
+                                   encoder=encoder)
         # Reset active slot so non-composite passes use the default path.
         renderer.set_active_subsample_slot(None)
 
@@ -530,6 +550,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             camera, fb_w, fb_h,
             s0["resolve"], s0["min"], s0["max"], s0["log"],
             s1["resolve"], s1["min"], s1["max"], s1["log"],
+            encoder=encoder, screen_view=screen_view,
         )
 
     def do_cull():
@@ -669,6 +690,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                             _vector_fields, _state["_vector_projection"],
                             _state.get("_los_camera_fwd"), camera.forward):
                 app_proxy._apply_render_mode(auto_range=True)
+                # LOS projection just rotated — force a re-render even if
+                # the idle-frame snapshot would otherwise short-circuit.
+                dirty = True
 
         # --- Cull / progressive refinement / auto-LOD ---
         # Composite mode: progressive refinement via budget, cull happens in _render_composite_frame
@@ -846,20 +870,96 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             win_w, _ = glfw.get_window_size(window)
             renderer._viewport_width = win_w  # LOD uses window size, not retina
 
+        # --- Idle-frame short-circuit ---
+        # Build a signature of all state that affects the rendered image.
+        # If nothing has changed since the last presented frame and we
+        # aren't carrying any pending work, skip the entire render path
+        # (no swapchain acquire, no encode, no submit) and sleep briefly
+        # so the loop doesn't burn CPU.
+        try:
+            _slot0 = _state["_slot"][0]
+            _slot1 = _state["_slot"][1]
+            state_sig = (
+                _state.get("_composite"),
+                _slot0.get("min"), _slot0.get("max"),
+                _slot0.get("log"), _slot0.get("resolve"),
+                _slot1.get("min"), _slot1.get("max"),
+                _slot1.get("log"), _slot1.get("resolve"),
+                _state.get("_render_mode_name"),
+                _state.get("_cmap_idx"),
+                _state.get("_wa_data_field"),
+                _state.get("_sd_field"),
+                _state.get("_sd_field2"),
+                _state.get("_sd_op"),
+                _state.get("_vector_projection"),
+                renderer.qty_min, renderer.qty_max, renderer.log_scale,
+                ui_hidden,
+            )
+        except Exception:
+            state_sig = None  # be conservative: render
+        cap_now = renderer._subsample_max_per_frame
+        lod_now = renderer.lod_pixels
+        n_particles_now = renderer.n_particles
+        fb_size_now = (fb_w, fb_h)
+
+        frame_dirty = (
+            dirty
+            or moved
+            or needs_auto_range
+            or pending_auto_range_frames > 0
+            or state_sig is None
+            or state_sig != prev_state_sig
+            or cap_now != prev_cap
+            or lod_now != prev_lod_pixels
+            or n_particles_now != prev_n_particles
+            or fb_size_now != prev_fb_size
+        )
+
+        if not frame_dirty:
+            # Nothing changed: skip render/encode/submit. Sleep briefly to
+            # avoid 100% CPU. glfw.poll_events at the top of the next
+            # iteration picks up new input. Don't increment frame_count
+            # for skipped frames so the FPS counter doesn't get inflated
+            # by no-op iterations.
+            frame_count = max(frame_count - 1, 0)
+            time.sleep(0.005)
+            continue
+
         # Render. Time the call wall-clock — most of this is
         # get_current_texture blocking on the swapchain present, which
         # is the only signal that reflects real GPU latency (Python's
         # encode + submit are async w.r.t. the GPU).
         _t_render = time.perf_counter()
+
+        # Single encoder + single submit per frame: acquire the swapchain
+        # texture once, append accum/resolve and the overlay/UI passes to
+        # the same command encoder, submit at the end. This halves the
+        # per-frame wgpu FFI roundtrips vs. the old "render submits, then
+        # overlay submits" path.
+        _frame_encoder = None
+        _frame_screen_view = None
         try:
-            if _state["_composite"]:
-                _render_composite_frame(fb_w, fb_h)
-            else:
-                renderer.render(camera, fb_w, fb_h)
+            current_tex = canvas_context.get_current_texture()
+            _frame_screen_view = current_tex.create_view()
+            _frame_encoder = device.create_command_encoder()
+        except Exception:
+            import traceback; traceback.print_exc()
+
+        try:
+            if _frame_encoder is not None:
+                if _state["_composite"]:
+                    _render_composite_frame(
+                        fb_w, fb_h,
+                        encoder=_frame_encoder, screen_view=_frame_screen_view)
+                else:
+                    renderer.render(
+                        camera, fb_w, fb_h,
+                        encoder=_frame_encoder, screen_view=_frame_screen_view)
         except Exception as e:
             print(f"Render error: {e}")
             import traceback; traceback.print_exc()
-            # Ensure we still present something (avoid black flash)
+            # Ensure we still present something (avoid black flash). The
+            # legacy fallback path uses its own encoder/submit.
             try:
                 renderer.render(camera, fb_w, fb_h)
             except Exception:
@@ -875,6 +975,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             renderer.qty_min = lo
             renderer.qty_max = hi
             print(f"Auto-range: {lo:.3g} .. {hi:.3g}")
+            # The pre-built frame encoder already encoded a resolve with
+            # the *stale* qty range. Drop it so we don't submit stale
+            # pixels on top of the freshly-auto-ranged image. The legacy
+            # render() call below uses its own encoder and submits
+            # immediately; the overlay block will fall back to its own
+            # encoder since _frame_encoder is now None.
+            _frame_encoder = None
+            _frame_screen_view = None
             try:
                 renderer.render(camera, fb_w, fb_h)
             except Exception:
@@ -904,10 +1012,19 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         # Overlay rendering pass (on top of the resolved image)
         # Skip overlay + present on odd frames when skip_vsync is on
         _do_present = not renderer.skip_vsync or frame_count % 2 == 0
-        if not ui_hidden and _do_present:
+        # If the auto-range branch dropped the prebuilt frame encoder,
+        # we need a fresh one (with its own swapchain view) just for the
+        # overlay pass.
+        if not ui_hidden and _do_present and _frame_encoder is None:
+            try:
+                current_tex = canvas_context.get_current_texture()
+                _frame_screen_view = current_tex.create_view()
+                _frame_encoder = device.create_command_encoder()
+            except Exception:
+                import traceback; traceback.print_exc()
+        if not ui_hidden and _do_present and _frame_encoder is not None:
           try:
-            current_tex = canvas_context.get_current_texture()
-            screen_view = current_tex.create_view()
+            screen_view = _frame_screen_view
 
             overlay.set_framebuffer_size(fb_w, fb_h)
             user_menu.set_framebuffer_size(fb_w, fb_h)
@@ -942,8 +1059,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 composite_slots=_state["_slot"] if _state["_composite"] else None,
             )
 
-            encoder = device.create_command_encoder()
-            rpass = encoder.begin_render_pass(color_attachments=[{
+            rpass = _frame_encoder.begin_render_pass(color_attachments=[{
                 "view": screen_view,
                 "load_op": "load",
                 "store_op": "store",
@@ -952,13 +1068,29 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             if overlay.enabled:
                 overlay.render_to_pass(rpass)
             rpass.end()
-            device.queue.submit([encoder.finish()])
           except Exception:
             import traceback
             traceback.print_exc()
 
+        # Submit the single per-frame encoder (covers accum + resolve +
+        # optional overlay/UI). Then present.
+        if _frame_encoder is not None:
+            try:
+                device.queue.submit([_frame_encoder.finish()])
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
         if _do_present:
             canvas_context.present()
+
+        # Frame committed: snapshot state for the next idle-check.
+        prev_state_sig = state_sig
+        prev_cap = cap_now
+        prev_lod_pixels = lod_now
+        prev_n_particles = n_particles_now
+        prev_fb_size = fb_size_now
+        dirty = False
 
     # Cleanup
     renderer.release()
