@@ -367,7 +367,11 @@ class WGPURenderer:
         self.STAR_RGB_BANDS = (4, 2, 1)  # PSF/κ layer indices for (R, G, B)
         self.star_band_idx = 2  # default V
         self.star_extinction_kappa = self.STAR_BANDS[self.star_band_idx][1]
-        self.star_extinction_enabled = True
+        # Off by default: building the gas KDTree and computing per-star
+        # column densities is expensive on large snapshots and pointless
+        # for users who never toggle extinction on. Both the tree build
+        # and the column update are gated on this flag.
+        self.star_extinction_enabled = False
 
     N_STAR_MODES = 6  # 5 single-band + 1 RGB composite
 
@@ -386,6 +390,10 @@ class WGPURenderer:
 
     def toggle_star_extinction(self):
         self.star_extinction_enabled = not self.star_extinction_enabled
+        # Drop the column cache so the next frame recomputes (when
+        # turning on) or stops attenuating (when turning off).
+        self._star_columns = None
+        self._star_columns_cam_pos = None
         self._star_buf_dirty = True
         print(f"  [stars] extinction {'ON' if self.star_extinction_enabled else 'OFF'}")
 
@@ -849,6 +857,8 @@ class WGPURenderer:
         self._star_columns and is consumed by the future star draw path.
         """
         if getattr(self, "n_stars", 0) == 0:
+            return
+        if not self.star_extinction_enabled:
             return
         if getattr(self, "_ext_xgas", None) is None:
             return
