@@ -21,3 +21,9 @@ dependencies = [
 
 [project.scripts]
 vizmo = "vizmo.app:main"
+
+[tool.setuptools.packages.find]
+include = ["vizmo*"]
+
+[tool.setuptools.package-data]
+vizmo = ["shaders/*.wgsl", "assets/*"]
