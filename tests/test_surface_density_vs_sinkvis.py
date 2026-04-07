@@ -248,13 +248,16 @@ def test_surface_density_perspective_huge_offset(particle_data):
     log_df = np.log10(sigma_vizmo[mask])
     correlation = np.corrcoef(log_sv, log_df)[0, 1]
     median_log_ratio = np.median(np.abs(log_sv - log_df))
+    _save_comparison(sigma_sinkvis, sigma_vizmo, correlation, median_log_ratio, mass_ratio,
+                     filename="surface_density_comparison_huge_offset.png")
     assert correlation > 0.99, f"Log surface density correlation too low: {correlation:.3f}"
     assert median_log_ratio < 0.1, (
         f"Median |log10(sinkvis/vizmo)| = {median_log_ratio:.3f}, expected < 0.1 dex"
     )
 
 
-def _save_comparison(sigma_sv, sigma_df, correlation, median_log_ratio, mass_ratio):
+def _save_comparison(sigma_sv, sigma_df, correlation, median_log_ratio, mass_ratio,
+                     filename="surface_density_comparison.png"):
     """3-panel diagnostic image: SinkVis | vizmo | log ratio."""
     import matplotlib
 
@@ -301,7 +304,7 @@ def _save_comparison(sigma_sv, sigma_df, correlation, median_log_ratio, mass_rat
         ax.set_yticks([])
 
     fig.tight_layout()
-    out = os.path.join(os.path.dirname(__file__), "surface_density_comparison.png")
+    out = os.path.join(os.path.dirname(__file__), filename)
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"\nComparison image saved to {out}")
