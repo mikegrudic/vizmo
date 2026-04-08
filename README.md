@@ -1,6 +1,6 @@
 # vizmo
 
-![Image of a galaxy rendered in the user interface window of vizmo](vizmo_screenshot.png)
+![Animated demo of vizmo flying through a galaxy simulation](vizmo_demo.gif)
 
 Real-time 3D fly-through explorer for unstructured simulation data. Loads HDF5 snapshots from GIZMO/Gadget/AREPO simulations and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite CoolMap visualizations on the GPU via WebGPU.
 
