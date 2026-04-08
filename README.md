@@ -10,6 +10,14 @@ But I hope you enjoy it and please feel free to report bugs or request features.
 
 ## Installation
 
+### pypi
+
+```bash
+pip install vizmo
+```
+
+### Local source
+
 ```bash
 pip install -e .
 ```
