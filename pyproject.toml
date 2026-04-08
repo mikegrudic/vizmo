@@ -18,6 +18,7 @@ dependencies = [
     "natsort",
     "Pillow",
     "wgpu>=0.19",
+    "meshoid",
 ]
 
 [project.scripts]

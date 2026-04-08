@@ -89,8 +89,15 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
 
     # Load data
     print(f"Loading {snapshot_path}...")
-    data = SnapshotData(snapshot_path)
-    print(f"  {data.n_particles:,} gas particles loaded")
+    def _hsml_progress(msg):
+        try:
+            glfw.set_window_title(window, f"vizmo [wgpu] | {msg}")
+            glfw.poll_events()
+        except Exception:
+            pass
+
+    data = SnapshotData(snapshot_path, hsml_progress=_hsml_progress)
+    print(f"  {data.n_particles:,} particles loaded (types {data.particle_types})")
 
     # Camera
     camera = Camera(fov=fov, aspect=width / height)
@@ -395,6 +402,16 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
             _state["_sd_field"] = value
             self._apply_render_mode()
 
+        def _toggle_particle_type(self, p):
+            """Toggle a particle type in the loaded pool. Triggers a reload."""
+            cur = set(data.particle_types)
+            if p in cur:
+                cur.discard(p)
+            else:
+                cur.add(p)
+            new_types = sorted(cur)
+            _state["_pending_ptype_reload"] = new_types
+
         def _set_colormap(self, name):
             from .colormaps import colormap_to_texture_data as _cmap_data
 
@@ -686,6 +703,52 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
             glfw.set_window_title(window, f"vizmo [wgpu] | {fps:.0f} fps | {n_vis/1e6:.1f}M/{n_tot/1e6:.1f}M{init_msg}")
 
         glfw.poll_events()
+
+        # Particle-type reload requested from the UI tickboxes.
+        pending_types = _state.get("_pending_ptype_reload")
+        if pending_types is not None:
+            _state["_pending_ptype_reload"] = None
+            print(f"Reloading particle types: {pending_types}")
+            data.set_particle_types(pending_types)
+
+            # Refresh available scalar/vector field lists (intersection
+            # across selected types).
+            _sd_fields = data.available_fields()
+            _vector_fields = data.available_vector_fields()
+            _state["_vector_fields"] = _vector_fields
+            if _state["_sd_field"] not in _sd_fields:
+                _state["_sd_field"] = "Masses"
+            if _state["_sd_field2"] not in (["None"] + _sd_fields):
+                _state["_sd_field2"] = "None"
+            if _state["_wa_data_field"] not in _sd_fields:
+                _state["_wa_data_field"] = "Masses"
+            for sl in _state["_slot"]:
+                if sl["weight"] not in _sd_fields:
+                    sl["weight"] = "Masses"
+                if sl.get("weight2", "None") not in (["None"] + _sd_fields):
+                    sl["weight2"] = "None"
+                if sl["data"] not in _sd_fields:
+                    sl["data"] = "Masses"
+
+            # Re-upload particles to the renderer and force GPU compute
+            # to re-init on the next frame so the subsample pipeline
+            # picks up the new pool.
+            weights = data.get_field("Masses")
+            renderer.set_particles(data.positions, data.hsml, weights)
+            try:
+                renderer.set_subsample_chunks(None)
+            except Exception:
+                pass
+            if gpu_compute is not None:
+                try:
+                    gpu_compute.release()
+                except Exception:
+                    pass
+            gpu_compute = None
+            _slot_sorted[0] = None
+            _slot_sorted[1] = None
+            needs_auto_range = True
+            dirty = True
 
         # GPU subsample pipeline init (one-time upload, first frame).
         gpu_ready = getattr(gpu_compute, "_upload_ready", False)
@@ -1073,6 +1136,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
                     vector_projection=_state["_vector_projection"],
                     vector_projections=_VECTOR_PROJECTIONS,
                     composite_slots=_state["_slot"] if _state["_composite"] else None,
+                    available_ptypes=data.available_types,
+                    selected_ptypes=list(data.particle_types),
                 )
 
                 rpass = _frame_encoder.begin_render_pass(

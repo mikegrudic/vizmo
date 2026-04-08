@@ -156,6 +156,11 @@ class Panel:
             elif t == "slider":
                 bbox = draw.textbbox((0, 0), f"[-] {item[1]}: {item[2]:.2f} [+]", font=self._font)
                 max_w = max(max_w, bbox[2] - bbox[0] + M * 4)
+            elif t == "ptype_row":
+                bbox = draw.textbbox((0, 0), item[1], font=self._font)
+                box_w = max(LH - 4, 16)
+                row_w = bbox[2] - bbox[0] + 8 + 6 * (box_w + 4) + M * 4
+                max_w = max(max_w, row_w)
 
         # Count lines including dropdown expansion
         n_lines = len(items)
@@ -242,6 +247,39 @@ class Panel:
                 self._widgets.append((y, y + LH, "slider_inc", key, vmin, vmax))
                 y += LH
 
+            elif t == "ptype_row":
+                _, label, available, selected, key = item
+                draw.text((M, y), label, fill=s.text_color, font=self._font)
+                bbox = draw.textbbox((0, 0), label, font=self._font)
+                lbl_w = bbox[2] - bbox[0] + 8
+                box_w = max(LH - 4, 16)
+                gap = 4
+                bx = M + lbl_w
+                for p in range(6):
+                    enabled = p in available
+                    on = p in selected
+                    fill = s.toggle_on_color if on else s.field_bg
+                    if not enabled:
+                        fill = (40, 40, 40, 255)
+                    draw.rectangle(
+                        [(bx, y + 2), (bx + box_w, y + LH - 4)],
+                        fill=fill,
+                        outline=s.text_color,
+                    )
+                    txt_color = s.text_color if enabled else (90, 90, 90, 255)
+                    tb = draw.textbbox((0, 0), str(p), font=self._font)
+                    tw_ = tb[2] - tb[0]
+                    draw.text(
+                        (bx + (box_w - tw_) // 2, y),
+                        str(p),
+                        fill=txt_color,
+                        font=self._font,
+                    )
+                    if enabled:
+                        self._widgets.append((y, y + LH, "ptype_tick", key, p, bx, bx + box_w))
+                    bx += box_w + gap
+                y += LH
+
             elif t == "field":
                 _, label, value, key = item
                 active = getattr(self, '_editing', None) == key
@@ -291,6 +329,11 @@ class Panel:
             return None
         for widget in self._widgets:
             if widget[0] <= ly < widget[1]:
+                # ptype_tick widgets share a row; disambiguate by x bounds.
+                if widget[2] == "ptype_tick":
+                    if widget[5] <= lx < widget[6]:
+                        return widget
+                    continue
                 return widget
         return "inside_miss"
 
@@ -589,7 +632,8 @@ class UserMenu(Panel):
                render_modes=None, render_mode_name="SurfaceDensity",
                wa_data_field="Masses",
                vector_fields=None, vector_projection="LOS", vector_projections=None,
-               composite_slots=None):
+               composite_slots=None,
+               available_ptypes=None, selected_ptypes=None):
         self._SD_OPS = sd_ops or ["*"]
         items = []
 
@@ -600,6 +644,13 @@ class UserMenu(Panel):
             if vf not in all_fields:
                 all_fields.append(vf)
         vprojs = vector_projections or ["LOS", "|v|", "|v|^2"]
+
+        if available_ptypes is not None:
+            items.append((
+                "ptype_row", "Types",
+                set(available_ptypes), set(selected_ptypes or set()),
+                "ptypes",
+            ))
 
         if render_modes and len(render_modes) > 1:
             items.append(("dropdown", "Mode", render_mode_name, render_modes, "render_mode"))
@@ -719,6 +770,12 @@ class UserMenu(Panel):
         # Common widget handling
         base = self._handle_base_click(widget, x - self._panel_x)
         if base is True:
+            return True
+
+        if wtype == "ptype_tick":
+            p = widget[4]
+            if hasattr(app, "_toggle_particle_type"):
+                app._toggle_particle_type(p)
             return True
 
         if wtype == "field":

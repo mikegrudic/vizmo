@@ -25,7 +25,11 @@ Point `vizmo` at an HDF5 snapshot file:
 vizmo path/to/snapshot.hdf5
 ```
 
-The snapshot must contain gas particle data (`PartType0`) with at minimum `Coordinates`, `Masses`, and `KernelMaxRadius` (or `SmoothingLength`) fields. Star particles (`PartType5`) are also supported if present.
+The snapshot must contain at least one `PartTypeN` group with `Coordinates` and `Masses`. Smoothing lengths are taken from `SmoothingLength`/`KernelMaxRadius`/`Hsml` if present, otherwise from a per-type softening in the header (e.g. `SofteningTypeN`, `SofteningTable`), and as a last resort computed on the fly via `meshoid.Meshoid(x, boxsize=boxsize).SmoothingLength()`. Star particles (`PartType5`) are rendered as point sources when present.
+
+### Particle type selection
+
+A row of six tickboxes labeled `0`–`5` at the top of the user menu controls which `PartTypeN` groups are loaded into the active particle pool. Disabled (greyed out) ticks correspond to types that are not present in the snapshot. Toggling a tick reloads the pool, refreshes the **Weight**/**Field 2**/**Data** dropdowns to show only the scalar/vector fields that are common to *all* selected types, and re-runs auto-range. The default selection is `PartType0` if present, otherwise the first available type.
 
 ### CLI options
 
