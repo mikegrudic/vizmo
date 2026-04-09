@@ -135,7 +135,7 @@ class WGPURenderer:
         self.log_scale = 1
         self.kernel = "cubic_spline"
         self.auto_lod = True
-        self.target_fps = 15.0
+        self.target_fps = 20.0
         self.auto_lod_smooth = 0.3
         # PID gains for the auto-LOD controller (tunable from the dev panel).
         self.pid_Kp = 1.0
@@ -613,7 +613,8 @@ class WGPURenderer:
                 usage=(wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.INDIRECT | wgpu.BufferUsage.COPY_DST),
             )
             bg1 = _make_bind_group(
-                dev, self._splat_bgl1,
+                dev,
+                self._splat_bgl1,
                 [cb["pos"], cb["hsml"], cb["mass"], cb["qty"], cb["index"], bases_buf, cb["pos_lo"]],
             )
             mg_bg = dev.create_bind_group(
@@ -931,8 +932,8 @@ class WGPURenderer:
         columns = np.zeros(n_stars, dtype=np.float64)
 
         # Per-star geometry, computed once.
-        rays = cam_pos[None, :] - xstar                         # (n_stars, 3)
-        d_obs_arr = np.linalg.norm(rays, axis=1)                # (n_stars,)
+        rays = cam_pos[None, :] - xstar  # (n_stars, 3)
+        d_obs_arr = np.linalg.norm(rays, axis=1)  # (n_stars,)
         safe = d_obs_arr > 0.0
         ray_dirs = np.zeros_like(rays)
         ray_dirs[safe] = rays[safe] / d_obs_arr[safe, None]
@@ -978,9 +979,7 @@ class WGPURenderer:
                     per_star_local[owners_cat[i]].append(lst)
             for s in range(n_stars):
                 if per_star_local[s]:
-                    local = np.unique(
-                        np.concatenate([np.asarray(l, dtype=np.int64) for l in per_star_local[s]])
-                    )
+                    local = np.unique(np.concatenate([np.asarray(l, dtype=np.int64) for l in per_star_local[s]]))
                     if local.size:
                         star_cands[s].append(bin_idx[local])
 
@@ -1022,9 +1021,9 @@ class WGPURenderer:
         chunk = max(1, int(32 * 1024 * 1024 / max(n_gas, 1)))
         for s0 in range(0, n_stars, chunk):
             s1 = min(s0 + chunk, n_stars)
-            xs = xstar[s0:s1]                        # (C, 3)
-            ray = cam_pos[None, :] - xs              # (C, 3)
-            d_obs = np.linalg.norm(ray, axis=1)      # (C,)
+            xs = xstar[s0:s1]  # (C, 3)
+            ray = cam_pos[None, :] - xs  # (C, 3)
+            d_obs = np.linalg.norm(ray, axis=1)  # (C,)
             safe = d_obs > 0.0
             if not np.any(safe):
                 continue
@@ -1034,15 +1033,15 @@ class WGPURenderer:
             # r[c, g, :] = xgas[g] - xs[c]
             # t[c, g] = r · ray_dir[c]
             # |r|² = |xgas|² - 2 xgas·xs + |xs|²
-            xs_dot_xs = np.einsum("ij,ij->i", xs, xs)             # (C,)
-            xg_dot_xg = np.einsum("ij,ij->i", xgas, xgas)         # (n_gas,)
-            xg_dot_xs = xgas @ xs.T                                # (n_gas, C)
+            xs_dot_xs = np.einsum("ij,ij->i", xs, xs)  # (C,)
+            xg_dot_xg = np.einsum("ij,ij->i", xgas, xgas)  # (n_gas,)
+            xg_dot_xs = xgas @ xs.T  # (n_gas, C)
             r2 = (xg_dot_xg[:, None] - 2.0 * xg_dot_xs + xs_dot_xs[None, :]).T  # (C, n_gas)
 
             # t = (xgas - xs) · ray_dir = xgas·ray_dir - xs·ray_dir
-            xs_dot_dir = np.einsum("ij,ij->i", xs, ray_dir)        # (C,)
-            xg_dot_dir = xgas @ ray_dir.T                           # (n_gas, C)
-            t = (xg_dot_dir - xs_dot_dir[None, :]).T                # (C, n_gas)
+            xs_dot_dir = np.einsum("ij,ij->i", xs, ray_dir)  # (C,)
+            xg_dot_dir = xgas @ ray_dir.T  # (n_gas, C)
+            t = (xg_dot_dir - xs_dot_dir[None, :]).T  # (C, n_gas)
 
             b2 = np.maximum(r2 - t * t, 0.0)
             mask = (t > 0.0) & (t < d_obs[:, None]) & (b2 < hgas2[None, :])
