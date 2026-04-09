@@ -739,7 +739,9 @@ class SnapshotData:
             return self._cache[key]
 
         grp = self._file[ptype]
-        if field in grp:
+        if field == "Coordinates" and "CenterOfMass" in grp:
+            data = grp["CenterOfMass"][:]
+        elif field in grp:
             data = grp[field][:]
         else:
             found = False
