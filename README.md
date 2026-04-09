@@ -55,6 +55,14 @@ vizmo uses a WebGPU backend ([wgpu-py](https://github.com/pygfx/wgpu-py)) with G
 
 The renderer uses progressive refinement and an auto-LOD subsample cap that adapts within a user-controlled ceiling to keep interaction smooth during motion and sharpen on idle.
 
+## Algorithms
+
+Getting this to work on 100M+ particle datasets can be tricky. Here is what has worked so far:
+- Adaptive random subsampling, rescaling masses and radii appropriately, wired up to a PID loop to achieve a smooth framerate.
+- Fully-sampled renders when the camera stops, resuming adaptive subsampling when it moves again.
+- Multi-grid kernel splatting, implementing the algorithm of [meshoid](https://github.com/mikegrudic/meshoid) on the GPU, so that particles appearing large on the screen do not have to splat a huge number of pixels.
+- GPU-side brute-force frustum culling. Experimented extensively with tree-based algorithms, but at ~100M bruteforce works fine.
+
 ## Controls
 
 **Camera:**
