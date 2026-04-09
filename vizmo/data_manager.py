@@ -22,7 +22,9 @@ def _resolve_snapshot_parts(path):
     if os.path.isdir(path):
         files = sorted(glob.glob(os.path.join(path, "*.hdf5")), key=_part_index)
         if not files:
-            raise FileNotFoundError(f"No .hdf5 files in directory {path}")
+            files = sorted(glob.glob(os.path.join(path, "*.athdf")))
+        if not files:
+            raise FileNotFoundError(f"No .hdf5/.athdf files in directory {path}")
         return files
     if os.path.isfile(path):
         base = os.path.basename(path)
@@ -112,6 +114,244 @@ class _MultiGroup:
 
     def get(self, name, default=None):
         return self[name] if name in self._names else default
+
+
+class _MemDataset:
+    """Wrap an in-memory ndarray with the bits of the h5py.Dataset API used here."""
+
+    def __init__(self, arr):
+        self._arr = arr
+        self.shape = arr.shape
+        self.ndim = arr.ndim
+        self.dtype = arr.dtype
+
+    def __getitem__(self, key):
+        return self._arr[key]
+
+    def __array__(self, dtype=None):
+        return self._arr if dtype is None else self._arr.astype(dtype)
+
+
+class _MemGroup:
+    def __init__(self, fields):
+        self._fields = {k: _MemDataset(v) for k, v in fields.items()}
+
+    def __contains__(self, name):
+        return name in self._fields
+
+    def __iter__(self):
+        return iter(self._fields)
+
+    def keys(self):
+        return list(self._fields.keys())
+
+    def __getitem__(self, name):
+        return self._fields[name]
+
+    def get(self, name, default=None):
+        return self._fields.get(name, default)
+
+
+class _HeaderGroup:
+    def __init__(self, attrs):
+        self.attrs = attrs
+
+
+def _decode_str_list(arr):
+    out = []
+    for v in np.array(arr).ravel():
+        if isinstance(v, bytes):
+            out.append(v.decode())
+        else:
+            out.append(str(v))
+    return out
+
+
+def _read_athdf(path):
+    """Flatten an Athena++ .athdf file into (header_attrs, PartType0_fields).
+
+    Each mesh-block cell becomes one "particle" with position = cell center
+    (converted to Cartesian xyz when needed), Masses = density * cell volume,
+    SmoothingLength = volume^(1/3), and every variable in VariableNames is
+    exposed as an additional scalar field. vel1/vel2/vel3 are bundled into a
+    Cartesian Velocities (N,3) field.
+    """
+    f = h5py.File(path, "r")
+    try:
+        a = f.attrs
+        nblocks = int(np.asarray(a["NumMeshBlocks"]).ravel()[0])
+        mbsize = np.asarray(a["MeshBlockSize"]).astype(int).ravel()
+        nx1, nx2, nx3 = int(mbsize[0]), int(mbsize[1]), int(mbsize[2])
+        coord_sys = a["Coordinates"]
+        if isinstance(coord_sys, bytes):
+            coord_sys = coord_sys.decode()
+        coord_sys = str(coord_sys)
+        time = float(np.asarray(a.get("Time", 0.0)).ravel()[0])
+        var_names = _decode_str_list(a["VariableNames"])
+        ds_names = _decode_str_list(a["DatasetNames"])
+        num_vars = np.asarray(a["NumVariables"]).astype(int).ravel()
+
+        # var_name -> (dataset_name, index_within_dataset)
+        var_map = {}
+        offset = 0
+        for ds, nv in zip(ds_names, num_vars):
+            for i in range(int(nv)):
+                var_map[var_names[offset + i]] = (ds, i)
+            offset += int(nv)
+
+        x1f = f["x1f"][:]  # (nblocks, nx1+1)
+        x2f = f["x2f"][:]
+        x3f = f["x3f"][:]
+
+        x1c = 0.5 * (x1f[:, :-1] + x1f[:, 1:])
+        x2c = 0.5 * (x2f[:, :-1] + x2f[:, 1:])
+        x3c = 0.5 * (x3f[:, :-1] + x3f[:, 1:])
+        dx1 = x1f[:, 1:] - x1f[:, :-1]
+        dx2 = x2f[:, 1:] - x2f[:, :-1]
+        dx3 = x3f[:, 1:] - x3f[:, :-1]
+
+        shape4 = (nblocks, nx3, nx2, nx1)
+        c1 = np.broadcast_to(x1c[:, None, None, :], shape4).reshape(-1)
+        c2 = np.broadcast_to(x2c[:, None, :, None], shape4).reshape(-1)
+        c3 = np.broadcast_to(x3c[:, :, None, None], shape4).reshape(-1)
+        d1 = np.broadcast_to(dx1[:, None, None, :], shape4).reshape(-1)
+        d2 = np.broadcast_to(dx2[:, None, :, None], shape4).reshape(-1)
+        d3 = np.broadcast_to(dx3[:, :, None, None], shape4).reshape(-1)
+        c1 = np.ascontiguousarray(c1)
+        c2 = np.ascontiguousarray(c2)
+        c3 = np.ascontiguousarray(c3)
+        d1 = np.ascontiguousarray(d1)
+        d2 = np.ascontiguousarray(d2)
+        d3 = np.ascontiguousarray(d3)
+
+        if coord_sys == "cartesian":
+            x, y, z = c1, c2, c3
+            vol = d1 * d2 * d3
+        elif coord_sys == "cylindrical":
+            R, phi, zc = c1, c2, c3
+            r1 = R - 0.5 * d1
+            r2 = R + 0.5 * d1
+            vol = 0.5 * (r2 * r2 - r1 * r1) * d2 * d3
+            x = R * np.cos(phi)
+            y = R * np.sin(phi)
+            z = zc
+        elif coord_sys.startswith("spherical"):
+            r, th, ph = c1, c2, c3
+            r1 = r - 0.5 * d1
+            r2 = r + 0.5 * d1
+            t1 = th - 0.5 * d2
+            t2 = th + 0.5 * d2
+            vol = (1.0 / 3.0) * (r2**3 - r1**3) * (np.cos(t1) - np.cos(t2)) * d3
+            sth = np.sin(th)
+            x = r * sth * np.cos(ph)
+            y = r * sth * np.sin(ph)
+            z = r * np.cos(th)
+        else:
+            print(f"  Warning: unknown Athena coordinate system {coord_sys!r}, "
+                  "treating as Cartesian")
+            x, y, z = c1, c2, c3
+            vol = d1 * d2 * d3
+
+        positions = np.stack(
+            [x.astype(np.float64), y.astype(np.float64), z.astype(np.float64)],
+            axis=1,
+        )
+        hsml = np.cbrt(vol).astype(np.float32)
+
+        fields = {}
+        for ds in ds_names:
+            arr = f[ds][:]  # (nv_in_ds, nblocks, nx3, nx2, nx1)
+            for vname, (vds, vi) in var_map.items():
+                if vds != ds:
+                    continue
+                fields[vname] = np.ascontiguousarray(
+                    arr[vi].reshape(-1)
+                ).astype(np.float32)
+
+        out = {"Coordinates": positions, "SmoothingLength": hsml}
+
+        rho_name = next(
+            (n for n in ("rho", "dens", "density") if n in fields), None
+        )
+        if rho_name is not None:
+            density = fields[rho_name]
+            out["Density"] = density
+            out["Masses"] = (density * vol).astype(np.float32)
+        else:
+            out["Masses"] = vol.astype(np.float32)
+
+        if all(f"vel{i}" in fields for i in (1, 2, 3)):
+            v1 = fields["vel1"]
+            v2 = fields["vel2"]
+            v3 = fields["vel3"]
+            if coord_sys == "cylindrical":
+                cphi = np.cos(c2)
+                sphi = np.sin(c2)
+                vx = v1 * cphi - v2 * sphi
+                vy = v1 * sphi + v2 * cphi
+                vz = v3
+            elif coord_sys.startswith("spherical"):
+                sth = np.sin(c2)
+                cth = np.cos(c2)
+                cph = np.cos(c3)
+                sph = np.sin(c3)
+                vx = v1 * sth * cph + v2 * cth * cph - v3 * sph
+                vy = v1 * sth * sph + v2 * cth * sph + v3 * cph
+                vz = v1 * cth - v2 * sth
+            else:
+                vx, vy, vz = v1, v2, v3
+            out["Velocities"] = np.stack(
+                [vx.astype(np.float32), vy.astype(np.float32), vz.astype(np.float32)],
+                axis=1,
+            )
+
+        skip = {"rho", "dens", "density", "vel1", "vel2", "vel3"}
+        rename = {"press": "Pressure"}
+        for vname, varr in fields.items():
+            if vname in skip:
+                continue
+            out[rename.get(vname, vname)] = varr
+
+        # Header attrs: Time is the only field SnapshotData truly needs;
+        # include a BoxSize derived from RootGridX1/2/3 for downstream sizing.
+        try:
+            extents = []
+            for k in ("RootGridX1", "RootGridX2", "RootGridX3"):
+                rg = np.asarray(a[k]).ravel()
+                extents.append(float(rg[1] - rg[0]))
+            box = float(max(extents))
+        except Exception:
+            box = 0.0
+        header_attrs = {"Time": time, "BoxSize": box}
+        return header_attrs, out
+    finally:
+        f.close()
+
+
+class _AthdfFile:
+    """h5py.File-like wrapper that exposes a flattened .athdf as PartType0."""
+
+    def __init__(self, path):
+        header_attrs, fields = _read_athdf(path)
+        self._groups = {
+            "Header": _HeaderGroup(header_attrs),
+            "PartType0": _MemGroup(fields),
+        }
+
+    def keys(self):
+        return list(self._groups.keys())
+
+    def __contains__(self, key):
+        return key in self._groups
+
+    def __getitem__(self, key):
+        return self._groups[key]
+
+    def get(self, key, default=None):
+        return self._groups.get(key, default)
+
+    def close(self):
+        pass
 
 
 class _MultiFile:
@@ -250,11 +490,16 @@ class SnapshotData:
 
     def __init__(self, path, particle_types=None, hsml_progress=None):
         self.path = path
-        parts = _resolve_snapshot_parts(path)
-        if len(parts) == 1:
-            self._file = h5py.File(parts[0], "r")
+        if os.path.isfile(path) and path.lower().endswith(".athdf"):
+            self._file = _AthdfFile(path)
         else:
-            self._file = _MultiFile(parts)
+            parts = _resolve_snapshot_parts(path)
+            if len(parts) == 1 and parts[0].lower().endswith(".athdf"):
+                self._file = _AthdfFile(parts[0])
+            elif len(parts) == 1:
+                self._file = h5py.File(parts[0], "r")
+            else:
+                self._file = _MultiFile(parts)
         self.header = dict(self._file["Header"].attrs)
         self.time = float(self.header.get("Time", 0))
 
@@ -436,6 +681,22 @@ class SnapshotData:
                 h = self._read_field(ptype, name).astype(np.float32)
                 self._hsml_cache[p] = h
                 return h
+
+        # Recover hsml from cell volume if available (Arepo-style "Volume",
+        # or Masses/Density). Use 2*cbrt(V) as an approximate kernel radius.
+        if "Volume" in grp:
+            vol = self._read_field(ptype, "Volume").astype(np.float32)
+            h = (2.0 * np.cbrt(vol)).astype(np.float32)
+            self._hsml_cache[p] = h
+            return h
+        if "Density" in grp and "Masses" in grp:
+            mass = self._read_field(ptype, "Masses").astype(np.float32)
+            dens = self._read_field(ptype, "Density").astype(np.float32)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                vol = np.where(dens > 0, mass / dens, 0.0)
+            h = (2.0 * np.cbrt(vol)).astype(np.float32)
+            self._hsml_cache[p] = h
+            return h
 
         # Try header per-type softening (Gadget-style: SofteningTypeN /
         # SofteningComovingTypeN / SofteningTable)
