@@ -6,7 +6,7 @@ Real-time 3D fly-through explorer for unstructured simulation data. Loads HDF5 s
 
 This is a **vibecoded** app. I have no idea how its front- or backends work, and am not sure if I could really properly support or get it running for you 10 years from now! But it would not exist otherwise. Software is weird now. It is what it is. 
 
-But I hope you enjoy it and please feel free to report bugs, request features, or develop your own and send a PR.
+But I hope you enjoy it and please feel free to report bugs, request features, or develop your own and send a PR. Making it work for more data formats is well within scope, just ask!
 
 ## Installation
 
