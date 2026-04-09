@@ -1,7 +1,156 @@
 """Load mesh-free simulation snapshots via h5py with lazy field loading."""
 
+import os
+import re
+import glob
 import numpy as np
 import h5py
+
+
+def _part_index(p):
+    m = re.match(r".+\.(\d+)\.hdf5$", os.path.basename(p))
+    return int(m.group(1)) if m else 0
+
+
+def _resolve_snapshot_parts(path):
+    """Return sorted list of HDF5 files for a snapshot.
+
+    Accepts a single .hdf5 file, one part of a multipart snapshot
+    (e.g. snapshot_XXX.0.hdf5), or a directory containing parts
+    (e.g. snapdir_XXX/).
+    """
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "*.hdf5")), key=_part_index)
+        if not files:
+            raise FileNotFoundError(f"No .hdf5 files in directory {path}")
+        return files
+    if os.path.isfile(path):
+        base = os.path.basename(path)
+        m = re.match(r"(.+)\.(\d+)\.hdf5$", base)
+        if m:
+            stem = m.group(1)
+            d = os.path.dirname(path) or "."
+            files = sorted(
+                glob.glob(os.path.join(d, f"{stem}.*.hdf5")), key=_part_index
+            )
+            if files:
+                return files
+        return [path]
+    raise FileNotFoundError(path)
+
+
+class _MultiDataset:
+    """Concatenated view of one field across multiple HDF5 part files."""
+
+    def __init__(self, files, ptype, name):
+        self._files = files
+        self._ptype = ptype
+        self._name = name
+        first_shape = None
+        first_dtype = None
+        total_n = 0
+        for f in files:
+            grp = f.get(ptype)
+            if grp is None or name not in grp:
+                continue
+            ds = grp[name]
+            if first_shape is None:
+                first_shape = ds.shape
+                first_dtype = ds.dtype
+            total_n += ds.shape[0]
+        if first_shape is None:
+            raise KeyError(name)
+        self.shape = (total_n,) + tuple(first_shape[1:])
+        self.ndim = len(self.shape)
+        self.dtype = first_dtype
+
+    def _concat(self):
+        chunks = []
+        for f in self._files:
+            grp = f.get(self._ptype)
+            if grp is None or self._name not in grp:
+                continue
+            chunks.append(grp[self._name][:])
+        if len(chunks) == 1:
+            return chunks[0]
+        return np.concatenate(chunks, axis=0)
+
+    def __getitem__(self, key):
+        return self._concat()[key]
+
+    def __array__(self, dtype=None):
+        a = self._concat()
+        return a if dtype is None else a.astype(dtype)
+
+
+class _MultiGroup:
+    """Union view of one PartType group across multiple HDF5 part files."""
+
+    def __init__(self, files, ptype):
+        self._files = files
+        self._ptype = ptype
+        names = set()
+        for f in files:
+            g = f.get(ptype)
+            if g is not None:
+                names.update(g.keys())
+        self._names = names
+
+    def __contains__(self, name):
+        return name in self._names
+
+    def __iter__(self):
+        return iter(sorted(self._names))
+
+    def keys(self):
+        return sorted(self._names)
+
+    def __getitem__(self, name):
+        if name not in self._names:
+            raise KeyError(name)
+        return _MultiDataset(self._files, self._ptype, name)
+
+    def get(self, name, default=None):
+        return self[name] if name in self._names else default
+
+
+class _MultiFile:
+    """Minimal h5py.File-like wrapper over a multipart snapshot."""
+
+    def __init__(self, paths):
+        self._files = [h5py.File(p, "r") for p in paths]
+        ptypes = set()
+        for f in self._files:
+            for k in f.keys():
+                if not k.startswith("PartType"):
+                    continue
+                g = f[k]
+                if isinstance(g, h5py.Group) and "Coordinates" in g:
+                    ptypes.add(k)
+        self._ptypes = sorted(ptypes)
+
+    def keys(self):
+        return ["Header"] + self._ptypes
+
+    def __contains__(self, key):
+        return key == "Header" or key in self._ptypes
+
+    def __getitem__(self, key):
+        if key == "Header":
+            return self._files[0]["Header"]
+        if key in self._ptypes:
+            return _MultiGroup(self._files, key)
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+    def close(self):
+        for f in self._files:
+            try:
+                f.close()
+            except Exception:
+                pass
 
 # Field name fallbacks for different GIZMO versions
 _FIELD_FALLBACKS = {
@@ -101,7 +250,11 @@ class SnapshotData:
 
     def __init__(self, path, particle_types=None, hsml_progress=None):
         self.path = path
-        self._file = h5py.File(path, "r")
+        parts = _resolve_snapshot_parts(path)
+        if len(parts) == 1:
+            self._file = h5py.File(parts[0], "r")
+        else:
+            self._file = _MultiFile(parts)
         self.header = dict(self._file["Header"].attrs)
         self.time = float(self.header.get("Time", 0))
 
@@ -111,7 +264,7 @@ class SnapshotData:
             if not k.startswith("PartType"):
                 continue
             grp = self._file[k]
-            if isinstance(grp, h5py.Group) and "Coordinates" in grp:
+            if "Coordinates" in grp:
                 avail.append(int(k.replace("PartType", "")))
         self.available_types = sorted(avail)
 
