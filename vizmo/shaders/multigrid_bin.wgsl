@@ -38,6 +38,8 @@ struct BinParams {
 @group(0) @binding(4) var<storage, read_write> bases: array<u32>;
 @group(0) @binding(5) var<storage, read_write> index_buf: array<u32>;
 @group(0) @binding(6) var<storage, read_write> indirect: array<u32>;
+@group(0) @binding(7) var<storage, read> brick_id: array<u32>;
+@group(0) @binding(8) var<storage, read> brick_vis: array<u32>;
 
 const MAX_LEVELS: u32 = 16u;
 
@@ -63,8 +65,10 @@ fn cs_count(@builtin(workgroup_id) wid: vec3<u32>,
     workgroupBarrier();
     let i = (wid.y * 65535u + wid.x) * 256u + lid.x;
     if (i < bp.n_to_consider) {
-        let lvl = level_for(i);
-        atomicAdd(&wg_counts[lvl], 1u);
+        if (brick_vis[brick_id[i]] != 0u) {
+            let lvl = level_for(i);
+            atomicAdd(&wg_counts[lvl], 1u);
+        }
     }
     workgroupBarrier();
     if (lid.x < bp.n_levels) {
@@ -116,10 +120,14 @@ fn cs_scatter(@builtin(workgroup_id) wid: vec3<u32>,
     let i = (wid.y * 65535u + wid.x) * 256u + lid.x;
     var lvl: u32 = 0u;
     var local_slot: u32 = 0u;
-    let in_range = i < bp.n_to_consider;
+    var in_range = i < bp.n_to_consider;
     if (in_range) {
-        lvl = level_for(i);
-        local_slot = atomicAdd(&wg_local[lvl], 1u);
+        if (brick_vis[brick_id[i]] == 0u) {
+            in_range = false;
+        } else {
+            lvl = level_for(i);
+            local_slot = atomicAdd(&wg_local[lvl], 1u);
+        }
     }
     workgroupBarrier();
 

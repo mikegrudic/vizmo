@@ -227,8 +227,8 @@ class WGPURenderer:
                 {"binding": 1, "visibility": V, "buffer": {"type": "uniform"}},
             ]
         )
-        # bg1: pos / hsml / mass / qty / index / bases / pos_lo per chunk
-        self._splat_bgl1 = _storage_bgl(dev, 7, V)
+        # bg1: pos / hsml / mass / qty / index / bases / pos_lo / brick_id / brick_vis per chunk
+        self._splat_bgl1 = _storage_bgl(dev, 9, V)
 
         self._splat_subsample_layout = dev.create_pipeline_layout(
             bind_group_layouts=[self._splat_subsample_bgl0, self._splat_bgl1]
@@ -273,6 +273,8 @@ class WGPURenderer:
                 {"binding": 4, "visibility": C, "buffer": {"type": "storage"}},
                 {"binding": 5, "visibility": C, "buffer": {"type": "storage"}},
                 {"binding": 6, "visibility": C, "buffer": {"type": "storage"}},
+                {"binding": 7, "visibility": C, "buffer": {"type": "read-only-storage"}},
+                {"binding": 8, "visibility": C, "buffer": {"type": "read-only-storage"}},
             ]
         )
         mg_layout = dev.create_pipeline_layout(bind_group_layouts=[self._mg_bin_bgl])
@@ -284,6 +286,19 @@ class WGPURenderer:
         )
         self._mg_scatter_pipeline = dev.create_compute_pipeline(
             layout=mg_layout, compute={"module": self._mg_bin_shader, "entry_point": "cs_scatter"}
+        )
+        # Brick-cull compute pipeline.
+        self._brick_cull_shader = dev.create_shader_module(code=_load_wgsl("brick_cull.wgsl"))
+        self._brick_cull_bgl = dev.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": C, "buffer": {"type": "uniform"}},
+                {"binding": 1, "visibility": C, "buffer": {"type": "read-only-storage"}},
+                {"binding": 2, "visibility": C, "buffer": {"type": "storage"}},
+            ]
+        )
+        brick_cull_layout = dev.create_pipeline_layout(bind_group_layouts=[self._brick_cull_bgl])
+        self._brick_cull_pipeline = dev.create_compute_pipeline(
+            layout=brick_cull_layout, compute={"module": self._brick_cull_shader, "entry_point": "cs_brick_cull"}
         )
 
         self._cascade_pipeline = dev.create_render_pipeline(
@@ -615,7 +630,7 @@ class WGPURenderer:
             bg1 = _make_bind_group(
                 dev,
                 self._splat_bgl1,
-                [cb["pos"], cb["hsml"], cb["mass"], cb["qty"], cb["index"], bases_buf, cb["pos_lo"]],
+                [cb["pos"], cb["hsml"], cb["mass"], cb["qty"], cb["index"], bases_buf, cb["pos_lo"], cb["brick_id"], cb["brick_vis"]],
             )
             mg_bg = dev.create_bind_group(
                 layout=self._mg_bin_bgl,
@@ -627,6 +642,19 @@ class WGPURenderer:
                     {"binding": 4, "resource": {"buffer": bases_buf}},
                     {"binding": 5, "resource": {"buffer": cb["index"]}},
                     {"binding": 6, "resource": {"buffer": indirect_buf}},
+                    {"binding": 7, "resource": {"buffer": cb["brick_id"]}},
+                    {"binding": 8, "resource": {"buffer": cb["brick_vis"]}},
+                ],
+            )
+            # Brick-cull compute bind group. 80 B = 4 × vec4 + 4 scalars.
+            brick_cull_params_buf = dev.create_buffer(
+                size=80, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+            brick_cull_bg = dev.create_bind_group(
+                layout=self._brick_cull_bgl,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": brick_cull_params_buf}},
+                    {"binding": 1, "resource": {"buffer": cb["brick_aabb"]}},
+                    {"binding": 2, "resource": {"buffer": cb["brick_vis"]}},
                 ],
             )
             out.append(
@@ -640,13 +668,18 @@ class WGPURenderer:
                     "pos_lo": cb["pos_lo"],
                     "hsml": cb["hsml"],
                     "index": cb["index"],
+                    "brick_id": cb["brick_id"],
+                    "brick_vis": cb["brick_vis"],
                     "n": int(cb["n"]),
+                    "n_bricks": int(cb["n_bricks"]),
                     "start": int(cb["start"]),
                     "bin_params_buf": bin_params_buf,
                     "counts_buf": counts_buf,
                     "bases_buf": bases_buf,
                     "indirect_buf": indirect_buf,
                     "mg_bg": mg_bg,
+                    "brick_cull_params_buf": brick_cull_params_buf,
+                    "brick_cull_bg": brick_cull_bg,
                 }
             )
         self._subsample_chunks = out
@@ -709,7 +742,7 @@ class WGPURenderer:
             bg = _make_bind_group(
                 self.device,
                 self._splat_bgl1,
-                [ck["pos"], ck["hsml"], sc["mass"], sc["qty"], ck["index"], ck["bases_buf"], ck["pos_lo"]],
+                [ck["pos"], ck["hsml"], sc["mass"], sc["qty"], ck["index"], ck["bases_buf"], ck["pos_lo"], ck["brick_id"], ck["brick_vis"]],
             )
             bgs.append(bg)
         self._slot_subsample_bgs[slot_idx] = bgs
@@ -1078,6 +1111,39 @@ class WGPURenderer:
             self._accum_size2 = (width, height)
             # Composite bind group references slot-2 accum views.
             self._composite_bg = None
+
+    def _dispatch_brick_cull(self, camera, encoder, h_scale):
+        """Run per-brick frustum culling for every chunk. Writes
+        brick_vis[brick_id] = 0/1 into each chunk's brick_vis buffer.
+        Must run before the multigrid bin pass or the splat draw.
+        """
+        import struct as _struct
+
+        dev = self.device
+        offset = getattr(self, "_world_offset", None)
+        cam_pos = camera.position - offset if offset is not None else camera.position
+        fov_rad = float(np.radians(camera.fov))
+
+        for ck in self._subsample_chunks:
+            n_bricks = int(ck["n_bricks"])
+            params = _struct.pack(
+                "ffff ffff ffff ffff fffI",
+                float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]), 0.0,
+                float(camera.forward[0]), float(camera.forward[1]), float(camera.forward[2]), 0.0,
+                float(camera.right[0]), float(camera.right[1]), float(camera.right[2]), 0.0,
+                float(camera.up[0]), float(camera.up[1]), float(camera.up[2]), 0.0,
+                fov_rad, float(camera.aspect), float(h_scale), n_bricks,
+            )
+            dev.queue.write_buffer(ck["brick_cull_params_buf"], 0, params)
+
+        for ck in self._subsample_chunks:
+            n_bricks = int(ck["n_bricks"])
+            n_groups = (n_bricks + 63) // 64
+            cp = encoder.begin_compute_pass()
+            cp.set_bind_group(0, ck["brick_cull_bg"])
+            cp.set_pipeline(self._brick_cull_pipeline)
+            cp.dispatch_workgroups(n_groups, 1, 1)
+            cp.end()
 
     def _dispatch_multigrid_bin(self, camera, encoder, budget, n_total_chunks):
         """Run count → build → scatter for every chunk so each level's
@@ -1466,10 +1532,16 @@ class WGPURenderer:
 
         n_levels = max(1, int(getattr(self, "_subsample_n_levels", 1)))
 
-        # Multigrid: bin pass writes per-chunk index buffer + indirect
-        # args. Must run before begin_render_pass.
-        if n_levels > 1 and self._subsample_chunks is not None and accum_textures is self._accum_textures:
-            self._dispatch_multigrid_bin(camera, encoder, budget, n_total_chunks)
+        # Brick cull + multigrid bin: always run both so that draw_indirect
+        # instance counts reflect only visible particles. The bin pass
+        # with brick_vis checks compacts the index buffer, so culled
+        # bricks produce zero vertex invocations (not just degenerate quads).
+        if self._subsample_chunks is not None:
+            ratio = max(n_total_chunks / max(budget, 1), 1.0)
+            h_scale = (ratio ** (1.0 / 3.0)) * float(self.hsml_scale)
+            self._dispatch_brick_cull(camera, encoder, h_scale)
+            if accum_textures is self._accum_textures:
+                self._dispatch_multigrid_bin(camera, encoder, budget, n_total_chunks)
 
         # Pre-resolve the slot bg list once.
         slot = self._active_subsample_slot
@@ -1507,10 +1579,7 @@ class WGPURenderer:
                     render_pass.set_bind_group(0, bg0)
                     bg1 = slot_bgs[i] if slot_bgs is not None else ck["bg1"]
                     render_pass.set_bind_group(1, bg1)
-                    if n_levels > 1:
-                        render_pass.draw_indirect(ck["indirect_buf"], lvl * 16)
-                    else:
-                        render_pass.draw(4, instances, 0, 0)
+                    render_pass.draw_indirect(ck["indirect_buf"], lvl * 16)
             render_pass.end()
 
         # Cascade: fold coarser levels into finer ones, ending at level 0

@@ -49,6 +49,10 @@ struct SubsampleParams {
 @group(1) @binding(5) var<storage, read> s_bases: array<u32>;
 // Low-order half of the particle position (DSFUN90 hi/lo split).
 @group(1) @binding(6) var<storage, read> s_pos_lo: array<vec4<f32>>;
+// Per-particle spatial brick assignment (survives the global shuffle).
+@group(1) @binding(7) var<storage, read> s_brick_id: array<u32>;
+// Per-brick visibility flag written by the brick_cull compute pass.
+@group(1) @binding(8) var<storage, read> s_brick_vis: array<u32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,

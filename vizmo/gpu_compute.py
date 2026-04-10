@@ -11,6 +11,52 @@ import numpy as np
 import wgpu
 
 
+BRICK_SIZE = 4096  # Must match BRICK_SIZE in multigrid_bin.wgsl
+
+
+def _spread_bits_10(v):
+    """Spread 10-bit uint into every-3rd-bit position for Morton interleave.
+    Input: uint32 array with values in [0, 1023]. Output: uint64."""
+    x = v.astype(np.uint64)
+    x = (x | (x << 16)) & np.uint64(0x030000FF)
+    x = (x | (x << 8))  & np.uint64(0x0300F00F)
+    x = (x | (x << 4))  & np.uint64(0x030C30C3)
+    x = (x | (x << 2))  & np.uint64(0x09249249)
+    return x
+
+
+def _assign_spatial_bricks(pos_f32, n_bricks):
+    """Assign each particle to a spatial brick via Morton-code binning.
+
+    Returns brick_ids (uint32 per particle). Bricks are equal-count
+    groups along the Z-order (Morton) curve, giving spatially compact
+    bricks suitable for frustum culling.
+    """
+    if n_bricks <= 1:
+        return np.zeros(len(pos_f32), dtype=np.uint32)
+
+    # Quantize positions to 10-bit-per-axis grid (1024^3 cells).
+    pmin = pos_f32.min(axis=0)
+    pmax = pos_f32.max(axis=0)
+    extent = np.maximum(pmax - pmin, 1e-30)
+    grid = ((pos_f32 - pmin) / extent * 1023.0).clip(0, 1023).astype(np.uint32)
+
+    # 30-bit Morton code via proper bit-interleaving.
+    morton = (_spread_bits_10(grid[:, 0]) << np.uint64(2)
+            | _spread_bits_10(grid[:, 1]) << np.uint64(1)
+            | _spread_bits_10(grid[:, 2]))
+
+    order = np.argsort(morton, kind="stable")
+    n = len(pos_f32)
+    brick_ids = np.empty(n, dtype=np.uint32)
+    bsize = (n + n_bricks - 1) // n_bricks
+    for bi in range(n_bricks):
+        a = bi * bsize
+        b = min(a + bsize, n)
+        brick_ids[order[a:b]] = bi
+    return brick_ids
+
+
 class GPUCompute:
     """Allocates and manages the per-chunk source particle buffers and
     the per-slot mass/qty buffers used by composite mode.
@@ -59,6 +105,34 @@ class GPUCompute:
         pmax = np.asarray(pos_src.max(axis=0), dtype=np.float64)
         self._pos_offset = (pmin + pmax) * 0.5
 
+        # 256 MB cap per binding (Apple Metal practical limit) → 16 M
+        # particles per chunk for pos at 16 bytes each.
+        SAFE_CHUNK_BYTES = 256 * 1024 * 1024
+        chunk_n = SAFE_CHUNK_BYTES // 16
+
+        # Assign each particle to a spatially compact brick BEFORE
+        # shuffling. The brick_id array will be shuffled along with
+        # everything else so the GPU can look up each particle's brick.
+        n_bricks_total = (n + BRICK_SIZE - 1) // BRICK_SIZE
+        # Compute offset-shifted f32 positions (needed for brick AABBs
+        # and spatial assignment).
+        shifted_all = (np.asarray(pos_src, dtype=np.float64) - self._pos_offset)
+        pos_hi_all = shifted_all.astype(np.float32)
+        brick_ids = _assign_spatial_bricks(pos_hi_all, n_bricks_total)
+
+        # Compute per-brick AABBs from pre-shuffle positions.
+        # Layout per brick: vec4(min_x, min_y, min_z, 0),
+        #                   vec4(max_x, max_y, max_z, h_max)
+        brick_aabb_data = np.zeros((n_bricks_total, 8), dtype=np.float32)
+        for bi in range(n_bricks_total):
+            mask = brick_ids == bi
+            bp = pos_hi_all[mask]
+            bh = hsml_src[mask]
+            if len(bp) > 0:
+                brick_aabb_data[bi, 0:3] = bp.min(axis=0)
+                brick_aabb_data[bi, 4:7] = bp.max(axis=0)
+                brick_aabb_data[bi, 7] = float(bh.max())
+
         # Pre-shuffle the source arrays so a per-chunk dispatch of K
         # instances draws a uniformly random K-subset of the chunk via
         # plain ii-indexing in the vertex shader (no hash, no
@@ -69,11 +143,7 @@ class GPUCompute:
         hsml_src = np.ascontiguousarray(hsml_src[perm])
         mass_src = np.ascontiguousarray(mass_src[perm])
         qty_src = np.ascontiguousarray(qty_src[perm])
-
-        # 256 MB cap per binding (Apple Metal practical limit) → 16 M
-        # particles per chunk for pos at 16 bytes each.
-        SAFE_CHUNK_BYTES = 256 * 1024 * 1024
-        chunk_n = SAFE_CHUNK_BYTES // 16
+        brick_ids = np.ascontiguousarray(brick_ids[perm])
 
         # mapped_at_creation lets us write directly to device memory
         # without going through Metal's staging-buffer queue.
@@ -132,10 +202,36 @@ class GPUCompute:
             index_buf.write_mapped(np.arange(cn, dtype=np.uint32).tobytes())
             index_buf.unmap()
 
+            # Per-particle brick_id buffer: maps each (shuffled) particle
+            # to its spatial brick. The cull shader writes per-brick
+            # visibility; the splat/multigrid shaders read brick_id to
+            # check it.
+            brick_id_buf = dev.create_buffer(
+                size=cn * 4, usage=usage, mapped_at_creation=True)
+            brick_id_buf.write_mapped(brick_ids[start:start + cn].tobytes())
+            brick_id_buf.unmap()
+
+            # Global brick AABB + visibility buffers (shared across all
+            # chunks since brick_ids are globally assigned).  Each chunk
+            # gets its own copy of the full AABB/vis arrays — they're
+            # small (~n_bricks * 32 B / 4 B) and this avoids cross-chunk
+            # bind group complications.
+            brick_aabb_buf = dev.create_buffer(
+                size=n_bricks_total * 32, usage=usage, mapped_at_creation=True)
+            brick_aabb_buf.write_mapped(brick_aabb_data.tobytes())
+            brick_aabb_buf.unmap()
+
+            brick_vis_buf = dev.create_buffer(
+                size=n_bricks_total * 4, usage=usage, mapped_at_creation=True)
+            brick_vis_buf.write_mapped(np.ones(n_bricks_total, dtype=np.uint32).tobytes())
+            brick_vis_buf.unmap()
+
             self._chunk_bufs.append({
                 "pos": pos_buf, "pos_lo": pos_lo_buf, "hsml": hsml_buf,
                 "mass": mass_buf, "qty": qty_buf, "index": index_buf,
-                "n": cn, "start": start,
+                "brick_id": brick_id_buf,
+                "brick_aabb": brick_aabb_buf, "brick_vis": brick_vis_buf,
+                "n": cn, "n_bricks": n_bricks_total, "start": start,
             })
 
         self._particle_bufs = self._chunk_bufs[0]
