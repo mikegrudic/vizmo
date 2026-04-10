@@ -424,6 +424,7 @@ class DevOverlay(Panel):
             items.append(("slider", "PID Ki", renderer.pid_Ki, 0.0, 2.0, "pid_Ki"))
             items.append(("slider", "PID Kd", renderer.pid_Kd, 0.0, 2.0, "pid_Kd"))
         items.append(("slider", "Hsml Scale", renderer.hsml_scale, 0.1, 5.0, "hsml_scale"))
+        items.append(("toggle", "Perspective Correction", renderer.perspective_correction, "perspective_correction"))
         items.append(("slider", "Multigrid Levels",
                       float(getattr(renderer, "multigrid_levels", 1)),
                       1.0, 8.0, "multigrid_levels"))

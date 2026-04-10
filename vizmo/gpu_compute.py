@@ -14,47 +14,37 @@ import wgpu
 BRICK_SIZE = 4096  # Must match BRICK_SIZE in multigrid_bin.wgsl
 
 
-def _spread_bits_10(v):
-    """Spread 10-bit uint into every-3rd-bit position for Morton interleave.
-    Input: uint32 array with values in [0, 1023]. Output: uint64."""
-    x = v.astype(np.uint64)
-    x = (x | (x << 16)) & np.uint64(0x030000FF)
-    x = (x | (x << 8))  & np.uint64(0x0300F00F)
-    x = (x | (x << 4))  & np.uint64(0x030C30C3)
-    x = (x | (x << 2))  & np.uint64(0x09249249)
-    return x
-
-
 def _assign_spatial_bricks(pos_f32, n_bricks):
-    """Assign each particle to a spatial brick via Morton-code binning.
+    """Assign each particle to a spatial brick via 3D grid binning.
 
-    Returns brick_ids (uint32 per particle). Bricks are equal-count
-    groups along the Z-order (Morton) curve, giving spatially compact
-    bricks suitable for frustum culling.
+    Each particle maps to a grid cell; each cell IS a brick. O(N) with
+    no sort. The grid resolution is chosen so the number of cells is
+    close to n_bricks (cubed root, rounded up).
     """
     if n_bricks <= 1:
-        return np.zeros(len(pos_f32), dtype=np.uint32)
+        pmin = pos_f32.min(axis=0)
+        pmax = pos_f32.max(axis=0)
+        extent = np.maximum(pmax - pmin, np.float32(1e-30))
+        return np.zeros(len(pos_f32), dtype=np.uint32), 1, 1, pmin, extent
 
-    # Quantize positions to 10-bit-per-axis grid (1024^3 cells).
     pmin = pos_f32.min(axis=0)
     pmax = pos_f32.max(axis=0)
-    extent = np.maximum(pmax - pmin, 1e-30)
-    grid = ((pos_f32 - pmin) / extent * 1023.0).clip(0, 1023).astype(np.uint32)
+    extent = np.maximum(pmax - pmin, np.float32(1e-30))
 
-    # 30-bit Morton code via proper bit-interleaving.
-    morton = (_spread_bits_10(grid[:, 0]) << np.uint64(2)
-            | _spread_bits_10(grid[:, 1]) << np.uint64(1)
-            | _spread_bits_10(grid[:, 2]))
-
-    order = np.argsort(morton, kind="stable")
-    n = len(pos_f32)
-    brick_ids = np.empty(n, dtype=np.uint32)
-    bsize = (n + n_bricks - 1) // n_bricks
-    for bi in range(n_bricks):
-        a = bi * bsize
-        b = min(a + bsize, n)
-        brick_ids[order[a:b]] = bi
-    return brick_ids
+    # Grid resolution: cube root of n_bricks, at least 2.
+    res = max(2, int(np.ceil(n_bricks ** (1.0 / 3.0))))
+    # Scale factors to map positions directly to grid cell indices.
+    scale = (np.float64(res) / extent).astype(np.float32)
+    # Compute flattened brick id per particle in one fused pass,
+    # avoiding a full (N,3) int32 intermediate.
+    r2 = np.int32(res * res)
+    r1 = np.int32(res)
+    rmax = np.int32(res - 1)
+    x = np.clip(((pos_f32[:, 0] - pmin[0]) * scale[0]).astype(np.int32), 0, rmax)
+    y = np.clip(((pos_f32[:, 1] - pmin[1]) * scale[1]).astype(np.int32), 0, rmax)
+    z = np.clip(((pos_f32[:, 2] - pmin[2]) * scale[2]).astype(np.int32), 0, rmax)
+    brick_ids = (x * r2 + y * r1 + z).astype(np.uint32)
+    return brick_ids, res * res * res, res, pmin, extent
 
 
 class GPUCompute:
@@ -113,25 +103,28 @@ class GPUCompute:
         # Assign each particle to a spatially compact brick BEFORE
         # shuffling. The brick_id array will be shuffled along with
         # everything else so the GPU can look up each particle's brick.
-        n_bricks_total = (n + BRICK_SIZE - 1) // BRICK_SIZE
+        n_bricks_approx = (n + BRICK_SIZE - 1) // BRICK_SIZE
         # Compute offset-shifted f32 positions (needed for brick AABBs
         # and spatial assignment).
         shifted_all = (np.asarray(pos_src, dtype=np.float64) - self._pos_offset)
         pos_hi_all = shifted_all.astype(np.float32)
-        brick_ids = _assign_spatial_bricks(pos_hi_all, n_bricks_total)
+        brick_ids, n_bricks_total, grid_res, pmin, extent = \
+            _assign_spatial_bricks(pos_hi_all, n_bricks_approx)
 
-        # Compute per-brick AABBs from pre-shuffle positions.
-        # Layout per brick: vec4(min_x, min_y, min_z, 0),
-        #                   vec4(max_x, max_y, max_z, h_max)
+        # Per-brick AABBs from grid geometry (no particle iteration).
+        # Each brick = one grid cell, so the AABB is the cell boundary.
+        cell_size = extent / grid_res
+        # Build grid-cell coordinates for all bricks.
+        bids = np.arange(n_bricks_total, dtype=np.int32)
+        ix = bids // (grid_res * grid_res)
+        iy = (bids // grid_res) % grid_res
+        iz = bids % grid_res
         brick_aabb_data = np.zeros((n_bricks_total, 8), dtype=np.float32)
-        for bi in range(n_bricks_total):
-            mask = brick_ids == bi
-            bp = pos_hi_all[mask]
-            bh = hsml_src[mask]
-            if len(bp) > 0:
-                brick_aabb_data[bi, 0:3] = bp.min(axis=0)
-                brick_aabb_data[bi, 4:7] = bp.max(axis=0)
-                brick_aabb_data[bi, 7] = float(bh.max())
+        for ax, gi in enumerate((ix, iy, iz)):
+            brick_aabb_data[:, ax] = pmin[ax] + gi * cell_size[ax]
+            brick_aabb_data[:, 4 + ax] = pmin[ax] + (gi + 1) * cell_size[ax]
+        # h_max per brick still needs a scatter-reduce over particles.
+        np.maximum.at(brick_aabb_data[:, 7], brick_ids, hsml_src)
 
         # Pre-shuffle the source arrays so a per-chunk dispatch of K
         # instances draws a uniformly random K-subset of the chunk via

@@ -34,7 +34,7 @@ struct SubsampleParams {
     n_levels: u32,
     full_res_w: f32,
     n_grid_kernel: f32,
-    _pad2: u32,
+    perspective_correction: u32,
     _pad3: u32,
 };
 
@@ -60,17 +60,19 @@ struct VertexOutput {
     @location(1) mass: f32,
     @location(2) hsml: f32,
     @location(3) quantity: f32,
+    // View-space position of the particle, for perspective-correct
+    // impact-parameter computation in the fragment shader.
+    @location(4) view_pos: vec3<f32>,
 };
 
 fn degenerate(corner: vec2<f32>) -> VertexOutput {
     var out: VertexOutput;
-    // Place behind the near plane: clip removes the entire quad with zero
-    // fragment work.
     out.position = vec4<f32>(0.0, 0.0, -2.0, 1.0);
     out.offset = corner;
     out.mass = 0.0;
     out.hsml = 0.0;
     out.quantity = 0.0;
+    out.view_pos = vec3<f32>(0.0, 0.0, -1.0);
     return out;
 }
 
@@ -98,19 +100,12 @@ fn vs_main(
     // version (the auto-LOD PID is tuned against that cost curve and
     // oscillates if the vertex cost shifts even a little).
     var local_idx: u32;
-    if (sub.n_levels <= 1u) {
-        if (ii >= sub.n_in_chunk) {
-            return degenerate(corner);
-        }
-        local_idx = ii;
-    } else {
-        let base = s_bases[sub.level_index];
-        let abs_ii = base + ii;
-        if (abs_ii >= sub.n_in_chunk) {
-            return degenerate(corner);
-        }
-        local_idx = s_index[abs_ii];
+    let base = s_bases[sub.level_index];
+    let abs_ii = base + ii;
+    if (abs_ii >= sub.n_in_chunk) {
+        return degenerate(corner);
     }
+    local_idx = s_index[abs_ii];
 
     let pos_hi = s_pos[local_idx].xyz;
     let pos_lo = s_pos_lo[local_idx].xyz;
@@ -154,6 +149,7 @@ fn vs_main(
     out.mass = mass;
     out.hsml = hsml;
     out.quantity = qty;
+    out.view_pos = view_center.xyz;
     return out;
 }
 
@@ -165,7 +161,32 @@ struct FragmentOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> FragmentOutput {
-    let r = length(in.offset);
+    var r: f32;
+    if (sub.perspective_correction != 0u) {
+        // Perspective-correct impact parameter.
+        // Reconstruct the fragment's view-space ray direction from the
+        // particle's view position and the quad offset, NOT from
+        // gl_FragCoord (which is resolution-dependent and breaks
+        // multigrid where each level has a different texture size).
+        //
+        // The quad offset (ox, oy) ∈ [-1,1] maps to a view-space
+        // displacement of (ox*h, oy*h, 0) at the particle's depth,
+        // so the fragment's view position is approximately:
+        //   F = P + (ox*h, oy*h, 0)
+        // The ray through F has direction d̂ = normalize(F), and the
+        // impact parameter is b = |P × d̂|.
+        let frag_view = in.view_pos + vec3<f32>(
+            in.offset.x * in.hsml,
+            in.offset.y * in.hsml,
+            0.0
+        );
+        let d_hat = normalize(frag_view);
+        let cross_v = cross(in.view_pos, d_hat);
+        let b = length(cross_v);
+        r = b / in.hsml;
+    } else {
+        r = length(in.offset);
+    }
     if (r > 1.0) { discard; }
 
     let w = eval_kernel(r, camera.kernel_id);

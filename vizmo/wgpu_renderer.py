@@ -143,6 +143,7 @@ class WGPURenderer:
         self.pid_Kd = 0.0
         self.skip_vsync = False
         self.hsml_scale = 1.0
+        self.perspective_correction = True
         # Multigrid LOD: 1 = disabled (single-level, original behavior).
         # When > 1, particles are routed to a pyramid of accum textures
         # (level 0 = full res, level k = full_res / 2^k) by their kernel
@@ -224,7 +225,7 @@ class WGPURenderer:
         self._splat_subsample_bgl0 = dev.create_bind_group_layout(
             entries=[
                 {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
-                {"binding": 1, "visibility": V, "buffer": {"type": "uniform"}},
+                {"binding": 1, "visibility": VF, "buffer": {"type": "uniform"}},
             ]
         )
         # bg1: pos / hsml / mass / qty / index / bases / pos_lo / brick_id / brick_vis per chunk
@@ -823,7 +824,7 @@ class WGPURenderer:
         for ck in self._subsample_chunks:
             for lvl in range(n_levels):
                 tail = _struct.pack(
-                    "ffII ffII fff f",
+                    "ffII ffII ffII",
                     fov_rad,
                     float(camera.aspect),
                     int(stride),
@@ -834,8 +835,8 @@ class WGPURenderer:
                     int(n_levels),
                     full_res_w,
                     n_grid_kernel,
-                    0.0,
-                    0.0,
+                    int(bool(self.perspective_correction)),
+                    0,
                 )
                 pbs = ck.get("params_bufs", [ck["params_buf"]])
                 self.device.queue.write_buffer(pbs[lvl], 0, cam_bytes + tail)
