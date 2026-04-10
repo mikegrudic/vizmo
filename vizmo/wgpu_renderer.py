@@ -144,6 +144,7 @@ class WGPURenderer:
         self.skip_vsync = False
         self.hsml_scale = 1.0
         self.perspective_correction = True
+        self.brick_cull = False
         # Multigrid LOD: 1 = disabled (single-level, original behavior).
         # When > 1, particles are routed to a pyramid of accum textures
         # (level 0 = full res, level k = full_res / 2^k) by their kernel
@@ -1540,7 +1541,15 @@ class WGPURenderer:
         if self._subsample_chunks is not None:
             ratio = max(n_total_chunks / max(budget, 1), 1.0)
             h_scale = (ratio ** (1.0 / 3.0)) * float(self.hsml_scale)
-            self._dispatch_brick_cull(camera, encoder, h_scale)
+            if self.brick_cull:
+                self._dispatch_brick_cull(camera, encoder, h_scale)
+            else:
+                # Force all bricks visible so the bin pass includes everything.
+                for ck in self._subsample_chunks:
+                    nb = ck["n_bricks"]
+                    self.device.queue.write_buffer(
+                        ck["brick_vis"], 0,
+                        b"\x01\x00\x00\x00" * nb)
             if accum_textures is self._accum_textures:
                 self._dispatch_multigrid_bin(camera, encoder, budget, n_total_chunks)
 
