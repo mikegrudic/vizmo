@@ -3,8 +3,20 @@
 import os
 import re
 import glob
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import h5py
+
+
+def _multipart_workers():
+    """Thread count for parallel multipart HDF5 reads."""
+    try:
+        n = int(os.environ.get("VIZMO_LOAD_THREADS", "0"))
+        if n > 0:
+            return n
+    except ValueError:
+        pass
+    return min(8, (os.cpu_count() or 4))
 
 
 def _part_index(p):
@@ -48,10 +60,14 @@ class _MultiDataset:
         self._files = files
         self._ptype = ptype
         self._name = name
+        # Per-part (file_index, n_rows, row_offset) for files that actually
+        # contain this field. Used to dispatch parallel reads directly into
+        # slices of a single preallocated output buffer.
+        self._parts = []
         first_shape = None
         first_dtype = None
         total_n = 0
-        for f in files:
+        for fi, f in enumerate(files):
             grp = f.get(ptype)
             if grp is None or name not in grp:
                 continue
@@ -59,6 +75,7 @@ class _MultiDataset:
             if first_shape is None:
                 first_shape = ds.shape
                 first_dtype = ds.dtype
+            self._parts.append((fi, ds.shape[0], total_n))
             total_n += ds.shape[0]
         if first_shape is None:
             raise KeyError(name)
@@ -67,15 +84,28 @@ class _MultiDataset:
         self.dtype = first_dtype
 
     def _concat(self):
-        chunks = []
-        for f in self._files:
-            grp = f.get(self._ptype)
-            if grp is None or self._name not in grp:
-                continue
-            chunks.append(grp[self._name][:])
-        if len(chunks) == 1:
-            return chunks[0]
-        return np.concatenate(chunks, axis=0)
+        if len(self._parts) == 1:
+            fi, _, _ = self._parts[0]
+            return self._files[fi][self._ptype][self._name][:]
+        out = np.empty(self.shape, dtype=self.dtype)
+
+        def _read_part(part):
+            fi, n, off = part
+            # h5py releases the GIL for the duration of the read, so this
+            # parallelizes well across files. Each thread writes into a
+            # disjoint slice of `out`, so no locking is needed.
+            self._files[fi][self._ptype][self._name].read_direct(
+                out, dest_sel=np.s_[off:off + n]
+            )
+
+        n_workers = min(_multipart_workers(), len(self._parts))
+        if n_workers <= 1:
+            for part in self._parts:
+                _read_part(part)
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                list(ex.map(_read_part, self._parts))
+        return out
 
     def __getitem__(self, key):
         return self._concat()[key]
@@ -433,23 +463,48 @@ def _compute_hsml_kdtree(positions, boxsize=None, n_neighbors=50,
     smoothing length per particle.
     """
     import time
-    from scipy.spatial import cKDTree
     from meshoid import HsmlIter
 
     x = np.ascontiguousarray(positions, dtype=np.float64)
     n = len(x)
 
-    # cKDTree's `boxsize` arg requires positions in [0, L); fall back to
-    # the open-domain tree if anything is outside, since scipy raises.
+    # Periodic boxsize is only meaningful if all positions lie inside
+    # [0, L). pykdtree has no periodic support, but periodic vs. open
+    # neighbor lists only differ for particles within ~h of a box face,
+    # so when the data sits well inside the box the periodic path is a
+    # pure no-op and we can take pykdtree's much faster OpenMP path.
+    #
+    # Estimate the k-NN radius from the mean inter-particle spacing in
+    # the data bbox: r_knn ~ (k * V_bbox / n)^(1/3). If the smallest gap
+    # between the data bbox and any box face exceeds a safety multiple
+    # of r_knn, no neighbor query can ever wrap, so periodicity is moot.
+    use_periodic = False
     bs_arg = None
     if boxsize is not None:
         bs = float(np.asarray(boxsize).ravel()[0])
         if bs > 0 and x.min() >= 0 and x.max() < bs:
             bs_arg = bs
+            mn = x.min(axis=0)
+            mx = x.max(axis=0)
+            extent = np.maximum(mx - mn, 1e-30)
+            v_bbox = float(np.prod(extent))
+            r_knn = (max(n_neighbors, 1) * v_bbox / max(n, 1)) ** (1.0 / 3.0)
+            gap = float(min(mn.min(), bs - mx.max()))
+            # 4× safety: HsmlIter needs h ~ a few × r_knn, and we want
+            # cushion for non-uniform density.
+            if gap < 4.0 * r_knn:
+                use_periodic = True
 
     t0 = time.perf_counter()
-    tree = cKDTree(x, boxsize=bs_arg)
-    print(f"  KDTree built in {time.perf_counter()-t0:.1f}s")
+    if use_periodic:
+        from scipy.spatial import cKDTree
+        tree = cKDTree(x, boxsize=bs_arg)
+        backend = "scipy.cKDTree (periodic)"
+    else:
+        from pykdtree.kdtree import KDTree as PyKDTree
+        tree = PyKDTree(x)
+        backend = "pykdtree"
+    print(f"  KDTree built in {time.perf_counter()-t0:.1f}s [{backend}]")
 
     h = np.empty(n, dtype=np.float32)
     n_chunks = (n + chunk_size - 1) // chunk_size
@@ -457,7 +512,11 @@ def _compute_hsml_kdtree(positions, boxsize=None, n_neighbors=50,
         a = ci * chunk_size
         b = min(a + chunk_size, n)
         t0 = time.perf_counter()
-        dists, _ = tree.query(x[a:b], k=n_neighbors, workers=-1)
+        if use_periodic:
+            dists, _ = tree.query(x[a:b], k=n_neighbors, workers=-1)
+        else:
+            # pykdtree is OpenMP-parallel internally; no workers arg.
+            dists, _ = tree.query(x[a:b], k=n_neighbors)
         h[a:b] = np.asarray(
             HsmlIter(dists, des_ngb=des_ngb, dim=3, error_norm=1e-2),
             dtype=np.float32,

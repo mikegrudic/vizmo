@@ -19,6 +19,7 @@ dependencies = [
     "Pillow",
     "wgpu>=0.19",
     "meshoid",
+    "pykdtree",
 ]
 
 [project.scripts]
