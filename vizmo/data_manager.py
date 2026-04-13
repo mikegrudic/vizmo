@@ -417,8 +417,8 @@ def _read_flash(path):
         # Build cell-centre positions for leaf blocks only.
         leaf_idx = np.where(leaf)[0]
         n_leaf = len(leaf_idx)
-        lcoords = coords[leaf_idx]    # (n_leaf, ndim)
-        lsize = blk_size[leaf_idx]    # (n_leaf, ndim)
+        lcoords = coords[leaf_idx].astype(np.float64)    # (n_leaf, ndim)
+        lsize = blk_size[leaf_idx].astype(np.float64)  # (n_leaf, ndim)
 
         # fractional cell offsets inside a block, in [-0.5, 0.5)
         fx = (np.arange(nxb) + 0.5) / nxb - 0.5
