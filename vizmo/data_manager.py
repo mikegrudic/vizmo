@@ -439,9 +439,9 @@ def _read_flash(path):
         else:
             cz = np.zeros(shape4)
 
-        cx = np.ascontiguousarray(cx.reshape(-1))
-        cy = np.ascontiguousarray(cy.reshape(-1))
-        cz = np.ascontiguousarray(cz.reshape(-1))
+        cx = np.ascontiguousarray(np.broadcast_to(cx, shape4).reshape(-1))
+        cy = np.ascontiguousarray(np.broadcast_to(cy, shape4).reshape(-1))
+        cz = np.ascontiguousarray(np.broadcast_to(cz, shape4).reshape(-1))
         positions = np.stack(
             [cx.astype(np.float64), cy.astype(np.float64), cz.astype(np.float64)],
             axis=1,
