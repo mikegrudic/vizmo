@@ -354,6 +354,205 @@ class _AthdfFile:
         pass
 
 
+def _is_flash_file(path):
+    """Return True if *path* is a FLASH HDF5 file (plotfile or checkpoint)."""
+    try:
+        with h5py.File(path, "r") as f:
+            return "coordinates" in f and "block size" in f and "node type" in f
+    except Exception:
+        return False
+
+
+def _read_flash(path):
+    """Flatten a FLASH AMR HDF5 file into (header_attrs, PartType0_fields).
+
+    Only leaf blocks (node type == 1) are included. Each cell becomes one
+    "particle" with position = cell centre, Masses = density * cell volume,
+    SmoothingLength = volume^(1/3), and every variable stored in the file is
+    exposed as a scalar field.
+    """
+    f = h5py.File(path, "r")
+    try:
+        # -- block metadata --------------------------------------------------
+        coords = f["coordinates"][:]        # (nblocks, ndim)
+        blk_size = f["block size"][:]       # (nblocks, ndim)
+        node_type = f["node type"][:].ravel()
+        leaf = node_type == 1
+        nblocks_all = len(node_type)
+
+        # Determine grid dimensions per block from the first field dataset.
+        # FLASH stores fields as (nblocks, nzb, nyb, nxb).
+        # Identify field datasets: same leading dim as nblocks_all and 4-D.
+        # "unknown names" lists the plotfile variables; fall back to scanning.
+        if "unknown names" in f:
+            raw = f["unknown names"][:]
+            var_names = []
+            for row in raw:
+                if isinstance(row, (bytes, np.bytes_)):
+                    var_names.append(row.decode().strip())
+                else:
+                    var_names.append(
+                        b"".join(row).decode().strip()
+                        if hasattr(row, "__iter__")
+                        else str(row).strip()
+                    )
+        else:
+            # Guess field datasets: 4-D arrays with first axis == nblocks_all
+            var_names = []
+            for name in f:
+                ds = f[name]
+                if hasattr(ds, "ndim") and ds.ndim == 4 and ds.shape[0] == nblocks_all:
+                    var_names.append(name)
+
+        if not var_names:
+            raise ValueError(f"No field variables found in FLASH file {path}")
+
+        # Read the shape from the first recognised field
+        first_ds = f[var_names[0]]
+        _, nzb, nyb, nxb = first_ds.shape
+
+        ndim = coords.shape[1]
+
+        # -- cell positions ---------------------------------------------------
+        # Build cell-centre positions for leaf blocks only.
+        leaf_idx = np.where(leaf)[0]
+        n_leaf = len(leaf_idx)
+        lcoords = coords[leaf_idx]    # (n_leaf, ndim)
+        lsize = blk_size[leaf_idx]    # (n_leaf, ndim)
+
+        # fractional cell offsets inside a block, in [-0.5, 0.5)
+        fx = (np.arange(nxb) + 0.5) / nxb - 0.5
+        fy = (np.arange(nyb) + 0.5) / nyb - 0.5
+        fz = (np.arange(nzb) + 0.5) / nzb - 0.5
+
+        # shape: (n_leaf, nzb, nyb, nxb)
+        shape4 = (n_leaf, nzb, nyb, nxb)
+
+        if ndim >= 1:
+            cx = lcoords[:, 0, None, None, None] + lsize[:, 0, None, None, None] * fx[None, None, None, :]
+        if ndim >= 2:
+            cy = lcoords[:, 1, None, None, None] + lsize[:, 1, None, None, None] * fy[None, None, :, None]
+        else:
+            cy = np.zeros(shape4)
+        if ndim >= 3:
+            cz = lcoords[:, 2, None, None, None] + lsize[:, 2, None, None, None] * fz[None, :, None, None]
+        else:
+            cz = np.zeros(shape4)
+
+        cx = np.ascontiguousarray(cx.reshape(-1))
+        cy = np.ascontiguousarray(cy.reshape(-1))
+        cz = np.ascontiguousarray(cz.reshape(-1))
+        positions = np.stack(
+            [cx.astype(np.float64), cy.astype(np.float64), cz.astype(np.float64)],
+            axis=1,
+        )
+
+        # Cell volume
+        dvol = (lsize[:, 0] / nxb) * (lsize[:, 1] / nyb if ndim >= 2 else 1.0) * (lsize[:, 2] / nzb if ndim >= 3 else 1.0)
+        vol = np.broadcast_to(dvol[:, None, None, None], shape4).reshape(-1)
+        hsml = np.cbrt(vol).astype(np.float32)
+
+        # -- fields -----------------------------------------------------------
+        fields = {}
+        for vname in var_names:
+            ds = f.get(vname)
+            if ds is None or ds.ndim != 4 or ds.shape[0] != nblocks_all:
+                continue
+            arr = ds[:][leaf_idx]  # (n_leaf, nzb, nyb, nxb)
+            fields[vname.strip()] = np.ascontiguousarray(arr.reshape(-1)).astype(np.float32)
+
+        # -- assemble output --------------------------------------------------
+        out = {"Coordinates": positions, "SmoothingLength": hsml}
+
+        # density -> Masses
+        dens_name = None
+        for candidate in ("dens", "density", "Density", "rho"):
+            if candidate in fields:
+                dens_name = candidate
+                break
+        if dens_name is not None:
+            density = fields[dens_name]
+            out["Density"] = density
+            out["Masses"] = (density * vol).astype(np.float32)
+        else:
+            out["Masses"] = vol.astype(np.float32)
+
+        # Velocities
+        vx_name = vy_name = vz_name = None
+        for vx_c, vy_c, vz_c in [("velx", "vely", "velz"),
+                                   ("vel_x", "vel_y", "vel_z")]:
+            if vx_c in fields and vy_c in fields and vz_c in fields:
+                vx_name, vy_name, vz_name = vx_c, vy_c, vz_c
+                break
+        if vx_name is not None:
+            out["Velocities"] = np.stack(
+                [fields[vx_name], fields[vy_name], fields[vz_name]], axis=1
+            )
+
+        # Expose remaining fields, skipping ones already consumed
+        consumed = {dens_name, vx_name, vy_name, vz_name} - {None}
+        rename = {"pres": "Pressure", "temp": "Temperature", "magx": "MagneticField[0]",
+                  "magy": "MagneticField[1]", "magz": "MagneticField[2]"}
+        for vname, varr in fields.items():
+            if vname in consumed:
+                continue
+            out[rename.get(vname, vname)] = varr
+
+        # -- header -----------------------------------------------------------
+        time = 0.0
+        if "real scalars" in f:
+            for row in f["real scalars"][:]:
+                name_bytes = row[0]
+                if isinstance(name_bytes, bytes):
+                    nm = name_bytes.decode().strip()
+                else:
+                    nm = str(name_bytes).strip()
+                if nm == "time":
+                    time = float(row[1])
+                    break
+        elif "sim info" in f:
+            si = f["sim info"]
+            if "time" in si.attrs:
+                time = float(si.attrs["time"])
+
+        # BoxSize from bounding box
+        box = 0.0
+        if "bounding box" in f:
+            bb = f["bounding box"][:]  # (nblocks, ndim, 2)
+            box = float(np.max(bb[:, :, 1]) - np.min(bb[:, :, 0]))
+
+        header_attrs = {"Time": time, "BoxSize": box}
+        return header_attrs, out
+    finally:
+        f.close()
+
+
+class _FlashFile:
+    """h5py.File-like wrapper that exposes a flattened FLASH file as PartType0."""
+
+    def __init__(self, path):
+        header_attrs, fields = _read_flash(path)
+        self._groups = {
+            "Header": _HeaderGroup(header_attrs),
+            "PartType0": _MemGroup(fields),
+        }
+
+    def keys(self):
+        return list(self._groups.keys())
+
+    def __contains__(self, key):
+        return key in self._groups
+
+    def __getitem__(self, key):
+        return self._groups[key]
+
+    def get(self, key, default=None):
+        return self._groups.get(key, default)
+
+    def close(self):
+        pass
+
+
 class _MultiFile:
     """Minimal h5py.File-like wrapper over a multipart snapshot."""
 
@@ -492,10 +691,14 @@ class SnapshotData:
         self.path = path
         if os.path.isfile(path) and path.lower().endswith(".athdf"):
             self._file = _AthdfFile(path)
+        elif os.path.isfile(path) and _is_flash_file(path):
+            self._file = _FlashFile(path)
         else:
             parts = _resolve_snapshot_parts(path)
             if len(parts) == 1 and parts[0].lower().endswith(".athdf"):
                 self._file = _AthdfFile(parts[0])
+            elif len(parts) == 1 and _is_flash_file(parts[0]):
+                self._file = _FlashFile(parts[0])
             elif len(parts) == 1:
                 self._file = h5py.File(parts[0], "r")
             else:
