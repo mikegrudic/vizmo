@@ -535,6 +535,23 @@ class WGPURenderer:
 
     # ---- Data management ----
 
+    @staticmethod
+    def _safe_f32(arr):
+        """Convert *arr* to float32, rescaling if values exceed float32 range.
+
+        Returns (f32_array, scale_factor) where the true values are
+        ``f32_array * scale_factor``.  For arrays that already fit in
+        float32 the scale factor is 1.0.
+        """
+        arr = np.asarray(arr, dtype=np.float64)
+        amax = np.max(np.abs(arr))
+        if amax == 0 or amax < np.finfo(np.float32).max:
+            return arr.astype(np.float32), 1.0
+        # Normalise so the peak absolute value maps to 1.0; the caller
+        # must compensate via a GPU-side scale uniform.
+        scale = float(amax)
+        return (arr / scale).astype(np.float32), scale
+
     def set_particles(self, positions, hsml, masses, quantity=None):
         """Store CPU-side particle data. The actual GPU upload is
         performed by GPUCompute.upload_subsample_only on the first
@@ -544,21 +561,21 @@ class WGPURenderer:
         # DSFUN90 hi/lo position split) starts from full source
         # precision rather than a pre-truncated f32 copy.
         self._all_pos = np.asarray(positions, dtype=np.float64)
-        self._all_hsml = hsml.astype(np.float32)
-        self._all_mass = masses.astype(np.float32)
+        self._all_hsml, self._hsml_norm = self._safe_f32(hsml)
+        self._all_mass, self._mass_norm = self._safe_f32(masses)
         if quantity is None:
             quantity = masses
-        self._all_qty = quantity.astype(np.float32)
+        self._all_qty, self._qty_norm = self._safe_f32(quantity)
         self.n_total = len(masses)
 
     def update_weights(self, masses, quantity=None):
         """Update the renderer's CPU mass/qty arrays after a field swap.
         The GPU side must be re-uploaded by GPUCompute.upload_weights.
         """
-        self._all_mass = masses.astype(np.float32)
+        self._all_mass, self._mass_norm = self._safe_f32(masses)
         if quantity is None:
             quantity = masses
-        self._all_qty = quantity.astype(np.float32)
+        self._all_qty, self._qty_norm = self._safe_f32(quantity)
 
     def set_subsample_chunks(self, chunks, world_offset=None):
         """Configure compute-driven splat: render directly from per-chunk
@@ -746,8 +763,8 @@ class WGPURenderer:
         # User-controlled hsml multiplier (overlay slider) composes with
         # the stride-derived scaling so each splat both fills its share
         # of the subsample volume and honors the manual size knob.
-        h_scale = (ratio ** (1.0 / 3.0)) * float(self.hsml_scale)
-        mass_scale = ratio  # each sampled particle stands in for `stride`
+        h_scale = (ratio ** (1.0 / 3.0)) * float(self.hsml_scale) * getattr(self, "_hsml_norm", 1.0)
+        mass_scale = ratio * getattr(self, "_mass_norm", 1.0)  # each sampled particle stands in for `stride`
         fov_rad = float(np.radians(camera.fov))
         # Apply the same world-origin shift as the view matrix, in
         # f64, then split into a DSFUN90 hi/lo pair so the shader's
@@ -1097,7 +1114,7 @@ class WGPURenderer:
         # Reuse the same h_scale derivation as the splat path so the
         # binner sees the kernel size the splat will actually draw.
         ratio = max(n_total_chunks / max(budget, 1), 1.0)
-        h_scale = (ratio ** (1.0 / 3.0)) * float(self.hsml_scale)
+        h_scale = (ratio ** (1.0 / 3.0)) * float(self.hsml_scale) * getattr(self, "_hsml_norm", 1.0)
 
         zero_counts = b"\x00" * (16 * 4)
         for ck in self._subsample_chunks:

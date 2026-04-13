@@ -450,7 +450,7 @@ def _read_flash(path):
         # Cell volume
         dvol = (lsize[:, 0] / nxb) * (lsize[:, 1] / nyb if ndim >= 2 else 1.0) * (lsize[:, 2] / nzb if ndim >= 3 else 1.0)
         vol = np.broadcast_to(dvol[:, None, None, None], shape4).reshape(-1)
-        hsml = np.cbrt(vol).astype(np.float32)
+        hsml = np.cbrt(vol)
 
         # -- fields -----------------------------------------------------------
         fields = {}
@@ -459,7 +459,7 @@ def _read_flash(path):
             if ds is None or ds.ndim != 4 or ds.shape[0] != nblocks_all:
                 continue
             arr = ds[:][leaf_idx]  # (n_leaf, nzb, nyb, nxb)
-            fields[vname.strip()] = np.ascontiguousarray(arr.reshape(-1)).astype(np.float32)
+            fields[vname.strip()] = np.ascontiguousarray(arr.reshape(-1)).astype(np.float64)
 
         # -- assemble output --------------------------------------------------
         out = {"Coordinates": positions, "SmoothingLength": hsml}
@@ -473,9 +473,9 @@ def _read_flash(path):
         if dens_name is not None:
             density = fields[dens_name]
             out["Density"] = density
-            out["Masses"] = (density * vol).astype(np.float32)
+            out["Masses"] = density * vol
         else:
-            out["Masses"] = vol.astype(np.float32)
+            out["Masses"] = vol.copy()
 
         # Velocities
         vx_name = vy_name = vz_name = None
@@ -848,7 +848,7 @@ class SnapshotData:
             self._evict_for(p)
             ptype = f"PartType{p}"
             pos = self._read_field(ptype, "Coordinates")
-            mass = self._read_field(ptype, "Masses").astype(np.float32)
+            mass = self._read_field(ptype, "Masses")
             hsml = self._resolve_hsml(ptype, pos)
             self._touch_ptype(p)
             n = len(mass)
@@ -881,23 +881,23 @@ class SnapshotData:
         grp = self._file[ptype]
         for name in _hsml_field_names():
             if name in grp:
-                h = self._read_field(ptype, name).astype(np.float32)
+                h = self._read_field(ptype, name)
                 self._hsml_cache[p] = h
                 return h
 
         # Recover hsml from cell volume if available (Arepo-style "Volume",
         # or Masses/Density). Use 2*cbrt(V) as an approximate kernel radius.
         if "Volume" in grp:
-            vol = self._read_field(ptype, "Volume").astype(np.float32)
-            h = (2.0 * np.cbrt(vol)).astype(np.float32)
+            vol = np.asarray(self._read_field(ptype, "Volume"), dtype=np.float64)
+            h = 2.0 * np.cbrt(vol)
             self._hsml_cache[p] = h
             return h
         if "Density" in grp and "Masses" in grp:
-            mass = self._read_field(ptype, "Masses").astype(np.float32)
-            dens = self._read_field(ptype, "Density").astype(np.float32)
+            mass = np.asarray(self._read_field(ptype, "Masses"), dtype=np.float64)
+            dens = np.asarray(self._read_field(ptype, "Density"), dtype=np.float64)
             with np.errstate(divide="ignore", invalid="ignore"):
                 vol = np.where(dens > 0, mass / dens, 0.0)
-            h = (2.0 * np.cbrt(vol)).astype(np.float32)
+            h = 2.0 * np.cbrt(vol)
             self._hsml_cache[p] = h
             return h
 
@@ -958,8 +958,8 @@ class SnapshotData:
 
         data = self._cosmo_correct(data, ptype, field)
 
-        if field != "Coordinates" and data.dtype != np.float32:
-            data = data.astype(np.float32)
+        if field != "Coordinates" and data.dtype not in (np.float32, np.float64):
+            data = data.astype(np.float64)
 
         self._cache[key] = data
         return data
