@@ -691,6 +691,23 @@ def _read_yt(path):
         hsml = _arr((pt, "smoothing_length"), "code_length")
         if hsml is not None:
             pgrp["SmoothingLength"] = hsml.astype(np.float32)
+
+        # Cluster-particle sizing for STAR-like types: R = 10pc * sqrt(M/1e4 Msun).
+        # Stored as L = R^2 so the existing renderer formula
+        #     billboard_radius = star_world_radius * sqrt(L)
+        # gives star_world_radius * R_phys, i.e. star_world_radius becomes
+        # a dimensionless multiplier on the physical scaling law.
+        if slot == 5:
+            try:
+                M_Msun = np.asarray(
+                    ad[(pt, "particle_mass")].to("Msun").d
+                )
+                pc_in_code = float(ds.quan(1.0, "pc").to("code_length").d)
+                R_phys = (10.0 * pc_in_code) * np.sqrt(M_Msun / 1.0e4)
+                pgrp["StarLuminosity"] = (R_phys ** 2).astype(np.float32)
+            except Exception as e:
+                print(f"  Warning: cluster-radius scaling unavailable ({e})")
+
         ptype_groups[f"PartType{slot}"] = pgrp
         print(f"  yt: PartType{slot} ({pt}) — {len(pos):,} particles")
 
@@ -1009,6 +1026,13 @@ class SnapshotData:
                 self.star_luminosity = grp["StarLuminosity_Solar"][:].astype(np.float32)
             elif "StarLuminosity" in grp:
                 self.star_luminosity = grp["StarLuminosity"][:].astype(np.float32)
+            elif isinstance(self._file, _YtFile):
+                # yt-loaded STAR particles (ART/RAMSES/Enzo/…) are
+                # cluster particles, not individual stars — ZAMS L∝M^3.5
+                # produces nonsense at 10³–10⁵ M☉. Linear L=M gives
+                # billboard radius ∝ √M_cluster, matching the
+                # mass-weighted-marker convention.
+                self.star_luminosity = self.star_masses.astype(np.float32)
             else:
                 self.star_luminosity = _zams_luminosity(self.star_masses)
         else:
