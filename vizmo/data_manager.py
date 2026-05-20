@@ -553,6 +553,178 @@ class _FlashFile:
         pass
 
 
+def _read_yt(path):
+    """Last-resort reader: load *path* via yt and flatten into PartType groups.
+
+    Mesh / grid cells (if present) become PartType0 — one cell per
+    "particle", with SmoothingLength = cbrt(cell_volume) and Masses =
+    density * cell_volume. Each non-meta particle type from yt gets its
+    own PartType slot: anything matching ``*star*`` → PartType5 (routed
+    through vizmo's point-source loader); remaining types fill
+    PartType1, 2, 3, 4 in declaration order (matching the Gadget/GIZMO
+    convention of DM at PartType1+). Fields yt doesn't expose for a
+    given type are silently skipped.
+
+    Returns ``(header_attrs, ptype_groups)`` where ``ptype_groups`` is a
+    ``{ "PartType<i>": {field_name: ndarray, ...} }`` dict.
+    """
+    import yt  # heavy import; defer until the fallback actually fires
+
+    print(f"  Loading {path!r} via yt fallback...")
+    ds = yt.load(path)
+    ad = ds.all_data()
+
+    def _arr(key, unit=None):
+        try:
+            a = ad[key]
+            if unit is not None:
+                a = a.to(unit)
+            return np.asarray(a.d)
+        except Exception:
+            return None
+
+    cosmo = bool(getattr(ds, "cosmological_simulation", False))
+    try:
+        time = (
+            float(ds.scale_factor) if cosmo
+            else float(ds.current_time.to("code_time").d)
+        )
+    except Exception:
+        time = 0.0
+    try:
+        box = float(ds.domain_width.max().to("code_length").d)
+    except Exception:
+        box = 0.0
+    header_attrs = {"Time": time, "BoxSize": box}
+
+    ptype_groups = {}
+
+    # --- Mesh / grid cells → PartType0 ---------------------------------
+    xs = _arr(("index", "x"), "code_length")
+    ys = _arr(("index", "y"), "code_length")
+    zs = _arr(("index", "z"), "code_length")
+    if xs is not None and ys is not None and zs is not None and len(xs) > 0:
+        n = len(xs)
+        gas = {"Coordinates": np.stack([xs, ys, zs], axis=1).astype(np.float64)}
+        vol = _arr(("index", "cell_volume"), "code_length**3")
+        if vol is not None:
+            gas["SmoothingLength"] = np.cbrt(vol).astype(np.float32)
+        dens = _arr(("gas", "density"), "code_mass/code_length**3")
+        if dens is not None:
+            gas["Density"] = dens.astype(np.float32)
+            if vol is not None:
+                gas["Masses"] = (dens * vol).astype(np.float32)
+        if "Masses" not in gas:
+            gas["Masses"] = (
+                vol.astype(np.float32) if vol is not None
+                else np.ones(n, dtype=np.float32)
+            )
+        vx = _arr(("gas", "velocity_x"), "code_velocity")
+        vy = _arr(("gas", "velocity_y"), "code_velocity")
+        vz = _arr(("gas", "velocity_z"), "code_velocity")
+        if vx is not None and vy is not None and vz is not None:
+            gas["Velocities"] = np.stack(
+                [vx, vy, vz], axis=1
+            ).astype(np.float32)
+        # Extra derived gas fields (yt's native units — no conversion).
+        for name, key in [
+            ("Pressure", ("gas", "pressure")),
+            ("Temperature", ("gas", "temperature")),
+            ("InternalEnergy", ("gas", "specific_thermal_energy")),
+            ("Metallicity", ("gas", "metallicity")),
+            ("MetalDensity", ("gas", "metal_density")),
+        ]:
+            arr = _arr(key)
+            if arr is not None and len(arr) == n:
+                gas[name] = arr.astype(np.float32)
+        ptype_groups["PartType0"] = gas
+        print(f"  yt: PartType0 (mesh) — {n:,} cells")
+
+    # --- Particle types -----------------------------------------------
+    raw = list(
+        getattr(ds, "particle_types_raw", None)
+        or getattr(ds, "particle_types", []) or []
+    )
+    meta = {"all", "io", "nbody"}
+    ptypes = [pt for pt in raw if pt.lower() not in meta]
+
+    used = {0} if "PartType0" in ptype_groups else set()
+    next_slot = 1
+    for pt in ptypes:
+        if "star" in pt.lower() and 5 not in used:
+            slot = 5
+        else:
+            while next_slot in used or next_slot == 5:
+                next_slot += 1
+            slot = next_slot
+            next_slot += 1
+        used.add(slot)
+
+        pos = _arr((pt, "particle_position"), "code_length")
+        if pos is None:
+            px = _arr((pt, "particle_position_x"), "code_length")
+            py = _arr((pt, "particle_position_y"), "code_length")
+            pz = _arr((pt, "particle_position_z"), "code_length")
+            if px is None or py is None or pz is None:
+                used.discard(slot)
+                continue
+            pos = np.stack([px, py, pz], axis=1)
+        if len(pos) == 0:
+            used.discard(slot)
+            continue
+
+        pgrp = {"Coordinates": pos.astype(np.float64)}
+        mass = _arr((pt, "particle_mass"), "code_mass")
+        if mass is not None:
+            pgrp["Masses"] = mass.astype(np.float32)
+        vx = _arr((pt, "particle_velocity_x"), "code_velocity")
+        vy = _arr((pt, "particle_velocity_y"), "code_velocity")
+        vz = _arr((pt, "particle_velocity_z"), "code_velocity")
+        if vx is not None and vy is not None and vz is not None:
+            pgrp["Velocities"] = np.stack(
+                [vx, vy, vz], axis=1
+            ).astype(np.float32)
+        hsml = _arr((pt, "smoothing_length"), "code_length")
+        if hsml is not None:
+            pgrp["SmoothingLength"] = hsml.astype(np.float32)
+        ptype_groups[f"PartType{slot}"] = pgrp
+        print(f"  yt: PartType{slot} ({pt}) — {len(pos):,} particles")
+
+    if not ptype_groups:
+        raise ValueError(
+            f"yt: no mesh or particle data extracted from {path}"
+        )
+    return header_attrs, ptype_groups
+
+
+class _YtFile:
+    """h5py.File-like wrapper for yt-loaded snapshots. Exposes mesh
+    cells as PartType0 and each particle type as its own PartType slot
+    (STAR-like → PartType5, others → PartType1+).
+    """
+
+    def __init__(self, path):
+        header_attrs, ptype_groups = _read_yt(path)
+        self._groups = {"Header": _HeaderGroup(header_attrs)}
+        for name, fields in ptype_groups.items():
+            self._groups[name] = _MemGroup(fields)
+
+    def keys(self):
+        return list(self._groups.keys())
+
+    def __contains__(self, key):
+        return key in self._groups
+
+    def __getitem__(self, key):
+        return self._groups[key]
+
+    def get(self, key, default=None):
+        return self._groups.get(key, default)
+
+    def close(self):
+        pass
+
+
 class _MultiFile:
     """Minimal h5py.File-like wrapper over a multipart snapshot."""
 
@@ -687,22 +859,40 @@ class SnapshotData:
         "PhotonFluxDensity",
     }
 
+    @staticmethod
+    def _open_snapshot(path):
+        """Pick a reader for *path*, falling back to yt when no explicit
+        reader recognises the format."""
+        if os.path.isfile(path) and path.lower().endswith(".athdf"):
+            return _AthdfFile(path)
+        if os.path.isfile(path) and _is_flash_file(path):
+            return _FlashFile(path)
+        try:
+            parts = _resolve_snapshot_parts(path)
+        except FileNotFoundError:
+            parts = None
+        if parts:
+            if len(parts) == 1 and parts[0].lower().endswith(".athdf"):
+                return _AthdfFile(parts[0])
+            if len(parts) == 1 and _is_flash_file(parts[0]):
+                return _FlashFile(parts[0])
+            if len(parts) == 1:
+                try:
+                    f = h5py.File(parts[0], "r")
+                except OSError:
+                    f = None
+                if f is not None:
+                    if any(k.startswith("PartType") for k in f.keys()):
+                        return f
+                    f.close()
+            else:
+                return _MultiFile(parts)
+        print(f"  No explicit reader matched {path}; trying yt fallback...")
+        return _YtFile(path)
+
     def __init__(self, path, particle_types=None, hsml_progress=None):
         self.path = path
-        if os.path.isfile(path) and path.lower().endswith(".athdf"):
-            self._file = _AthdfFile(path)
-        elif os.path.isfile(path) and _is_flash_file(path):
-            self._file = _FlashFile(path)
-        else:
-            parts = _resolve_snapshot_parts(path)
-            if len(parts) == 1 and parts[0].lower().endswith(".athdf"):
-                self._file = _AthdfFile(parts[0])
-            elif len(parts) == 1 and _is_flash_file(parts[0]):
-                self._file = _FlashFile(parts[0])
-            elif len(parts) == 1:
-                self._file = h5py.File(parts[0], "r")
-            else:
-                self._file = _MultiFile(parts)
+        self._file = self._open_snapshot(path)
         self.header = dict(self._file["Header"].attrs)
         self.time = float(self.header.get("Time", 0))
 
