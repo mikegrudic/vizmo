@@ -331,6 +331,8 @@ def _read_athdf(path):
 class _AthdfFile:
     """h5py.File-like wrapper that exposes a flattened .athdf as PartType0."""
 
+    is_structured_grid = True
+
     def __init__(self, path):
         header_attrs, fields = _read_athdf(path)
         self._groups = {
@@ -530,6 +532,8 @@ def _read_flash(path):
 class _FlashFile:
     """h5py.File-like wrapper that exposes a flattened FLASH file as PartType0."""
 
+    is_structured_grid = True
+
     def __init__(self, path):
         header_attrs, fields = _read_flash(path)
         self._groups = {
@@ -687,6 +691,23 @@ def _read_yt(path):
         hsml = _arr((pt, "smoothing_length"), "code_length")
         if hsml is not None:
             pgrp["SmoothingLength"] = hsml.astype(np.float32)
+
+        # Cluster-particle sizing for STAR-like types: R = 10pc * sqrt(M/1e4 Msun).
+        # Stored as L = R^2 so the existing renderer formula
+        #     billboard_radius = star_world_radius * sqrt(L)
+        # gives star_world_radius * R_phys, i.e. star_world_radius becomes
+        # a dimensionless multiplier on the physical scaling law.
+        if slot == 5:
+            try:
+                M_Msun = np.asarray(
+                    ad[(pt, "particle_mass")].to("Msun").d
+                )
+                pc_in_code = float(ds.quan(1.0, "pc").to("code_length").d)
+                R_phys = (10.0 * pc_in_code) * np.sqrt(M_Msun / 1.0e4)
+                pgrp["StarLuminosity"] = (R_phys ** 2).astype(np.float32)
+            except Exception as e:
+                print(f"  Warning: cluster-radius scaling unavailable ({e})")
+
         ptype_groups[f"PartType{slot}"] = pgrp
         print(f"  yt: PartType{slot} ({pt}) — {len(pos):,} particles")
 
@@ -708,6 +729,10 @@ class _YtFile:
         self._groups = {"Header": _HeaderGroup(header_attrs)}
         for name, fields in ptype_groups.items():
             self._groups[name] = _MemGroup(fields)
+        # Mesh data lands in PartType0; PartType1+ are particles. If we
+        # built a PartType0, the gas/grid branch fired → treat as a
+        # structured-grid source so the renderer widens the kernel.
+        self.is_structured_grid = "PartType0" in ptype_groups
 
     def keys(self):
         return list(self._groups.keys())
@@ -893,6 +918,10 @@ class SnapshotData:
     def __init__(self, path, particle_types=None, hsml_progress=None):
         self.path = path
         self._file = self._open_snapshot(path)
+        # True for cell-based AMR/structured-grid readers (Athena++ .athdf,
+        # FLASH plotfiles, ART/Enzo/RAMSES/etc. via yt). Used by the
+        # renderer to widen the kernel and hide cell-edge artifacts.
+        self.is_structured_grid = getattr(self._file, "is_structured_grid", False)
         self.header = dict(self._file["Header"].attrs)
         self.time = float(self.header.get("Time", 0))
 
@@ -997,6 +1026,13 @@ class SnapshotData:
                 self.star_luminosity = grp["StarLuminosity_Solar"][:].astype(np.float32)
             elif "StarLuminosity" in grp:
                 self.star_luminosity = grp["StarLuminosity"][:].astype(np.float32)
+            elif isinstance(self._file, _YtFile):
+                # yt-loaded STAR particles (ART/RAMSES/Enzo/…) are
+                # cluster particles, not individual stars — ZAMS L∝M^3.5
+                # produces nonsense at 10³–10⁵ M☉. Linear L=M gives
+                # billboard radius ∝ √M_cluster, matching the
+                # mass-weighted-marker convention.
+                self.star_luminosity = self.star_masses.astype(np.float32)
             else:
                 self.star_luminosity = _zams_luminosity(self.star_masses)
         else:

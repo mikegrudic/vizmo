@@ -107,6 +107,17 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
     # Renderer
     renderer = WGPURenderer(device, canvas_context, present_format)
     renderer._viewport_width = width  # use window size for LOD, not retina framebuffer size
+    if getattr(data, "is_structured_grid", False):
+        # Hsml from these readers is cbrt(cell_volume) — i.e. the cell's
+        # half-side. Widening to 2× smooths across cell faces and hides
+        # the AMR grid pattern.
+        renderer.hsml_scale = 2.0
+    from vizmo.data_manager import _YtFile
+    if isinstance(data._file, _YtFile) and data.n_stars > 0:
+        # _read_yt stored StarLuminosity = R_phys² (in code_length²) for
+        # cluster particles, so sqrt(L)·world_radius gives world_radius·R_phys.
+        # Default the multiplier to 1 so the physical scaling shows as-is.
+        renderer.star_world_radius = 1.0
 
     # Colormap
     rgba = colormap_to_texture_data("magma")
