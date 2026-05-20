@@ -107,6 +107,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
     # Renderer
     renderer = WGPURenderer(device, canvas_context, present_format)
     renderer._viewport_width = width  # use window size for LOD, not retina framebuffer size
+    if getattr(data, "is_structured_grid", False):
+        # Hsml from these readers is cbrt(cell_volume) — i.e. the cell's
+        # half-side. Widening to 2× smooths across cell faces and hides
+        # the AMR grid pattern.
+        renderer.hsml_scale = 2.0
 
     # Colormap
     rgba = colormap_to_texture_data("magma")

@@ -331,6 +331,8 @@ def _read_athdf(path):
 class _AthdfFile:
     """h5py.File-like wrapper that exposes a flattened .athdf as PartType0."""
 
+    is_structured_grid = True
+
     def __init__(self, path):
         header_attrs, fields = _read_athdf(path)
         self._groups = {
@@ -530,6 +532,8 @@ def _read_flash(path):
 class _FlashFile:
     """h5py.File-like wrapper that exposes a flattened FLASH file as PartType0."""
 
+    is_structured_grid = True
+
     def __init__(self, path):
         header_attrs, fields = _read_flash(path)
         self._groups = {
@@ -708,6 +712,10 @@ class _YtFile:
         self._groups = {"Header": _HeaderGroup(header_attrs)}
         for name, fields in ptype_groups.items():
             self._groups[name] = _MemGroup(fields)
+        # Mesh data lands in PartType0; PartType1+ are particles. If we
+        # built a PartType0, the gas/grid branch fired → treat as a
+        # structured-grid source so the renderer widens the kernel.
+        self.is_structured_grid = "PartType0" in ptype_groups
 
     def keys(self):
         return list(self._groups.keys())
@@ -893,6 +901,10 @@ class SnapshotData:
     def __init__(self, path, particle_types=None, hsml_progress=None):
         self.path = path
         self._file = self._open_snapshot(path)
+        # True for cell-based AMR/structured-grid readers (Athena++ .athdf,
+        # FLASH plotfiles, ART/Enzo/RAMSES/etc. via yt). Used by the
+        # renderer to widen the kernel and hide cell-edge artifacts.
+        self.is_structured_grid = getattr(self._file, "is_structured_grid", False)
         self.header = dict(self._file["Header"].attrs)
         self.time = float(self.header.get("Time", 0))
 
