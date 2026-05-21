@@ -53,6 +53,19 @@ DEV_STYLE = PanelStyle(
     position="top-right",
 )
 
+SINK_STYLE = PanelStyle(
+    font_size=14, line_height=20, margin=8, min_width=220,
+    bg_color=(20, 10, 30, 220),
+    text_color=(220, 220, 255, 255),
+    accent_color=(180, 180, 255, 255),
+    toggle_on_color=(120, 160, 255, 255),
+    toggle_off_color=(100, 100, 110, 255),
+    dropdown_bg=(40, 40, 60, 255),
+    dropdown_hover=(80, 80, 120, 255),
+    slider_btn=(80, 80, 100, 255),
+    position="top-right",
+)
+
 USER_STYLE = PanelStyle(
     font_size=28, line_height=37, margin=13, min_width=267,
     bg_color=(15, 15, 25, 100),
@@ -86,6 +99,9 @@ class Panel:
         self._widgets = []
         self._dropdown_open = None
         self._dropdown_scroll = {}
+        # Subclasses can opt into a minimize button by appending a
+        # ("button", "[-]", "_toggle_minimize") item to render_panel.
+        self._minimized = False
         self._fb_width = 1
         self._fb_height = 1
         self._panel_x = 0
@@ -147,6 +163,9 @@ class Panel:
                 label = f"{item[1]}: {item[2]}" if len(item) > 2 else item[1]
                 bbox = draw.textbbox((0, 0), label, font=self._font)
                 max_w = max(max_w, bbox[2] - bbox[0] + M * 4)
+            elif t == "button":
+                bbox = draw.textbbox((0, 0), item[1], font=self._font)
+                max_w = max(max_w, bbox[2] - bbox[0] + M * 4 + 16)
             elif t == "toggle":
                 bbox = draw.textbbox((0, 0), f"[ ] {item[1]}", font=self._font)
                 max_w = max(max_w, bbox[2] - bbox[0] + M * 4)
@@ -157,25 +176,37 @@ class Panel:
                 bbox = draw.textbbox((0, 0), f"[-] {item[1]}: {item[2]:.2f} [+]", font=self._font)
                 max_w = max(max_w, bbox[2] - bbox[0] + M * 4)
             elif t == "ptype_row":
-                bbox = draw.textbbox((0, 0), item[1], font=self._font)
-                box_w = max(LH - 4, 16)
-                row_w = bbox[2] - bbox[0] + 8 + 6 * (box_w + 4) + M * 4
-                max_w = max(max_w, row_w)
+                # Vertical stack: width is just the widest single label
+                # (plus the indent + padding), not the sum of all of them.
+                bbox = draw.textbbox((0, 0), f"{item[1]}:", font=self._font)
+                header_w = bbox[2] - bbox[0] + M * 4
+                labels = item[5] if len(item) > 5 else {}
+                widest = 0
+                for p in sorted(item[2]):
+                    txt = str(labels.get(p, p))
+                    tb = draw.textbbox((0, 0), txt, font=self._font)
+                    widest = max(widest, tb[2] - tb[0])
+                button_w = max(LH - 4, widest + 8)
+                max_w = max(max_w, header_w, M + 16 + button_w + M * 2)
 
-        # Count lines including dropdown expansion
+        # Count lines including dropdown expansion + ptype_row stack.
         n_lines = len(items)
         dropdown_extra = 0
+        ptype_extra = 0
         max_dd_visible = max(4, (self._fb_height // LH) - n_lines - 4)
-        if self._dropdown_open:
-            for item in items:
-                if item[0] == "dropdown" and item[4] == self._dropdown_open:
-                    n_opts = len(item[3])
-                    dropdown_extra = min(n_opts, max_dd_visible)
-                    if n_opts > max_dd_visible:
-                        dropdown_extra += 2
+        for item in items:
+            if item[0] == "ptype_row":
+                # Header + one row per available ptype (the header counts
+                # as the 1 already in n_lines, so just add the N rows).
+                ptype_extra += len(item[2])
+            elif item[0] == "dropdown" and self._dropdown_open and item[4] == self._dropdown_open:
+                n_opts = len(item[3])
+                dropdown_extra = min(n_opts, max_dd_visible)
+                if n_opts > max_dd_visible:
+                    dropdown_extra += 2
 
         tw = max_w + M * 2
-        th = (n_lines + dropdown_extra) * LH + M * 2
+        th = (n_lines + dropdown_extra + ptype_extra) * LH + M * 2
 
         img = Image.new("RGBA", (tw, th), s.bg_color)
         draw = ImageDraw.Draw(img)
@@ -188,6 +219,19 @@ class Panel:
 
             if t == "text":
                 draw.text((M, y), item[1], fill=s.text_color, font=self._font)
+                y += LH
+
+            elif t == "button":
+                _, label, key = item
+                bbox = draw.textbbox((0, 0), label, font=self._font)
+                bw = bbox[2] - bbox[0] + 16
+                draw.rectangle(
+                    [(M, y + 2), (M + bw, y + LH - 2)],
+                    fill=s.slider_btn,
+                    outline=s.text_color,
+                )
+                draw.text((M + 8, y), label, fill=s.text_color, font=self._font)
+                self._widgets.append((y, y + LH, "button", key, M, M + bw))
                 y += LH
 
             elif t == "toggle":
@@ -248,37 +292,32 @@ class Panel:
                 y += LH
 
             elif t == "ptype_row":
-                _, label, available, selected, key = item
-                draw.text((M, y), label, fill=s.text_color, font=self._font)
-                bbox = draw.textbbox((0, 0), label, font=self._font)
-                lbl_w = bbox[2] - bbox[0] + 8
-                box_w = max(LH - 4, 16)
-                gap = 4
-                bx = M + lbl_w
-                for p in range(6):
-                    enabled = p in available
+                _, label, available, selected, key, labels = item
+                # Header line + one toggle button per available ptype,
+                # stacked vertically and indented under the header.
+                draw.text((M, y), f"{label}:", fill=s.text_color, font=self._font)
+                y += LH
+                indent = M + 16
+                for p in sorted(available):
+                    txt = str(labels.get(p, p))
+                    tb = draw.textbbox((0, 0), txt, font=self._font)
+                    tw_ = tb[2] - tb[0]
+                    box_w = max(LH - 4, tw_ + 8)
                     on = p in selected
                     fill = s.toggle_on_color if on else s.field_bg
-                    if not enabled:
-                        fill = (40, 40, 40, 255)
                     draw.rectangle(
-                        [(bx, y + 2), (bx + box_w, y + LH - 4)],
+                        [(indent, y + 2), (indent + box_w, y + LH - 4)],
                         fill=fill,
                         outline=s.text_color,
                     )
-                    txt_color = s.text_color if enabled else (90, 90, 90, 255)
-                    tb = draw.textbbox((0, 0), str(p), font=self._font)
-                    tw_ = tb[2] - tb[0]
                     draw.text(
-                        (bx + (box_w - tw_) // 2, y),
-                        str(p),
-                        fill=txt_color,
+                        (indent + (box_w - tw_) // 2, y),
+                        txt,
+                        fill=s.text_color,
                         font=self._font,
                     )
-                    if enabled:
-                        self._widgets.append((y, y + LH, "ptype_tick", key, p, bx, bx + box_w))
-                    bx += box_w + gap
-                y += LH
+                    self._widgets.append((y, y + LH, "ptype_tick", key, p, indent, indent + box_w))
+                    y += LH
 
             elif t == "field":
                 _, label, value, key = item
@@ -340,6 +379,11 @@ class Panel:
     def _handle_base_click(self, widget, lx):
         """Handle common widget click types. Returns True if handled."""
         wtype = widget[2]
+        if wtype == "button":
+            key = widget[3]
+            if key == "_toggle_minimize":
+                self._minimized = not self._minimized
+                return True
         if wtype == "dropdown_header":
             key = widget[3]
             self._dropdown_open = None if self._dropdown_open == key else key
@@ -427,11 +471,9 @@ class DevOverlay(Panel):
         items.append(("slider", "Multigrid Levels",
                       float(getattr(renderer, "multigrid_levels", 1)),
                       1.0, 8.0, "multigrid_levels"))
+        # Sink/star controls live in the dedicated panel now (toggle with K).
         if getattr(renderer, "n_stars", 0) > 0:
-            items.append(("slider", "Star Radius",
-                          renderer.star_world_radius, 0.001, 5.0, "star_world_radius"))
-            items.append(("slider", "Star Intensity",
-                          renderer.star_intensity, 0.0, 100.0, "star_intensity"))
+            items.append(("text", "Sink controls: press K"))
 
         if message:
             items.append(("text", message))
@@ -501,6 +543,193 @@ class DevOverlay(Panel):
                 setattr(renderer, key, not getattr(renderer, key))
             return True
 
+        return True
+
+
+class SinkOverlay(Panel):
+    """Panel for sink/star marker rendering: pick mode (realistic PSF
+    vs. flat marker) and tune the per-mode controls. Toggled with K."""
+
+    def __init__(self):
+        super().__init__(SINK_STYLE)
+        self.enabled = False
+
+    def update(self, renderer):
+        if not self.enabled:
+            return
+        if self._minimized:
+            self.render_panel([("button", "[+] Sink", "_toggle_minimize")])
+            return
+        if getattr(renderer, "n_stars", 0) == 0:
+            self.render_panel([
+                ("button", "[-] Sink", "_toggle_minimize"),
+                ("text", "(no sink/star particles loaded)"),
+            ])
+            return
+
+        avail_fields = sorted((getattr(renderer, "_star_fields", {}) or {}).keys())
+        size_opts = avail_fields if avail_fields else [renderer.sink_size_field]
+        color_opts = ["None"] + avail_fields
+
+        items = [
+            ("button", "[-] Sink", "_toggle_minimize"),
+            ("text", f"Sink rendering — {renderer.n_stars:,} particles"),
+        ]
+        items.append(("toggle", "Marker Mode (off=PSF)",
+                      bool(renderer.sink_marker_mode), "sink_marker_mode"))
+        items.append(("dropdown", "Size Field",
+                      renderer.sink_size_field, size_opts, "sink_size_field"))
+        items.append(("slider", "Star Radius",
+                      renderer.star_world_radius, 0.001, 5.0, "star_world_radius"))
+        items.append(("slider", "Size Exponent",
+                      renderer.sink_size_exponent, 0.0, 2.0, "sink_size_exponent"))
+
+        if renderer.sink_marker_mode:
+            items.append(("slider", "Opacity",
+                          renderer.sink_opacity, 0.0, 1.0, "sink_opacity"))
+            items.append(("slider", "Border Width",
+                          renderer.sink_border_frac, 0.0, 0.5, "sink_border_frac"))
+            items.append(("dropdown", "Color Field",
+                          renderer.sink_color_field, color_opts, "sink_color_field"))
+            if renderer.sink_color_field == "None":
+                # No field selected → fall back to a uniform RGB fill.
+                items.append(("text", "Fill color"))
+                items.append(("slider", "  R", renderer.sink_fill_r, 0.0, 1.0, "sink_fill_r"))
+                items.append(("slider", "  G", renderer.sink_fill_g, 0.0, 1.0, "sink_fill_g"))
+                items.append(("slider", "  B", renderer.sink_fill_b, 0.0, 1.0, "sink_fill_b"))
+            else:
+                from .colormaps import AVAILABLE_COLORMAPS
+                items.append(("dropdown", "Cmap", renderer.sink_cmap_name,
+                              list(AVAILABLE_COLORMAPS), "sink_cmap"))
+                # Min/Max are bare numeric ranges; the slider widget can't
+                # span the dynamic range of arbitrary sink data, but ±20-
+                # range click-stepping handles most cases. Switch the Log
+                # toggle to dial in log10 space.
+                prefix = "log " if renderer.sink_log_scale else ""
+                if renderer.sink_log_scale:
+                    vmin_lo, vmax_lo = -20.0, 20.0
+                else:
+                    ext = max(abs(renderer.sink_qty_min), abs(renderer.sink_qty_max), 1.0)
+                    vmin_lo, vmax_lo = -10.0 * ext, 10.0 * ext
+                items.append(("slider", f"{prefix}Min",
+                              renderer.sink_qty_min, vmin_lo, vmax_lo, "sink_qty_min"))
+                items.append(("slider", f"{prefix}Max",
+                              renderer.sink_qty_max, vmin_lo, vmax_lo, "sink_qty_max"))
+                items.append(("toggle", "Log scale", renderer.sink_log_scale, "sink_log_scale"))
+            items.append(("text", "Border color"))
+            items.append(("slider", "  R", renderer.sink_border_r, 0.0, 1.0, "sink_border_r"))
+            items.append(("slider", "  G", renderer.sink_border_g, 0.0, 1.0, "sink_border_g"))
+            items.append(("slider", "  B", renderer.sink_border_b, 0.0, 1.0, "sink_border_b"))
+        else:
+            items.append(("slider", "Star Intensity",
+                          renderer.star_intensity, 0.0, 100.0, "star_intensity"))
+            band = getattr(renderer, "star_band", "?")
+            ext = "ON" if getattr(renderer, "star_extinction_enabled", False) else "OFF"
+            items.append(("text", f"Band: {band}  (B/⇧B to cycle)"))
+            items.append(("text", f"Extinction: {ext}  (O to toggle)"))
+
+        # ---- Trajectories (RAMSES sink_*.txt files) ----
+        traj_data = getattr(renderer, "_sink_trajectory_data", None) or {}
+        if traj_data:
+            avail_ids = sorted(traj_data.keys())
+            max_n = min(8, len(avail_ids))
+            n_active = len(getattr(renderer, "_traj_slots", []))
+            items.append(("text", f"Trajectories ({len(avail_ids)} sink IDs available)"))
+            items.append(("slider", "# Trajectories",
+                          float(n_active), 0.0, float(max_n), "_n_trajectories"))
+            id_opts = [str(i) for i in avail_ids]
+            for i, slot in enumerate(renderer._traj_slots):
+                sid = slot.get("sink_id")
+                items.append(("dropdown", f"  T{i+1} ID",
+                              str(sid) if sid is not None else "(none)",
+                              id_opts, f"_traj_id_{i}"))
+                items.append(("slider", f"    R", slot["r"], 0.0, 1.0, f"_traj_r_{i}"))
+                items.append(("slider", f"    G", slot["g"], 0.0, 1.0, f"_traj_g_{i}"))
+                items.append(("slider", f"    B", slot["b"], 0.0, 1.0, f"_traj_b_{i}"))
+
+        self.render_panel(items)
+
+    def render(self):
+        if not self.enabled:
+            return
+        super().render()
+
+    def on_click(self, x, y, renderer):
+        if not self.enabled:
+            return False
+        hit = self._hit_test(x, y)
+        if hit is None:
+            return False
+        if hit in ("outside_close", "inside_miss"):
+            return True
+
+        widget = hit
+        wtype = widget[2]
+        lx = x - self._panel_x
+
+        base = self._handle_base_click(widget, lx)
+        if base is True:
+            return True
+        if isinstance(base, tuple):
+            action, key, vmin, vmax = base
+            # Trajectory controls have keys "_n_trajectories", "_traj_r_<i>" etc.
+            # Route them through the renderer's setters so the buffers
+            # get rebuilt immediately.
+            if key == "_n_trajectories":
+                cur = len(renderer._traj_slots)
+                renderer.set_n_trajectories(cur - 1 if action == "slider_dec" else cur + 1)
+                return True
+            if key.startswith("_traj_") and "_" in key[6:]:
+                # _traj_<r|g|b>_<i>
+                _, _, channel, idx_str = key.split("_", 3)
+                idx = int(idx_str)
+                if 0 <= idx < len(renderer._traj_slots):
+                    cur_v = renderer._traj_slots[idx][channel]
+                    step = (vmax - vmin) / 20
+                    new_v = max(vmin, cur_v - step) if action == "slider_dec" else min(vmax, cur_v + step)
+                    kw = {channel: new_v}
+                    renderer.set_traj_slot_color(idx, **kw)
+                return True
+            cur = getattr(renderer, key, 1.0)
+            # Log-scale clicks for quantities spanning many decades.
+            if key in ("star_world_radius", "star_intensity"):
+                factor = 1.5
+                if action == "slider_dec":
+                    setattr(renderer, key, max(cur / factor, 1e-12))
+                else:
+                    setattr(renderer, key, cur * factor)
+                return True
+            step = max((vmax - vmin) / 20, 0.01)
+            if action == "slider_dec":
+                setattr(renderer, key, max(vmin, cur - step))
+            else:
+                setattr(renderer, key, min(vmax, cur + step))
+            return True
+
+        if wtype == "toggle":
+            key = widget[3]
+            setattr(renderer, key, not getattr(renderer, key))
+            return True
+
+        if wtype == "dropdown_item":
+            key, value = widget[3], widget[4]
+            if key == "sink_cmap":
+                from .colormaps import colormap_to_texture_data
+                renderer.sink_cmap_name = value
+                renderer.set_sink_colormap(colormap_to_texture_data(value))
+            elif key == "sink_size_field":
+                renderer.set_sink_size_field(value)
+            elif key == "sink_color_field":
+                renderer.set_sink_color_field(value)
+            elif key.startswith("_traj_id_"):
+                idx = int(key.split("_")[-1])
+                try:
+                    sid = int(value)
+                except ValueError:
+                    sid = None
+                renderer.set_traj_slot_id(idx, sid)
+            self._dropdown_open = None
+            return True
         return True
 
 
@@ -633,9 +862,13 @@ class UserMenu(Panel):
                wa_data_field="Masses",
                vector_fields=None, vector_projection="LOS", vector_projections=None,
                composite_slots=None,
-               available_ptypes=None, selected_ptypes=None):
+               available_ptypes=None, selected_ptypes=None,
+               ptype_labels=None):
         self._SD_OPS = sd_ops or ["*"]
-        items = []
+        if self._minimized:
+            self.render_panel([("button", "[+] Splat", "_toggle_minimize")])
+            return
+        items = [("button", "[-] Splat", "_toggle_minimize")]
 
         # All field dropdowns include vector field names
         vf_set = set(vector_fields or [])
@@ -649,7 +882,7 @@ class UserMenu(Panel):
             items.append((
                 "ptype_row", "Types",
                 set(available_ptypes), set(selected_ptypes or set()),
-                "ptypes",
+                "ptypes", dict(ptype_labels or {}),
             ))
 
         if render_modes and len(render_modes) > 1:

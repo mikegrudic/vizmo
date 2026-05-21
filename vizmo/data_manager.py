@@ -602,6 +602,9 @@ def _read_yt(path):
     header_attrs = {"Time": time, "BoxSize": box}
 
     ptype_groups = {}
+    # {slot_int: original yt-side name} — used by the UI to label the
+    # particle-type toggles with "STAR", "N-BODY_0", "mesh" etc.
+    ptype_labels = {}
 
     # --- Mesh / grid cells → PartType0 ---------------------------------
     xs = _arr(("index", "x"), "code_length")
@@ -642,21 +645,67 @@ def _read_yt(path):
             if arr is not None and len(arr) == n:
                 gas[name] = arr.astype(np.float32)
         ptype_groups["PartType0"] = gas
+        ptype_labels[0] = "mesh"
         print(f"  yt: PartType0 (mesh) — {n:,} cells")
 
     # --- Particle types -----------------------------------------------
-    raw = list(
-        getattr(ds, "particle_types_raw", None)
-        or getattr(ds, "particle_types", []) or []
-    )
-    meta = {"all", "io", "nbody"}
-    ptypes = [pt for pt in raw if pt.lower() not in meta]
+    # yt exposes two views: `particle_types_raw` (the frontend's raw
+    # families) and `particle_types` (which also includes derived/
+    # filtered types, e.g. RAMSES splits its `io` pool into DM/star/
+    # cloud by `particle_family`). Prefer the derived view when it has
+    # more useful types than raw — that's how we pick up DM and stars
+    # alongside sinks for RAMSES. ART exposes the same set in both,
+    # so the choice is a no-op there.
+    #
+    # `sink_csv` is yt's RAMSES frontend mis-parsing sink_*.csv (column
+    # values become field names — no `particle_position_x`). `io` is
+    # the unfiltered superset when derived filters exist; skipping it
+    # avoids double-counting. `_tracer` types are passive markers and
+    # typically empty in the snapshots we care about.
+    meta_exact = {"all", "io", "nbody", "sink_csv"}
+
+    def _is_meta(pt):
+        lo = pt.lower()
+        return lo in meta_exact or lo.endswith("_tracer")
+
+    raw_pts = list(getattr(ds, "particle_types_raw", None) or [])
+    derived_pts = list(getattr(ds, "particle_types", []) or [])
+    raw_useful = [pt for pt in raw_pts if not _is_meta(pt)]
+    derived_useful = [pt for pt in derived_pts if not _is_meta(pt)]
+    if len(derived_useful) > len(raw_useful):
+        ptypes = sorted(derived_useful)
+    else:
+        ptypes = raw_useful
+
+    # Categorise each ptype so we can place sinks at PartType5 (priority
+    # over stars) and stars at PartType4 when both exist. ART STAR
+    # particles (clusters, no separate sink) still land at PartType5 so
+    # the existing cluster-radius treatment fires. DM-like types claim
+    # PartType1 to follow the Gadget convention.
+    def _classify(pt):
+        lo = pt.lower()
+        if "sink" in lo or "bh" in lo:
+            return "sink"
+        if "star" in lo:
+            return "star"
+        if any(tok in lo for tok in ("dm", "dark", "halo", "nbody", "n-body")):
+            return "dm"
+        return "other"
+
+    categories = [(pt, _classify(pt)) for pt in ptypes]
+    has_sink = any(cat == "sink" for _, cat in categories)
 
     used = {0} if "PartType0" in ptype_groups else set()
     next_slot = 1
-    for pt in ptypes:
-        if "star" in pt.lower() and 5 not in used:
+    for pt, cat in categories:
+        if cat == "sink" and 5 not in used:
             slot = 5
+        elif cat == "star" and has_sink and 4 not in used:
+            slot = 4
+        elif cat == "star" and not has_sink and 5 not in used:
+            slot = 5
+        elif cat == "dm" and 1 not in used:
+            slot = 1
         else:
             while next_slot in used or next_slot == 5:
                 next_slot += 1
@@ -708,14 +757,63 @@ def _read_yt(path):
             except Exception as e:
                 print(f"  Warning: cluster-radius scaling unavailable ({e})")
 
+        # Surface any remaining 1-D scalar field yt exposes for this
+        # particle type, so the sink-marker size/colour dropdowns can
+        # pick it. Positions, velocities and mass are already covered by
+        # the canonical fields above; skip them to avoid duplicates and
+        # to keep the dropdown legible. The natural-unit fetch (no unit
+        # conversion) gives whatever yt's frontend decides — Msun, K,
+        # dimensionless metallicity, etc. — which is generally what the
+        # user wants for visualization.
+        n_p = len(pos)
+        canonical_skip = {
+            "particle_position", "particle_position_x",
+            "particle_position_y", "particle_position_z",
+            "particle_velocity", "particle_velocity_x",
+            "particle_velocity_y", "particle_velocity_z",
+            "particle_mass", "smoothing_length",
+            # Raw-frontend names for the same quantities (ART uses
+            # uppercased POSITION_X/VELOCITY_X/MASS; lower-casing the
+            # incoming name catches case variants generically).
+            "position_x", "position_y", "position_z",
+            "velocity_x", "velocity_y", "velocity_z",
+            "mass",
+        }
+        for fname in ds.field_list:
+            if fname[0] != pt:
+                continue
+            if fname[1] in canonical_skip or fname[1].lower() in canonical_skip:
+                continue
+            arr = _arr(fname, None)
+            if arr is None or arr.ndim != 1 or len(arr) != n_p:
+                continue
+            # Sanitise: trim the leading "particle_" if present, keep
+            # the rest as-is so frontend-native names (BIRTH_TIME,
+            # METALLICITY_SNII, age, …) flow through unchanged.
+            clean = fname[1]
+            if clean.startswith("particle_"):
+                clean = clean[len("particle_"):]
+            if not clean or clean in pgrp:
+                continue
+            pgrp[clean] = arr.astype(np.float32)
+
         ptype_groups[f"PartType{slot}"] = pgrp
+        ptype_labels[slot] = pt
         print(f"  yt: PartType{slot} ({pt}) — {len(pos):,} particles")
 
     if not ptype_groups:
         raise ValueError(
             f"yt: no mesh or particle data extracted from {path}"
         )
-    return header_attrs, ptype_groups
+    # Conversion factor from pc to code_length, used to bring sink
+    # trajectory files (which live in pc) into the rendering coord
+    # system. May fail for non-cosmological frontends without a
+    # registered length unit; in that case the trajectory loader skips.
+    try:
+        pc_per_code = float(ds.quan(1.0, "pc").to("code_length").d)
+    except Exception:
+        pc_per_code = None
+    return header_attrs, ptype_groups, ptype_labels, pc_per_code
 
 
 class _YtFile:
@@ -725,7 +823,7 @@ class _YtFile:
     """
 
     def __init__(self, path):
-        header_attrs, ptype_groups = _read_yt(path)
+        header_attrs, ptype_groups, ptype_labels, pc_per_code = _read_yt(path)
         self._groups = {"Header": _HeaderGroup(header_attrs)}
         for name, fields in ptype_groups.items():
             self._groups[name] = _MemGroup(fields)
@@ -733,6 +831,12 @@ class _YtFile:
         # built a PartType0, the gas/grid branch fired → treat as a
         # structured-grid source so the renderer widens the kernel.
         self.is_structured_grid = "PartType0" in ptype_groups
+        # Descriptive labels for the UI toggle row (e.g. {1: "N-BODY_0",
+        # 5: "STAR"}). The bare integers are still the slot keys.
+        self.ptype_labels = dict(ptype_labels)
+        # Conversion factor pc → code_length (None when yt couldn't
+        # resolve the length unit, e.g. non-cosmological frontends).
+        self.pc_per_code = pc_per_code
 
     def keys(self):
         return list(self._groups.keys())
@@ -922,6 +1026,19 @@ class SnapshotData:
         # FLASH plotfiles, ART/Enzo/RAMSES/etc. via yt). Used by the
         # renderer to widen the kernel and hide cell-edge artifacts.
         self.is_structured_grid = getattr(self._file, "is_structured_grid", False)
+        # UI labels for each PartType slot. yt populates these from the
+        # frontend's native naming ({0: "mesh", 1: "N-BODY_0", 5: "STAR"});
+        # for the flatten-to-PartType0 readers we know it's a mesh; for
+        # h5py-loaded Gadget data we use the canonical Gadget conventions.
+        if isinstance(self._file, _YtFile):
+            self.ptype_labels = dict(self._file.ptype_labels)
+        elif isinstance(self._file, (_AthdfFile, _FlashFile)):
+            self.ptype_labels = {0: "mesh"}
+        else:
+            self.ptype_labels = {
+                0: "gas", 1: "halo", 2: "disk",
+                3: "bulge", 4: "stars", 5: "sinks",
+            }
         self.header = dict(self._file["Header"].attrs)
         self.time = float(self.header.get("Time", 0))
 
@@ -943,6 +1060,11 @@ class SnapshotData:
                 particle_types = [self.available_types[0]]
             else:
                 particle_types = []
+
+        # Per-sink trajectories — look for a sibling SINK1 directory
+        # with RAMSES-style sink_<id>.txt files. Cosmological/RAMSES
+        # only; empty dict for everything else.
+        self.sink_trajectories = self._load_sink_trajectories(path)
 
         # Stars (PartType5) loaded independently as point-source pool
         self._stars = "PartType5" in self._file
@@ -987,6 +1109,71 @@ class SnapshotData:
         n = grp["Coordinates"].shape[0]
         # Coordinates (f64), Masses (f32), Hsml (f32) ~ 32 bytes/particle
         return n * 32
+
+    def _load_sink_trajectories(self, snapshot_path):
+        """Read RAMSES-style sink_<id>.txt trajectories from a sibling
+        SINK1 directory and return {sink_id: positions_in_code_length}.
+
+        Each file has nstep/aexp/idsink/... and 3D position columns
+        14-16 (1-based) in pc. We convert to code_length using the
+        snapshot's yt unit registry so trajectories land in the same
+        coordinate system as the gas mesh and particles. Files with
+        fewer than two valid rows are skipped (nothing to draw).
+        Returns an empty dict when SINK1 doesn't exist or when the
+        snapshot isn't a yt-loaded RAMSES dataset.
+        """
+        if not isinstance(self._file, _YtFile):
+            return {}
+        pc_per_code = self._file.pc_per_code
+        if pc_per_code is None or pc_per_code <= 0:
+            return {}
+
+        # SINK1 is the RAMSES convention; sit next to or one level above
+        # the snapshot directory depending on how the user pointed at it.
+        base = snapshot_path
+        if os.path.isfile(base):
+            base = os.path.dirname(base)
+        candidates = [
+            os.path.join(base, "SINK1"),
+            os.path.join(os.path.dirname(base), "SINK1"),
+        ]
+        sink_dir = next((c for c in candidates if os.path.isdir(c)), None)
+        if sink_dir is None:
+            return {}
+
+        pat = re.compile(r"^sink_(\d+)\.txt$")
+        out = {}
+        for fn in sorted(os.listdir(sink_dir)):
+            m = pat.match(fn)
+            if not m:
+                continue
+            sid = int(m.group(1))
+            xs, ys, zs = [], [], []
+            with open(os.path.join(sink_dir, fn)) as f:
+                for raw in f:
+                    s = raw.lstrip()
+                    if not s or s.startswith("#"):
+                        continue
+                    toks = s.split()
+                    if len(toks) < 16:
+                        continue
+                    try:
+                        x = float(toks[13])
+                        y = float(toks[14])
+                        z = float(toks[15])
+                    except ValueError:
+                        continue
+                    xs.append(x); ys.append(y); zs.append(z)
+            if len(xs) < 2:
+                continue
+            # pc → code_length so the trajectory shares the snapshot
+            # coordinate frame. pc_per_code is the code-length value of
+            # 1 pc, so multiplying converts pc → code-length.
+            pos = (np.asarray([xs, ys, zs], dtype=np.float64).T) * pc_per_code
+            out[sid] = pos
+        if out:
+            print(f"  Loaded {len(out)} sink trajectories from {sink_dir}")
+        return out
 
     def _evict_for(self, p_new):
         """Evict LRU non-selected ptypes until we expect to fit p_new."""
@@ -1040,6 +1227,53 @@ class SnapshotData:
             self.star_masses = np.zeros(0, dtype=np.float32)
             self.star_luminosity = np.zeros(0, dtype=np.float32)
             self.n_stars = 0
+
+        # Eagerly populate a {name: ndarray} dict of all per-sink scalar
+        # fields. Cheap (sinks are typically thousands, not millions),
+        # and lets the UI pick fields for size/colour without an extra
+        # round-trip through the data manager on every dropdown click.
+        self.star_fields = {}
+        if self._stars and self.n_stars > 0:
+            for name in self._ptype_scalar_fields(5):
+                try:
+                    self.star_fields[name] = self.get_star_field(name)
+                except Exception:
+                    pass
+            # StarLuminosity is synthesized (ZAMS or cluster R²) when
+            # absent from the file, so it might not appear in the
+            # scalar-field enumeration. Always expose it.
+            self.star_fields["StarLuminosity"] = np.asarray(
+                self.star_luminosity, dtype=np.float32
+            )
+            # Synthetic |Velocity| — handier than individual components
+            # for size/colour mapping. Computed from the (N, 3) vector.
+            try:
+                v = self._read_field("PartType5", "Velocities")
+                if v.ndim == 2 and v.shape[1] == 3:
+                    self.star_fields["Speed"] = np.linalg.norm(
+                        v.astype(np.float32), axis=1
+                    )
+            except Exception:
+                pass
+
+    def available_star_fields(self):
+        """Per-sink scalar fields available for size/colour selection."""
+        return sorted(self.star_fields.keys())
+
+    def get_star_field(self, name):
+        """Read a scalar (or vector component) field from PartType5."""
+        if not self._stars:
+            return np.zeros(0, dtype=np.float32)
+        if name == "Masses":
+            return np.asarray(self.star_masses, dtype=np.float32)
+        if name == "StarLuminosity":
+            return np.asarray(self.star_luminosity, dtype=np.float32)
+        if "[" in name and name.endswith("]"):
+            base, idx_str = name[:-1].split("[", 1)
+            col = int(idx_str)
+            d = self._read_field("PartType5", base)
+            return np.ascontiguousarray(d[:, col]).astype(np.float32)
+        return self._read_field("PartType5", name).astype(np.float32)
 
     def set_particle_types(self, particle_types):
         """(Re)load the particle pool from the given list of PartType ints."""

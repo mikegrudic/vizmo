@@ -306,7 +306,7 @@ class WGPURenderer:
 
         # ---- Realistic stars overlay ----
         self._star_shader = dev.create_shader_module(code=_load_wgsl("star_realistic.wgsl"))
-        self._star_params_buf = dev.create_buffer(size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+        self._star_params_buf = dev.create_buffer(size=80, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
         self._star_bgl0 = dev.create_bind_group_layout(
             entries=[
                 {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
@@ -317,6 +317,13 @@ class WGPURenderer:
                     "texture": {"sample_type": "float", "view_dimension": "2d-array"},
                 },
                 {"binding": 3, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {"type": "filtering"}},
+                # Sink-marker colormap (1D texture sampled in marker mode).
+                {
+                    "binding": 4,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "1d"},
+                },
+                {"binding": 5, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {"type": "filtering"}},
             ]
         )
         # Load baked UBVRI PSFs (5 layers × 162×162) and upload as a
@@ -340,10 +347,109 @@ class WGPURenderer:
                 "targets": [{"format": self.present_format, "blend": star_blend}],
             },
         )
+        # Marker mode uses standard alpha blending so the fill/border
+        # actually cover the gas underneath. With additive blending the
+        # border would be invisible (black border adds zero).
+        marker_blend = {
+            "color": {
+                "operation": "add",
+                "src_factor": "src-alpha",
+                "dst_factor": "one-minus-src-alpha",
+            },
+            "alpha": {
+                "operation": "add",
+                "src_factor": "one",
+                "dst_factor": "one-minus-src-alpha",
+            },
+        }
+        self._sink_marker_pipeline = dev.create_render_pipeline(
+            layout=star_layout,
+            vertex={"module": self._star_shader, "entry_point": "vs_main", "buffers": []},
+            primitive={"topology": "triangle-strip", "strip_index_format": "uint32"},
+            fragment={
+                "module": self._star_shader,
+                "entry_point": "fs_main",
+                "targets": [{"format": self.present_format, "blend": marker_blend}],
+            },
+        )
         self._star_buf = None
         self._star_bg0 = None
         self._star_bg1 = None
         self._star_buf_dirty = True
+
+        # ---- Sink trajectories (colored line strips through the scene) ----
+        # Inline shader: just transforms position by camera and outputs a
+        # flat colour per draw. The vertex buffer carries one xyz per
+        # trajectory sample, drawn as a line-strip primitive.
+        traj_src = """
+            struct Camera {
+                view: mat4x4<f32>,
+                proj: mat4x4<f32>,
+                viewport_size: vec2<f32>,
+                kernel_id: u32,
+                _pad: u32,
+            };
+            struct TrajParams { color: vec4<f32> };
+            @group(0) @binding(0) var<uniform> camera: Camera;
+            @group(0) @binding(1) var<uniform> params: TrajParams;
+            @vertex
+            fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {
+                return camera.proj * (camera.view * vec4<f32>(pos, 1.0));
+            }
+            @fragment
+            fn fs_main() -> @location(0) vec4<f32> {
+                return params.color;
+            }
+        """
+        self._traj_shader = dev.create_shader_module(code=traj_src)
+        self._traj_bgl = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
+            {"binding": 1, "visibility": VF, "buffer": {"type": "uniform"}},
+        ])
+        traj_layout = dev.create_pipeline_layout(bind_group_layouts=[self._traj_bgl])
+        traj_blend = {
+            "color": {
+                "operation": "add",
+                "src_factor": "src-alpha",
+                "dst_factor": "one-minus-src-alpha",
+            },
+            "alpha": {
+                "operation": "add",
+                "src_factor": "one",
+                "dst_factor": "one-minus-src-alpha",
+            },
+        }
+        self._traj_pipeline = dev.create_render_pipeline(
+            layout=traj_layout,
+            vertex={
+                "module": self._traj_shader,
+                "entry_point": "vs_main",
+                "buffers": [{
+                    "array_stride": 12,
+                    "step_mode": "vertex",
+                    "attributes": [{
+                        "format": "float32x3",
+                        "offset": 0,
+                        "shader_location": 0,
+                    }],
+                }],
+            },
+            primitive={"topology": "line-strip"},
+            fragment={
+                "module": self._traj_shader,
+                "entry_point": "fs_main",
+                "targets": [{"format": self.present_format, "blend": traj_blend}],
+            },
+        )
+        # Loaded once by wgpu_app from data.sink_trajectories.
+        self._sink_trajectory_data = {}
+        # Per-slot selection state. SinkOverlay mutates these; renderer
+        # rebuilds line buffers via _rebuild_trajectories(). Each slot:
+        # {"sink_id": int|None, "r": f, "g": f, "b": f}.
+        self._traj_slots = []
+        # Built per-trajectory line buffers (vbo + bind group). Mirrors
+        # _traj_slots in length but only includes valid entries.
+        self._traj_render = []
 
         # Tunables — wired into the dev panel later.
         # Physical billboard radius, in world (snapshot) units. The
@@ -351,6 +457,46 @@ class WGPURenderer:
         # like a real spherical object. Tune from the dev panel.
         self.star_world_radius = 0.2
         self.star_intensity = 10.0
+        # Sink/star marker rendering: switch the shader's fragment branch
+        # from a PSF lookup to a flat filled disk with a contrasting
+        # border ring. World-radius sizing (with √M scaling and pixel
+        # floor) is shared between both modes. Fill color comes from
+        # sampling a colormap at the per-sink data value (mass by
+        # default), with min/max/log controls mirroring the splat path.
+        # Border color stays RGB-configurable.
+        self.sink_marker_mode = True
+        self.sink_border_r = 0.0
+        self.sink_border_g = 0.0
+        self.sink_border_b = 0.0
+        self.sink_border_frac = 0.2
+        self.sink_cmap_name = "viridis"
+        self.sink_qty_min = 0.0
+        self.sink_qty_max = 1.0
+        self.sink_log_scale = True
+        # Per-sink field selection. Size defaults to the synthesized
+        # luminosity (cluster R² for yt sinks, ZAMS L for Gadget), which
+        # preserves the existing physical-radius sizing. Color defaults
+        # to None → solid fill from sink_fill_rgb sliders (black at
+        # startup; user-configurable). Picking any field swaps to a
+        # colormap-driven fill.
+        self.sink_size_field = "StarLuminosity"
+        self.sink_color_field = "None"
+        self.sink_fill_r = 0.0
+        self.sink_fill_g = 0.0
+        self.sink_fill_b = 0.0
+        # r_world = world_radius * pow(size_field_value, size_exponent).
+        # 0.5 reproduces the original sqrt-area scaling (radius ∝ √L);
+        # 1.0 makes radius linear in the field; 0 is constant-size dots.
+        self.sink_size_exponent = 0.5
+        # Marker-mode fill opacity. PSF mode is additive and ignores it.
+        self.sink_opacity = 1.0
+        self._star_fields = {}
+        self._sink_colormap_tex = None
+        self._sink_colormap_tex_view = None
+        self._sink_colormap_sampler = dev.create_sampler(
+            mag_filter="linear", min_filter="linear",
+            address_mode_u="clamp-to-edge",
+        )
         # UBVRI dust opacities (cm^2/g, MRN-style averages). Σ in
         # Msun/pc^2 → multiply by 2.0834e-4 to get code-unit κ such
         # that τ = κ_code * Σ.
@@ -396,6 +542,28 @@ class WGPURenderer:
         self._star_columns_cam_pos = None
         self._star_buf_dirty = True
         print(f"  [stars] extinction {'ON' if self.star_extinction_enabled else 'OFF'}")
+
+    def set_sink_colormap(self, rgba_data):
+        """Set the colormap for sink-marker fills, independent of the
+        gas-splat colormap. Same RGBA uint8 (N, 4) interface."""
+        dev = self.device
+        n = len(rgba_data)
+        self._sink_colormap_tex = dev.create_texture(
+            size=(n, 1, 1),
+            format="rgba8unorm",
+            dimension="1d",
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+        )
+        self._sink_colormap_tex_view = self._sink_colormap_tex.create_view()
+        # Invalidate the cached bind group so it gets rebuilt with the
+        # new texture on the next render.
+        self._star_bg0 = None
+        dev.queue.write_texture(
+            {"texture": self._sink_colormap_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            rgba_data.tobytes(),
+            {"bytes_per_row": n * 4, "rows_per_image": 1},
+            (n, 1, 1),
+        )
 
     def set_colormap(self, rgba_data):
         """Set colormap from RGBA uint8 array of shape (N, 4).
@@ -1312,6 +1480,150 @@ class WGPURenderer:
         )
         return tex, view, sampler
 
+    def set_sink_trajectory_data(self, trajectories):
+        """Hand the renderer the per-sink-id positions dict from the
+        data manager. Resets the slot list so the next UI interaction
+        can pick from the new sink IDs."""
+        self._sink_trajectory_data = dict(trajectories or {})
+        self._traj_slots = []
+        self._rebuild_trajectories()
+
+    def _default_traj_slot(self, slot_idx):
+        """Pick a sensible default sink_id + color for a freshly-added slot."""
+        ids = sorted(self._sink_trajectory_data.keys())
+        sid = ids[slot_idx % len(ids)] if ids else None
+        # Cycle through a small palette of distinct colours for new
+        # slots so the first few additions auto-differentiate.
+        palette = (
+            (0.10, 0.80, 1.00),
+            (1.00, 0.20, 0.10),
+            (0.20, 1.00, 0.30),
+            (1.00, 0.85, 0.10),
+            (0.85, 0.20, 1.00),
+            (0.10, 1.00, 0.80),
+        )
+        r, g, b = palette[slot_idx % len(palette)]
+        return {"sink_id": sid, "r": r, "g": g, "b": b}
+
+    def set_n_trajectories(self, n):
+        """Resize the slot list to *n*. Existing slots are preserved;
+        new slots get default sink_id + colour."""
+        n = max(0, int(n))
+        while len(self._traj_slots) < n:
+            self._traj_slots.append(self._default_traj_slot(len(self._traj_slots)))
+        if len(self._traj_slots) > n:
+            self._traj_slots = self._traj_slots[:n]
+        self._rebuild_trajectories()
+
+    def set_traj_slot_id(self, idx, sink_id):
+        if 0 <= idx < len(self._traj_slots):
+            self._traj_slots[idx]["sink_id"] = sink_id
+            self._rebuild_trajectories()
+
+    def set_traj_slot_color(self, idx, r=None, g=None, b=None):
+        if not (0 <= idx < len(self._traj_slots)):
+            return
+        slot = self._traj_slots[idx]
+        if r is not None: slot["r"] = float(r)
+        if g is not None: slot["g"] = float(g)
+        if b is not None: slot["b"] = float(b)
+        self._rebuild_trajectories()
+
+    def _rebuild_trajectories(self):
+        """Reconcile self._traj_render with self._traj_slots — build
+        a vertex buffer + bind group for each populated slot. Called
+        whenever the data, slot count, sink_id, or colour changes."""
+        import struct
+        self._traj_render = []
+        offset = getattr(self, "_world_offset", None)
+        for slot in self._traj_slots:
+            sid = slot.get("sink_id")
+            if sid is None:
+                continue
+            traj = self._sink_trajectory_data.get(sid)
+            if traj is None or len(traj) < 2:
+                continue
+            p = np.asarray(traj, dtype=np.float32)
+            if offset is not None:
+                p = p - np.asarray(offset, dtype=np.float32)
+            vbo = self.device.create_buffer_with_data(
+                data=np.ascontiguousarray(p).tobytes(),
+                usage=wgpu.BufferUsage.VERTEX,
+            )
+            color = (slot["r"], slot["g"], slot["b"], 1.0)
+            pbuf = self.device.create_buffer_with_data(
+                data=struct.pack("ffff", *color),
+                usage=wgpu.BufferUsage.UNIFORM,
+            )
+            bg = self.device.create_bind_group(
+                layout=self._traj_bgl,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": self._camera_buf}},
+                    {"binding": 1, "resource": {"buffer": pbuf}},
+                ],
+            )
+            self._traj_render.append({"vbo": vbo, "n": len(p), "bg": bg})
+
+    def _encode_trajectories(self, encoder, screen_view):
+        """Draw the active trajectories as line-strips over the
+        resolved screen, before the star overlay so sink markers sit
+        on top of their own tracks."""
+        if not self._traj_render or screen_view is None:
+            return
+        rp = encoder.begin_render_pass(color_attachments=[{
+            "view": screen_view,
+            "load_op": "load",
+            "store_op": "store",
+        }])
+        rp.set_pipeline(self._traj_pipeline)
+        for entry in self._traj_render:
+            rp.set_bind_group(0, entry["bg"])
+            rp.set_vertex_buffer(0, entry["vbo"])
+            rp.draw(entry["n"], 1, 0, 0)
+        rp.end()
+
+    def _sink_field(self, which, fallback):
+        """Resolve a sink field-selection attribute to an ndarray. Falls
+        back to *fallback* when the selection is "None", unknown, or the
+        wrong length (e.g. before the field dict has been uploaded)."""
+        name = getattr(self, which, None)
+        if name is None or name == "None":
+            return fallback
+        arr = self._star_fields.get(name)
+        if arr is None or len(arr) != self.n_stars:
+            return fallback
+        return arr
+
+    def set_sink_size_field(self, name):
+        """Pick which per-sink scalar drives the marker/PSF size."""
+        self.sink_size_field = name
+        self._star_buf_dirty = True
+
+    def set_sink_color_field(self, name):
+        """Pick which per-sink scalar feeds the marker colormap, and
+        re-auto-range min/max for the new field. "None" → solid black
+        fill (colormap path skipped in the shader)."""
+        self.sink_color_field = name
+        self._star_buf_dirty = True
+        if name == "None":
+            return
+        arr = self._star_fields.get(name)
+        if arr is None or len(arr) == 0:
+            return
+        valid = arr[np.isfinite(arr)]
+        if self.sink_log_scale:
+            valid = valid[valid > 0]
+        if len(valid) == 0:
+            return
+        if self.sink_log_scale:
+            self.sink_qty_min = float(np.log10(valid.min()))
+            self.sink_qty_max = float(np.log10(valid.max()))
+        else:
+            self.sink_qty_min = float(valid.min())
+            self.sink_qty_max = float(valid.max())
+        if self.sink_qty_max - self.sink_qty_min < 1e-6:
+            self.sink_qty_max = self.sink_qty_min + 1.0
+
     def _ensure_star_buffer(self):
         """(Re)build the per-star storage buffer holding (xyz, attenuated L)."""
         n = getattr(self, "n_stars", 0)
@@ -1329,7 +1641,7 @@ class WGPURenderer:
         # Track the offset so we rebuild if it changes after upload.
         self._star_buf_offset_used = None if offset is None else np.asarray(offset, dtype=np.float64).copy()
 
-        L0 = self._star_luminosity.astype(np.float32, copy=False)
+        L0 = self._sink_field("sink_size_field", self._star_luminosity).astype(np.float32, copy=False)
         cols = getattr(self, "_star_columns", None)
         have_ext = self.star_extinction_enabled and cols is not None and len(cols) == n
 
@@ -1351,18 +1663,28 @@ class WGPURenderer:
                 l = l * np.exp(-kappa_ch * cols).astype(np.float32)
             rgb[:, ch] = l
 
-        # Layout: two vec4 per star.
+        # Layout: three vec4 per star.
         # vec4[0] = (x, y, z, L_raw)            ← drives billboard size
         # vec4[1] = (L_R_att, L_G_att, L_B_att, L_single_att)
+        # vec4[2] = (sink_data_value, _, _, _)  ← marker-mode colormap lookup
         # The shader divides each L_*_att by L_raw to get a per-channel
         # attenuation factor in [0,1], so per-pixel surface brightness
         # is independent of intrinsic luminosity (which goes entirely
         # into the billboard area via radius ∝ sqrt(L)).
-        data = np.zeros((n, 8), dtype=np.float32)
+        data = np.zeros((n, 12), dtype=np.float32)
         data[:, 0:3] = pos.astype(np.float32)
         data[:, 3] = L0  # raw bolometric, for sizing
         data[:, 4:7] = rgb
         data[:, 7] = lum_single
+        # Marker color driver — whatever per-sink field the user picked.
+        # When the color field is "None" the shader skips the colormap
+        # sample entirely; the array still has to be filled with
+        # *something*, so default to L0 (the size driver) to avoid
+        # branching here.
+        sink_data = self._sink_field("sink_color_field", L0).astype(np.float32, copy=False)
+        if len(sink_data) != n:
+            sink_data = L0
+        data[:, 8] = sink_data
 
         nbytes = data.nbytes
         if self._star_buf is None or self._star_buf.size < nbytes:
@@ -1376,7 +1698,7 @@ class WGPURenderer:
             )
         self.device.queue.write_buffer(self._star_buf, 0, data.tobytes())
 
-        if self._star_bg0 is None:
+        if self._star_bg0 is None and self._sink_colormap_tex_view is not None:
             self._star_bg0 = self.device.create_bind_group(
                 layout=self._star_bgl0,
                 entries=[
@@ -1384,8 +1706,12 @@ class WGPURenderer:
                     {"binding": 1, "resource": {"buffer": self._star_params_buf}},
                     {"binding": 2, "resource": self._star_psf_view},
                     {"binding": 3, "resource": self._star_psf_sampler},
+                    {"binding": 4, "resource": self._sink_colormap_tex_view},
+                    {"binding": 5, "resource": self._sink_colormap_sampler},
                 ],
             )
+        if self._star_bg0 is None:
+            return False
         self._star_buf_dirty = False
         return True
 
@@ -1422,12 +1748,30 @@ class WGPURenderer:
 
         import struct
 
+        # 20 f32s = 80 bytes. Layout matches WGSL StarParams:
+        #   00 world_radius, intensity, band_idx, marker_mode
+        #   16 border_rgb (vec3, 16-aligned), border_frac
+        #   32 sink_qty_min, _max, log_scale, color_active
+        #   48 fill_rgb (vec3, 16-aligned), _pad
+        #   64 size_exponent, opacity, _pad, _pad
+        color_active = 0.0 if self.sink_color_field == "None" else 1.0
         params = struct.pack(
-            "ffff",
+            "f" * 20,
             float(self.star_world_radius),
             float(self.star_intensity),
             float(self.star_band_idx),
+            1.0 if self.sink_marker_mode else 0.0,
+            float(self.sink_border_r), float(self.sink_border_g), float(self.sink_border_b),
+            float(self.sink_border_frac),
+            float(self.sink_qty_min),
+            float(self.sink_qty_max),
+            1.0 if self.sink_log_scale else 0.0,
+            float(color_active),
+            float(self.sink_fill_r), float(self.sink_fill_g), float(self.sink_fill_b),
             0.0,
+            float(self.sink_size_exponent),
+            float(self.sink_opacity),
+            0.0, 0.0,
         )
         self.device.queue.write_buffer(self._star_params_buf, 0, params)
 
@@ -1441,7 +1785,11 @@ class WGPURenderer:
                 }
             ],
         )
-        rp.set_pipeline(self._star_pipeline)
+        pipeline = (
+            self._sink_marker_pipeline if self.sink_marker_mode
+            else self._star_pipeline
+        )
+        rp.set_pipeline(pipeline)
         rp.set_bind_group(0, self._star_bg0)
         rp.set_bind_group(1, self._star_bg1)
         rp.draw(4, int(self.n_stars), 0, 0)
@@ -1619,6 +1967,7 @@ class WGPURenderer:
         render_pass.set_bind_group(0, self._resolve_bg)
         render_pass.draw(3, 1, 0, 0)  # fullscreen triangle
         render_pass.end()
+        self._encode_trajectories(encoder, screen_view)
         self._encode_star_overlay(encoder, screen_view)
         if owns_encoder:
             self.device.queue.submit([encoder.finish()])
@@ -1679,6 +2028,7 @@ class WGPURenderer:
         render_pass.set_bind_group(0, self._composite_bg)
         render_pass.draw(3, 1, 0, 0)
         render_pass.end()
+        self._encode_trajectories(encoder, screen_view)
         self._encode_star_overlay(encoder, screen_view)
         if owns_encoder:
             self.device.queue.submit([encoder.finish()])
@@ -1784,6 +2134,13 @@ class WGPURenderer:
         rp.set_bind_group(0, bind_group)
         rp.draw(3, 1, 0, 0)
         rp.end()
+        # Overlay sinks/stars on top of the resolved gas, mirroring the
+        # live render path. _encode_star_overlay reads _last_camera —
+        # set it explicitly since the screenshot path doesn't go
+        # through the normal render() entry that updates it.
+        self._last_camera = camera
+        self._encode_trajectories(encoder, out_view)
+        self._encode_star_overlay(encoder, out_view)
         dev.queue.submit([encoder.finish()])
 
         # 4) Read back. read_texture requires bytes_per_row to be a

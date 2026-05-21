@@ -2,7 +2,17 @@
 
 ![Animated demo of vizmo flying through a galaxy simulation](vizmo_demo.gif)
 
-Real-time 3D fly-through explorer for unstructured simulation data. Loads HDF5 snapshots from GIZMO/Gadget/AREPO simulations and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite CoolMap visualizations on the GPU via WebGPU.
+Real-time 3D fly-through explorer for unstructured simulation data. Loads simulation snapshot data and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite lightness x color maps on the GPU via WebGPU.
+
+Codes whose outputs have been successfully loaded to date:
+- GIZMO
+- AREPO
+- Gadget-3
+- Athena
+- RAMSES
+- ART
+
+If your data format is parseable by `yt` then vizmo should be able to load it.
 
 This is a **vibecoded** app. I have no idea how its front- or backends work, and am not sure if I could really properly support or get it running for you 10 years from now! But it would not exist otherwise. Software is weird now. It is what it is. 
 

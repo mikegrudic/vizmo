@@ -9,7 +9,7 @@ import numpy as np
 import wgpu
 from pathlib import Path
 
-from .overlay import DevOverlay, UserMenu
+from .overlay import DevOverlay, SinkOverlay, UserMenu
 
 SHADER_DIR = Path(__file__).parent / "shaders"
 
@@ -140,6 +140,12 @@ class _WGPUPanelMixin:
 class WGPUDevOverlay(_WGPUPanelMixin, DevOverlay):
     def __init__(self, device, present_format):
         DevOverlay.__init__(self)
+        self._init_wgpu(device, present_format)
+
+
+class WGPUSinkOverlay(_WGPUPanelMixin, SinkOverlay):
+    def __init__(self, device, present_format):
+        SinkOverlay.__init__(self)
         self._init_wgpu(device, present_format)
 
 

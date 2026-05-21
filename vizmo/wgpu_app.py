@@ -122,6 +122,17 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
     # Colormap
     rgba = colormap_to_texture_data("magma")
     renderer.set_colormap(rgba)
+    # Sink-marker colormap. Independent default; user picks the active
+    # colour field from the sink panel (default "None" → black fill).
+    sink_rgba = colormap_to_texture_data(renderer.sink_cmap_name)
+    renderer.set_sink_colormap(sink_rgba)
+    if data.n_stars > 0:
+        # Hand the renderer the per-sink field dict so the size/colour
+        # selectors can resolve names to arrays at draw time.
+        renderer._star_fields = data.star_fields
+    # Per-sink trajectory positions (RAMSES SINK1/sink_*.txt files). The
+    # sink panel will let the user pick which ones to draw.
+    renderer.set_sink_trajectory_data(getattr(data, "sink_trajectories", {}))
 
     # Load particles. set_particles only stores arrays + n_total; the
     # actual GPU upload happens in the background-built grid + GPUCompute
@@ -144,9 +155,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
     glfw.set_window_title(window, "vizmo [wgpu] | Initializing...")
 
     # UI overlays
-    from .wgpu_overlay import WGPUDevOverlay, WGPUUserMenu
+    from .wgpu_overlay import WGPUDevOverlay, WGPUSinkOverlay, WGPUUserMenu
 
     overlay = WGPUDevOverlay(device, present_format)
+    sink_panel = WGPUSinkOverlay(device, present_format)
+    sink_panel.enabled = data.n_stars > 0
     user_menu = WGPUUserMenu(device, present_format)
     _timings = {"cull": 0, "upload": 0, "render": 0}
     _last_message = ""
@@ -282,6 +295,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
                 _take_screenshot()
             elif key == glfw.KEY_F1 or key == glfw.KEY_BACKSLASH:
                 overlay.enabled = not overlay.enabled
+            elif key == glfw.KEY_K:
+                sink_panel.enabled = not sink_panel.enabled
             elif key == glfw.KEY_TAB:
                 ui_hidden = not ui_hidden
             elif key == glfw.KEY_B:
@@ -449,6 +464,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
         if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
             x, y = _cursor_to_fb(win)
             if user_menu.on_click(x, y, app_proxy):
+                return
+            if sink_panel.enabled and sink_panel.on_click(x, y, renderer):
                 return
             if overlay.enabled and overlay.on_click(x, y, renderer):
                 return
@@ -1109,6 +1126,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
                 screen_view = _frame_screen_view
 
                 overlay.set_framebuffer_size(fb_w, fb_h)
+                sink_panel.set_framebuffer_size(fb_w, fb_h)
                 user_menu.set_framebuffer_size(fb_w, fb_h)
 
                 smooth_fps_val = smooth_fps_ema if smooth_fps_ema > 0 else fps
@@ -1131,6 +1149,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
                         smooth_fps=smooth_fps_val,
                     )
                     overlay.enabled = was_enabled
+                if sink_panel.enabled:
+                    sink_panel.update(renderer)
                 user_menu.update(
                     renderer,
                     AVAILABLE_COLORMAPS[_state["_cmap_idx"]],
@@ -1149,6 +1169,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
                     composite_slots=_state["_slot"] if _state["_composite"] else None,
                     available_ptypes=data.available_types,
                     selected_ptypes=list(data.particle_types),
+                    ptype_labels=data.ptype_labels,
                 )
 
                 rpass = _frame_encoder.begin_render_pass(
@@ -1161,6 +1182,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
                     ]
                 )
                 user_menu.render_to_pass(rpass)
+                if sink_panel.enabled:
+                    sink_panel.render_to_pass(rpass)
                 if overlay.enabled:
                     overlay.render_to_pass(rpass)
                 rpass.end()
