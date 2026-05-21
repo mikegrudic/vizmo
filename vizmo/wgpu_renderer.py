@@ -377,10 +377,13 @@ class WGPURenderer:
         self._star_bg1 = None
         self._star_buf_dirty = True
 
-        # ---- Sink trajectories (colored line strips through the scene) ----
-        # Inline shader: just transforms position by camera and outputs a
-        # flat colour per draw. The vertex buffer carries one xyz per
-        # trajectory sample, drawn as a line-strip primitive.
+        # ---- Sink trajectories (colored thick line ribbons) ----
+        # Thick lines via instanced quads: each segment between
+        # consecutive trajectory points becomes a 4-vertex triangle
+        # strip extruded perpendicular to the segment in screen space.
+        # `line_width` (pixels) controls the half-width offset. The
+        # trajectory points sit in a storage buffer indexed by
+        # instance_index.
         traj_src = """
             struct Camera {
                 view: mat4x4<f32>,
@@ -389,24 +392,70 @@ class WGPURenderer:
                 kernel_id: u32,
                 _pad: u32,
             };
-            struct TrajParams { color: vec4<f32> };
+            struct TrajParams {
+                color: vec4<f32>,
+                line_width: f32,
+                _pad0: f32,
+                _pad1: f32,
+                _pad2: f32,
+            };
             @group(0) @binding(0) var<uniform> camera: Camera;
             @group(0) @binding(1) var<uniform> params: TrajParams;
+            @group(1) @binding(0) var<storage, read> points: array<vec4<f32>>;
+
             @vertex
-            fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {
-                return camera.proj * (camera.view * vec4<f32>(pos, 1.0));
+            fn vs_main(@builtin(vertex_index) vid: u32,
+                       @builtin(instance_index) iid: u32) -> @builtin(position) vec4<f32> {
+                let p0 = points[iid].xyz;
+                let p1 = points[iid + 1u].xyz;
+                // Strip vertices: 0=p0 left, 1=p1 left, 2=p0 right, 3=p1 right.
+                let is_end = (vid & 1u) == 1u;
+                let side = select(1.0, -1.0, vid >= 2u);
+                let p = select(p0, p1, is_end);
+                let clip  = camera.proj * (camera.view * vec4<f32>(p,  1.0));
+                let c0    = camera.proj * (camera.view * vec4<f32>(p0, 1.0));
+                let c1    = camera.proj * (camera.view * vec4<f32>(p1, 1.0));
+                // Behind the camera: collapse to a point so the quad gets
+                // clipped instead of flailing across the screen.
+                if (c0.w <= 0.0 || c1.w <= 0.0) {
+                    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+                }
+                let n0 = c0.xy / c0.w;
+                let n1 = c1.xy / c1.w;
+                let dx = n1 - n0;
+                if (length(dx) < 1.0e-8) {
+                    return clip;
+                }
+                let dir  = normalize(dx);
+                let perp = vec2<f32>(-dir.y, dir.x) * side;
+                // Pixel half-width → NDC offset (per-axis division by
+                // viewport keeps the line a fixed pixel thickness even
+                // when the viewport's aspect changes).
+                let half_w_ndc = params.line_width * 0.5 / camera.viewport_size;
+                let off = perp * half_w_ndc;
+                var out = clip;
+                out.x = out.x + off.x * clip.w;
+                out.y = out.y + off.y * clip.w;
+                return out;
             }
+
             @fragment
             fn fs_main() -> @location(0) vec4<f32> {
                 return params.color;
             }
         """
         self._traj_shader = dev.create_shader_module(code=traj_src)
-        self._traj_bgl = dev.create_bind_group_layout(entries=[
+        self._traj_bgl0 = dev.create_bind_group_layout(entries=[
             {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
             {"binding": 1, "visibility": VF, "buffer": {"type": "uniform"}},
         ])
-        traj_layout = dev.create_pipeline_layout(bind_group_layouts=[self._traj_bgl])
+        self._traj_bgl1 = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX,
+             "buffer": {"type": "read-only-storage"}},
+        ])
+        traj_layout = dev.create_pipeline_layout(
+            bind_group_layouts=[self._traj_bgl0, self._traj_bgl1]
+        )
         traj_blend = {
             "color": {
                 "operation": "add",
@@ -424,24 +473,17 @@ class WGPURenderer:
             vertex={
                 "module": self._traj_shader,
                 "entry_point": "vs_main",
-                "buffers": [{
-                    "array_stride": 12,
-                    "step_mode": "vertex",
-                    "attributes": [{
-                        "format": "float32x3",
-                        "offset": 0,
-                        "shader_location": 0,
-                    }],
-                }],
+                "buffers": [],
             },
-            primitive={"topology": "line-strip"},
+            primitive={"topology": "triangle-strip", "strip_index_format": "uint32"},
             fragment={
                 "module": self._traj_shader,
                 "entry_point": "fs_main",
                 "targets": [{"format": self.present_format, "blend": traj_blend}],
             },
         )
-        # Loaded once by wgpu_app from data.sink_trajectories.
+        # Loaded once by wgpu_app from data.sink_trajectories. Maps
+        # sink_id → (positions ndarray (N,3), aexp ndarray (N,)).
         self._sink_trajectory_data = {}
         # Per-slot selection state. SinkOverlay mutates these; renderer
         # rebuilds line buffers via _rebuild_trajectories(). Each slot:
@@ -450,6 +492,13 @@ class WGPURenderer:
         # Built per-trajectory line buffers (vbo + bind group). Mirrors
         # _traj_slots in length but only includes valid entries.
         self._traj_render = []
+        # Global start-time cutoff: only include trajectory samples with
+        # aexp >= _traj_start_aexp. 0 keeps the whole track; bumping
+        # toward 1 trims off early-universe portions that wander far
+        # from the current view at galaxy-scale zoom.
+        self._traj_start_aexp = 0.0
+        # Trajectory line thickness in screen pixels.
+        self._traj_line_width = 2.0
 
         # Tunables — wired into the dev panel later.
         # Physical billboard radius, in world (snapshot) units. The
@@ -1489,21 +1538,12 @@ class WGPURenderer:
         self._rebuild_trajectories()
 
     def _default_traj_slot(self, slot_idx):
-        """Pick a sensible default sink_id + color for a freshly-added slot."""
+        """Pick a sensible default sink_id + color for a freshly-added
+        slot. Color defaults to white; user dials RGB from the panel
+        when they want to distinguish multiple tracks."""
         ids = sorted(self._sink_trajectory_data.keys())
         sid = ids[slot_idx % len(ids)] if ids else None
-        # Cycle through a small palette of distinct colours for new
-        # slots so the first few additions auto-differentiate.
-        palette = (
-            (0.10, 0.80, 1.00),
-            (1.00, 0.20, 0.10),
-            (0.20, 1.00, 0.30),
-            (1.00, 0.85, 0.10),
-            (0.85, 0.20, 1.00),
-            (0.10, 1.00, 0.80),
-        )
-        r, g, b = palette[slot_idx % len(palette)]
-        return {"sink_id": sid, "r": r, "g": g, "b": b}
+        return {"sink_id": sid, "r": 1.0, "g": 1.0, "b": 1.0}
 
     def set_n_trajectories(self, n):
         """Resize the slot list to *n*. Existing slots are preserved;
@@ -1529,10 +1569,22 @@ class WGPURenderer:
         if b is not None: slot["b"] = float(b)
         self._rebuild_trajectories()
 
+    def set_traj_start_aexp(self, a):
+        """Clip every drawn trajectory to samples with aexp >= a."""
+        self._traj_start_aexp = float(a)
+        self._rebuild_trajectories()
+
+    def set_traj_line_width(self, w):
+        """Set trajectory thickness (in screen pixels) and rebuild the
+        per-trajectory uniform that carries it."""
+        self._traj_line_width = max(0.5, float(w))
+        self._rebuild_trajectories()
+
     def _rebuild_trajectories(self):
-        """Reconcile self._traj_render with self._traj_slots — build
-        a vertex buffer + bind group for each populated slot. Called
-        whenever the data, slot count, sink_id, or colour changes."""
+        """Reconcile self._traj_render with self._traj_slots — build a
+        storage buffer of trajectory points plus a color/line-width
+        uniform for each populated slot. Each segment between
+        consecutive points becomes one instance of a 4-vertex quad."""
         import struct
         self._traj_render = []
         offset = getattr(self, "_world_offset", None)
@@ -1540,34 +1592,55 @@ class WGPURenderer:
             sid = slot.get("sink_id")
             if sid is None:
                 continue
-            traj = self._sink_trajectory_data.get(sid)
-            if traj is None or len(traj) < 2:
+            entry = self._sink_trajectory_data.get(sid)
+            if entry is None:
                 continue
-            p = np.asarray(traj, dtype=np.float32)
+            pos, aexp = entry
+            if self._traj_start_aexp > 0.0:
+                mask = aexp >= self._traj_start_aexp
+                pos = pos[mask]
+            if len(pos) < 2:
+                continue
+            p = np.asarray(pos, dtype=np.float32)
             if offset is not None:
                 p = p - np.asarray(offset, dtype=np.float32)
-            vbo = self.device.create_buffer_with_data(
-                data=np.ascontiguousarray(p).tobytes(),
-                usage=wgpu.BufferUsage.VERTEX,
+            # vec4 per point — vec3 in std430 storage would stride to 16
+            # anyway, so just pad with a zero w to keep layout obvious.
+            verts = np.zeros((len(p), 4), dtype=np.float32)
+            verts[:, :3] = p
+            sbo = self.device.create_buffer_with_data(
+                data=verts.tobytes(),
+                usage=wgpu.BufferUsage.STORAGE,
             )
             color = (slot["r"], slot["g"], slot["b"], 1.0)
+            params = struct.pack(
+                "f" * 8,
+                *color,
+                float(self._traj_line_width),
+                0.0, 0.0, 0.0,
+            )
             pbuf = self.device.create_buffer_with_data(
-                data=struct.pack("ffff", *color),
+                data=params,
                 usage=wgpu.BufferUsage.UNIFORM,
             )
-            bg = self.device.create_bind_group(
-                layout=self._traj_bgl,
+            bg0 = self.device.create_bind_group(
+                layout=self._traj_bgl0,
                 entries=[
                     {"binding": 0, "resource": {"buffer": self._camera_buf}},
                     {"binding": 1, "resource": {"buffer": pbuf}},
                 ],
             )
-            self._traj_render.append({"vbo": vbo, "n": len(p), "bg": bg})
+            bg1 = self.device.create_bind_group(
+                layout=self._traj_bgl1,
+                entries=[{"binding": 0, "resource": {"buffer": sbo}}],
+            )
+            self._traj_render.append({
+                "sbo": sbo, "bg0": bg0, "bg1": bg1,
+                "n_segments": len(p) - 1,
+            })
 
     def _encode_trajectories(self, encoder, screen_view):
-        """Draw the active trajectories as line-strips over the
-        resolved screen, before the star overlay so sink markers sit
-        on top of their own tracks."""
+        """Draw active trajectories as instanced thick-line quads."""
         if not self._traj_render or screen_view is None:
             return
         rp = encoder.begin_render_pass(color_attachments=[{
@@ -1577,9 +1650,9 @@ class WGPURenderer:
         }])
         rp.set_pipeline(self._traj_pipeline)
         for entry in self._traj_render:
-            rp.set_bind_group(0, entry["bg"])
-            rp.set_vertex_buffer(0, entry["vbo"])
-            rp.draw(entry["n"], 1, 0, 0)
+            rp.set_bind_group(0, entry["bg0"])
+            rp.set_bind_group(1, entry["bg1"])
+            rp.draw(4, entry["n_segments"], 0, 0)
         rp.end()
 
     def _sink_field(self, which, fallback):

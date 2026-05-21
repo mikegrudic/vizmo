@@ -244,6 +244,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
         # particle accumulation.
         if user_menu.on_key(key, action):
             ui_dirty = True
+        if sink_panel.on_key(key, action):
+            ui_dirty = True
             return
         # Any other PRESS may mutate scene state (R, L, ',', '.', mode
         # toggles, etc.), so force a full re-render.
@@ -490,6 +492,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
         ui_dirty = True
         idle_streak = 0
         user_menu.on_char(codepoint, app_proxy)
+        sink_panel.on_char(codepoint)
 
     glfw.set_mouse_button_callback(window, mouse_button_callback)
     glfw.set_cursor_pos_callback(window, cursor_callback)

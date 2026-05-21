@@ -1141,6 +1141,14 @@ class SnapshotData:
         if sink_dir is None:
             return {}
 
+        # Clip every trajectory to samples with aexp ≤ snapshot aexp so
+        # tracks end at the sink's current position (otherwise the
+        # sink_*.txt log keeps recording past this snapshot and the
+        # drawn line trails off into the future). For non-cosmological
+        # runs self.time is in code-time (typically huge), so the
+        # comparison is effectively a no-op.
+        snap_t = float(getattr(self, "time", 0.0))
+
         pat = re.compile(r"^sink_(\d+)\.txt$")
         out = {}
         for fn in sorted(os.listdir(sink_dir)):
@@ -1148,7 +1156,7 @@ class SnapshotData:
             if not m:
                 continue
             sid = int(m.group(1))
-            xs, ys, zs = [], [], []
+            xs, ys, zs, aexps = [], [], [], []
             with open(os.path.join(sink_dir, fn)) as f:
                 for raw in f:
                     s = raw.lstrip()
@@ -1158,19 +1166,29 @@ class SnapshotData:
                     if len(toks) < 16:
                         continue
                     try:
+                        a = float(toks[1])  # aexp (col 2, 1-based)
                         x = float(toks[13])
                         y = float(toks[14])
                         z = float(toks[15])
                     except ValueError:
                         continue
-                    xs.append(x); ys.append(y); zs.append(z)
+                    xs.append(x); ys.append(y); zs.append(z); aexps.append(a)
             if len(xs) < 2:
                 continue
             # pc → code_length so the trajectory shares the snapshot
             # coordinate frame. pc_per_code is the code-length value of
             # 1 pc, so multiplying converts pc → code-length.
             pos = (np.asarray([xs, ys, zs], dtype=np.float64).T) * pc_per_code
-            out[sid] = pos
+            aexp = np.asarray(aexps, dtype=np.float64)
+            # Drop samples past the snapshot epoch so each track ends
+            # where the corresponding PartType5 sink lives right now.
+            mask = aexp <= snap_t
+            if not mask.all():
+                pos = pos[mask]
+                aexp = aexp[mask]
+            if len(pos) < 2:
+                continue
+            out[sid] = (pos, aexp)
         if out:
             print(f"  Loaded {len(out)} sink trajectories from {sink_dir}")
         return out

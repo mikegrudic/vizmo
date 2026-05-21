@@ -553,10 +553,19 @@ class SinkOverlay(Panel):
     def __init__(self):
         super().__init__(SINK_STYLE)
         self.enabled = False
+        # Numeric-field text-edit state (mirrors UserMenu's pattern):
+        # self._editing is the key of the field currently being edited,
+        # or None. _edit_buffer holds the digits typed so far. The
+        # renderer ref is captured at click time so on_key/on_char can
+        # commit without re-routing through wgpu_app.
+        self._editing = None
+        self._edit_buffer = ""
+        self._renderer_ref = None
 
     def update(self, renderer):
         if not self.enabled:
             return
+        self._renderer_ref = renderer
         if self._minimized:
             self.render_panel([("button", "[+] Sink", "_toggle_minimize")])
             return
@@ -637,6 +646,22 @@ class SinkOverlay(Panel):
             items.append(("text", f"Trajectories ({len(avail_ids)} sink IDs available)"))
             items.append(("slider", "# Trajectories",
                           float(n_active), 0.0, float(max_n), "_n_trajectories"))
+            items.append(("slider", "Line width (px)",
+                          float(getattr(renderer, "_traj_line_width", 2.0)),
+                          0.5, 20.0, "_traj_line_width"))
+            a_start = float(getattr(renderer, "_traj_start_aexp", 0.0))
+            # Show the corresponding redshift so users who don't think
+            # in scale factors can still read the cutoff at a glance.
+            # z = 1/a - 1; clamp a away from 0 so we don't divide.
+            z_start = (1.0 / max(a_start, 1e-6) - 1.0) if a_start > 0 else float("inf")
+            z_str = f"z={z_start:.2f}" if a_start > 0 else "z=∞"
+            items.append(("text", f"  Trim trajectories before  ({z_str})"))
+            if self._editing == "_traj_start_aexp":
+                a_display = self._edit_buffer + "_"
+            else:
+                a_display = f"{a_start:.4f}"
+            items.append(("field", "  Start scale factor (a)",
+                          a_display, "_traj_start_aexp"))
             id_opts = [str(i) for i in avail_ids]
             for i, slot in enumerate(renderer._traj_slots):
                 sid = slot.get("sink_id")
@@ -678,6 +703,18 @@ class SinkOverlay(Panel):
             if key == "_n_trajectories":
                 cur = len(renderer._traj_slots)
                 renderer.set_n_trajectories(cur - 1 if action == "slider_dec" else cur + 1)
+                return True
+            if key == "_traj_start_aexp":
+                cur_a = float(getattr(renderer, "_traj_start_aexp", 0.0))
+                step = (vmax - vmin) / 20
+                new_a = max(vmin, cur_a - step) if action == "slider_dec" else min(vmax, cur_a + step)
+                renderer.set_traj_start_aexp(new_a)
+                return True
+            if key == "_traj_line_width":
+                cur_w = float(getattr(renderer, "_traj_line_width", 2.0))
+                step = (vmax - vmin) / 20
+                new_w = max(vmin, cur_w - step) if action == "slider_dec" else min(vmax, cur_w + step)
+                renderer.set_traj_line_width(new_w)
                 return True
             if key.startswith("_traj_") and "_" in key[6:]:
                 # _traj_<r|g|b>_<i>
@@ -730,7 +767,61 @@ class SinkOverlay(Panel):
                 renderer.set_traj_slot_id(idx, sid)
             self._dropdown_open = None
             return True
+
+        if wtype == "field":
+            key = widget[3]
+            self._editing = key
+            if key == "_traj_start_aexp":
+                self._edit_buffer = f"{getattr(renderer, '_traj_start_aexp', 0.0):.4f}"
+            else:
+                self._edit_buffer = ""
+            return True
         return True
+
+    def on_key(self, key, action):
+        """Handle text-field edits (Escape / Enter / Backspace)."""
+        import glfw
+        if self._editing is None:
+            return False
+        if action not in (glfw.PRESS, glfw.REPEAT):
+            return True
+        if key == glfw.KEY_ESCAPE:
+            self._editing = None
+            self._edit_buffer = ""
+            return True
+        if key in (glfw.KEY_ENTER, glfw.KEY_KP_ENTER):
+            self._commit_edit()
+            return True
+        if key == glfw.KEY_BACKSPACE:
+            self._edit_buffer = self._edit_buffer[:-1]
+            return True
+        return True
+
+    def on_char(self, codepoint):
+        """Append typed digits / exponent characters to the edit buffer."""
+        if self._editing is None:
+            return False
+        ch = chr(codepoint)
+        if ch in "0123456789.eE+-":
+            self._edit_buffer += ch
+            return True
+        if ch in ("\r", "\n"):
+            self._commit_edit()
+            return True
+        return False
+
+    def _commit_edit(self):
+        if self._editing and self._edit_buffer and self._renderer_ref is not None:
+            try:
+                val = float(self._edit_buffer)
+                if self._editing == "_traj_start_aexp":
+                    # Scale factor must be non-negative; allow values >1
+                    # (the filter just clips everything in that case).
+                    self._renderer_ref.set_traj_start_aexp(max(0.0, val))
+            except ValueError:
+                pass
+        self._editing = None
+        self._edit_buffer = ""
 
 
 class UserMenu(Panel):
