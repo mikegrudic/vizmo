@@ -39,13 +39,13 @@ pip install -e .
 
 ## Quickstart
 
-Point `vizmo` at an HDF5 snapshot file:
+Run `vizmo` with a snapshot file as the argument:
 
 ```bash
 vizmo path/to/snapshot.hdf5
 ```
 
-The snapshot must contain at least one `PartTypeN` group with `Coordinates` and `Masses`. Smoothing lengths are taken from `SmoothingLength`/`KernelMaxRadius`/`Hsml` if present, otherwise from a per-type softening in the header (e.g. `SofteningTypeN`, `SofteningTable`), and as a last resort computed on the fly via `meshoid.Meshoid(x, boxsize=boxsize).SmoothingLength()`. Star particles (`PartType5`) are rendered as point sources when present.
+For gizmo/arepo/gadget: The snapshot must contain at least one `PartTypeN` group with `Coordinates` and `Masses`. Smoothing lengths are taken from `SmoothingLength`/`KernelMaxRadius`/`Hsml` if present, otherwise from a per-type softening in the header (e.g. `SofteningTypeN`, `SofteningTable`), and as a last resort computed on the fly via `meshoid.Meshoid(x, boxsize=boxsize).SmoothingLength()`. Star particles (`PartType5`) are rendered as point sources when present.
 
 ### Particle type selection
 
