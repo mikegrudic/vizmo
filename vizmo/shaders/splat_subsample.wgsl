@@ -173,3 +173,4 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
     out.sq = vec4<f32>(sigma * in.quantity * in.quantity, 0.0, 0.0, 0.0);
     return out;
 }
+

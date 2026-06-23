@@ -50,11 +50,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let num = textureLoad(t_numerator, coords, 0).r;
         val = num / denom;
     } else {
-        let num = textureLoad(t_numerator, coords, 0).r;
+        // Variance mode: the renderer ran a two-pass that wrote
+        // sigma * (qty - mean_pixel)^2 into sq, so the displayable
+        // stddev is sqrt(sq/den) with no cancellation. max() guards
+        // against a tiny negative residue if f16 quantization
+        // perturbs sq slightly below zero on near-laminar pixels.
         let sq = textureLoad(t_sq, coords, 0).r;
-        let mean = num / denom;
-        let mean_sq = sq / denom;
-        val = sqrt(max(mean_sq - mean * mean, 0.0));
+        val = sqrt(max(sq / denom, 0.0));
     }
 
     var t: f32;

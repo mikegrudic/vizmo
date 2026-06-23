@@ -189,6 +189,17 @@ class WGPURenderer:
         self._resolve_bg = None
         self._composite_bg = None
 
+        # Variance-mode two-pass state: per-pixel mean texture +
+        # cached bind groups. Allocated in _ensure_fbo on first use.
+        self._mean_texture = None
+        self._mean_view = None
+        self._compute_mean_bg = None
+        self._variance_mean_bg = None
+        self._mean_texture2 = None
+        self._mean_view2 = None
+        self._compute_mean_bg2 = None
+        self._variance_mean_bg2 = None
+
         self._init_pipelines()
 
     def _init_pipelines(self):
@@ -203,6 +214,15 @@ class WGPURenderer:
         self._composite_shader = dev.create_shader_module(code=_load_wgsl("composite.wgsl"))
         self._cascade_shader = dev.create_shader_module(code=_load_wgsl("cascade.wgsl"))
         self._mg_bin_shader = dev.create_shader_module(code=_load_wgsl("multigrid_bin.wgsl"))
+        # Variance-mode shaders: a fullscreen "compute mean" pass and a
+        # second splat pass that uses the per-pixel mean to write
+        # sigma * (qty - mean_pixel)^2 into the sq accumulator. Avoids
+        # the (mean_sq - mean^2) cancellation that wipes the variance
+        # signal under rgba16float on high-bulk-velocity flows.
+        self._compute_mean_shader = dev.create_shader_module(code=_load_wgsl("compute_mean.wgsl"))
+        self._splat_variance_shader = dev.create_shader_module(
+            code=_load_wgsl("splat_variance.wgsl", include_common=True)
+        )
 
         # Camera uniform: view + proj + viewport + kernel_id + pad
         # + view_rot (rotation-only view matrix used by the
@@ -237,6 +257,58 @@ class WGPURenderer:
         accum_targets = [{"format": self._accum_format, "blend": _additive_blend()}] * 3
         self._splat_subsample_pipeline = _make_render_pipeline(
             dev, self._splat_subsample_layout, self._splat_subsample_shader, accum_targets
+        )
+
+        # Variance-pass pipeline: same vertex stage, but the fragment
+        # samples a per-pixel mean texture (bg2) and writes only the sq
+        # channel (num/den outputs are zero so additive blend preserves
+        # the first pass).
+        F = wgpu.ShaderStage.FRAGMENT
+        self._mean_tex_bgl = dev.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": F,
+                    "texture": {"sample_type": "unfilterable-float" if self._accum_format == "r32float" else "float"},
+                },
+            ]
+        )
+        self._splat_variance_layout = dev.create_pipeline_layout(
+            bind_group_layouts=[self._splat_subsample_bgl0, self._splat_bgl1, self._mean_tex_bgl]
+        )
+        self._splat_variance_pipeline = _make_render_pipeline(
+            dev, self._splat_variance_layout, self._splat_variance_shader, accum_targets
+        )
+
+        # Compute-mean pass: fullscreen shader, reads num+den, writes
+        # mean. Output is a single rgba16float (or r32float) texture
+        # used as input to the variance-pass splat.
+        self._compute_mean_bgl = dev.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": F,
+                    "texture": {"sample_type": "unfilterable-float" if self._accum_format == "r32float" else "float"},
+                },
+                {
+                    "binding": 1,
+                    "visibility": F,
+                    "texture": {"sample_type": "unfilterable-float" if self._accum_format == "r32float" else "float"},
+                },
+            ]
+        )
+        compute_mean_layout = dev.create_pipeline_layout(bind_group_layouts=[self._compute_mean_bgl])
+        self._compute_mean_pipeline = dev.create_render_pipeline(
+            layout=compute_mean_layout,
+            vertex={"module": self._compute_mean_shader, "entry_point": "vs_main", "buffers": []},
+            primitive={"topology": "triangle-list"},
+            fragment={
+                "module": self._compute_mean_shader,
+                "entry_point": "fs_main",
+                # Single-channel mean target; format matches accum so we
+                # don't need a separate blend state.
+                "targets": [{"format": self._accum_format}],
+            },
         )
 
         # Cascade pipeline: reads 3 coarse accum textures, additively
@@ -1304,7 +1376,15 @@ class WGPURenderer:
                 self._accum_pyramid = []
                 self._accum_pyramid_levels = 0
                 self._cascade_bgs = []
+                # Mean texture used by the variance two-pass path.
+                # Rebuilt alongside the slot-1 accum textures so it
+                # tracks resize / format changes.
+                self._mean_texture = None
+                self._mean_view = None
+                self._compute_mean_bg = None
+                self._variance_mean_bg = None
             self._ensure_pyramid(width, height)
+            self._ensure_mean_texture(width, height)
         else:
             if self._accum_size2 == (width, height) and self._accum_textures2 is not None:
                 return
@@ -1312,6 +1392,70 @@ class WGPURenderer:
             self._accum_size2 = (width, height)
             # Composite bind group references slot-2 accum views.
             self._composite_bg = None
+            # Mean texture for slot-2 variance pass (composite mode).
+            self._mean_texture2 = None
+            self._mean_view2 = None
+            self._compute_mean_bg2 = None
+            self._variance_mean_bg2 = None
+            self._ensure_mean_texture(width, height, which=2)
+
+    def _ensure_mean_texture(self, width, height, which=1):
+        """Create / resize the per-pixel mean texture used by the
+        variance-mode second splat pass, and rebuild its bind groups.
+        Mean values are stored in the same format as the accumulators
+        so the variance-pass shader's textureLoad matches.
+        """
+        dev = self.device
+        if which == 1:
+            if self._mean_texture is None or self._accum_size != (width, height):
+                self._mean_texture = dev.create_texture(
+                    size=(width, height, 1),
+                    format=self._accum_format,
+                    usage=(
+                        wgpu.TextureUsage.RENDER_ATTACHMENT
+                        | wgpu.TextureUsage.TEXTURE_BINDING
+                    ),
+                )
+                self._mean_view = self._mean_texture.create_view()
+            if self._compute_mean_bg is None:
+                accum_views = self._accum_textures["views"]
+                self._compute_mean_bg = dev.create_bind_group(
+                    layout=self._compute_mean_bgl,
+                    entries=[
+                        {"binding": 0, "resource": accum_views[0]},  # num
+                        {"binding": 1, "resource": accum_views[1]},  # den
+                    ],
+                )
+            if self._variance_mean_bg is None:
+                self._variance_mean_bg = dev.create_bind_group(
+                    layout=self._mean_tex_bgl,
+                    entries=[{"binding": 0, "resource": self._mean_view}],
+                )
+        else:
+            if self._mean_texture2 is None or self._accum_size2 != (width, height):
+                self._mean_texture2 = dev.create_texture(
+                    size=(width, height, 1),
+                    format=self._accum_format,
+                    usage=(
+                        wgpu.TextureUsage.RENDER_ATTACHMENT
+                        | wgpu.TextureUsage.TEXTURE_BINDING
+                    ),
+                )
+                self._mean_view2 = self._mean_texture2.create_view()
+            if self._compute_mean_bg2 is None:
+                accum_views = self._accum_textures2["views"]
+                self._compute_mean_bg2 = dev.create_bind_group(
+                    layout=self._compute_mean_bgl,
+                    entries=[
+                        {"binding": 0, "resource": accum_views[0]},
+                        {"binding": 1, "resource": accum_views[1]},
+                    ],
+                )
+            if self._variance_mean_bg2 is None:
+                self._variance_mean_bg2 = dev.create_bind_group(
+                    layout=self._mean_tex_bgl,
+                    entries=[{"binding": 0, "resource": self._mean_view2}],
+                )
 
     def _dispatch_multigrid_bin(self, camera, encoder, budget, n_total_chunks):
         """Run count → build → scatter for every chunk so each level's
@@ -1868,7 +2012,8 @@ class WGPURenderer:
         rp.draw(4, int(self.n_stars), 0, 0)
         rp.end()
 
-    def _render_accum(self, camera, width, height, accum_textures, encoder=None):
+    def _render_accum(self, camera, width, height, accum_textures, encoder=None,
+                      variance_pass=None):
         """Render additive accumulation pass into given textures.
 
         Renders:
@@ -1879,6 +2024,12 @@ class WGPURenderer:
         submitted at the end of the call (legacy path used by screenshot).
         Otherwise the accum pass is appended to the supplied encoder and
         the caller is responsible for submission.
+
+        `variance_pass`: explicit override for whether to run the
+        variance two-pass tail. When None, derived from
+        `self.resolve_mode == 2` (correct for the non-composite render
+        path). Composite callers pass True/False per slot since the
+        global resolve_mode is not meaningful there.
         """
         self._write_camera_uniforms(camera, width, height)
 
@@ -1968,8 +2119,92 @@ class WGPURenderer:
                 rp.draw(3, 1, 0, 0)
                 rp.end()
 
+        # Variance two-pass tail. The flag is explicit for composite
+        # callers (each slot has its own resolve mode); for non-composite
+        # it falls back to self.resolve_mode.
+        do_variance = (
+            variance_pass if variance_pass is not None else (self.resolve_mode == 2)
+        )
+        if do_variance and self._subsample_chunks is not None:
+            self._dispatch_variance_second_pass(
+                encoder, accum_textures, budget, n_total_chunks, slot_bgs
+            )
+
         if owns_encoder:
             dev.queue.submit([encoder.finish()])
+
+    def _dispatch_variance_second_pass(
+        self, encoder, accum_textures, budget, n_total_chunks, slot_bgs
+    ):
+        """Second splat pass for variance mode.
+
+        Reads num+den from the first pass's accum (post-cascade) into
+        a per-pixel mean texture, then re-splats with
+        sigma * (qty - mean_pixel)^2 written to sq while num+den are
+        preserved via additive blending of zero. Runs at the full-res
+        level only (no multigrid in the second pass — the mean texture
+        is at full res and sampling it from a coarser level would
+        re-introduce the cancellation we just removed).
+
+        Works for either slot. Routes through slot-1 vs slot-2 mean
+        textures + bind groups based on which accum the caller supplied.
+        """
+        # Route to the slot whose accum we're working on. Slot-2 is the
+        # composite-mode second field; slot-1 is everything else.
+        if accum_textures is self._accum_textures2:
+            mean_view = self._mean_view2
+            compute_mean_bg = self._compute_mean_bg2
+            variance_mean_bg = self._variance_mean_bg2
+        else:
+            mean_view = self._mean_view
+            compute_mean_bg = self._compute_mean_bg
+            variance_mean_bg = self._variance_mean_bg
+
+        # 1) Compute mean = num/den into the slot's mean texture.
+        rp = encoder.begin_render_pass(
+            color_attachments=[
+                {
+                    "view": mean_view,
+                    "clear_value": (0, 0, 0, 0),
+                    "load_op": "clear",
+                    "store_op": "store",
+                }
+            ]
+        )
+        rp.set_pipeline(self._compute_mean_pipeline)
+        rp.set_bind_group(0, compute_mean_bg)
+        rp.draw(3, 1, 0, 0)
+        rp.end()
+
+        # 2) Re-splat with the variance pipeline. num/den load_op=load
+        # so the first pass's values are preserved (the variance shader
+        # writes 0 there and additive blend is a no-op). sq is cleared
+        # so it accumulates only the shifted contributions.
+        views = accum_textures["views"]
+        rp = encoder.begin_render_pass(
+            color_attachments=[
+                {"view": views[0], "load_op": "load", "store_op": "store"},
+                {"view": views[1], "load_op": "load", "store_op": "store"},
+                {
+                    "view": views[2],
+                    "clear_value": (0, 0, 0, 0),
+                    "load_op": "clear",
+                    "store_op": "store",
+                },
+            ]
+        )
+        rp.set_pipeline(self._splat_variance_pipeline)
+        rp.set_bind_group(2, variance_mean_bg)
+        for i, ck in enumerate(self._subsample_chunks):
+            instances = max(1, int(round(budget * ck["n"] / n_total_chunks)))
+            instances = min(instances, ck["n"])
+            # bg0s[0] is the level-0 params (variance pass is single-level).
+            bg0 = ck.get("bg0s", [ck["bg0"]])[0]
+            rp.set_bind_group(0, bg0)
+            bg1 = slot_bgs[i] if slot_bgs is not None else ck["bg1"]
+            rp.set_bind_group(1, bg1)
+            rp.draw(4, instances, 0, 0)
+        rp.end()
 
     def render(self, camera, width, height, encoder=None, screen_view=None, skip_accum=False):
         """Render particle splats via additive accumulation + resolve.
@@ -2128,14 +2363,24 @@ class WGPURenderer:
         # render slot 0 into _accum_textures and slot 1 into
         # _accum_textures2 (matching the live composite path).
         if composite_args is not None:
+            # composite_args[0] / [4] are the slot resolve modes; pass
+            # variance_pass=True per slot so the two-pass second splat
+            # writes shifted sq into the right accum.
+            m1, _, _, _, m2, _, _, _ = composite_args
             self._ensure_fbo(width, height, which=1)
             self._ensure_fbo(width, height, which=2)
             self.set_active_subsample_slot(0)
             self._write_camera_uniforms(camera, width, height)
-            self._render_accum(camera, width, height, self._accum_textures)
+            self._render_accum(
+                camera, width, height, self._accum_textures,
+                variance_pass=(int(m1) == 2),
+            )
             self.set_active_subsample_slot(1)
             self._write_camera_uniforms(camera, width, height)
-            self._render_accum(camera, width, height, self._accum_textures2)
+            self._render_accum(
+                camera, width, height, self._accum_textures2,
+                variance_pass=(int(m2) == 2),
+            )
             self.set_active_subsample_slot(None)
         else:
             self._ensure_fbo(width, height, which=1)
@@ -2288,12 +2533,12 @@ class WGPURenderer:
         mask = den > 1e-30
 
         if self.resolve_mode == 2:
-            num = self._read_accum_texture_r(self._accum_textures["textures"][0])
+            # Variance two-pass already wrote sigma*(qty-mean_pixel)^2
+            # into sq, so the displayable stddev is sqrt(sq/den) with no
+            # subtraction. Matches the resolve shader's mode-2 branch.
             sq = self._read_accum_texture_r(self._accum_textures["textures"][2])
             with np.errstate(invalid="ignore"):
-                mean = np.where(mask, num / den, 0)
-                mean_sq = np.where(mask, sq / den, 0)
-            vals = np.sqrt(np.maximum(mean_sq - mean * mean, 0))[mask]
+                vals = np.sqrt(np.maximum(np.where(mask, sq / den, 0), 0))[mask]
             mass = den[mask]
         elif self.resolve_mode == 1:
             num = self._read_accum_texture_r(self._accum_textures["textures"][0])

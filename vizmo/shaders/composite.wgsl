@@ -52,10 +52,12 @@ fn resolve_value(num: f32, den: f32, sq: f32, mode: u32) -> f32 {
     if (den < 1e-30) { return -1e30; }
     if (mode == 0u) { return den; }
     if (mode == 1u) { return num / den; }
-    // mode 2: variance
-    let mean = num / den;
-    let mean_sq = sq / den;
-    return sqrt(max(mean_sq - mean * mean, 0.0));
+    // mode 2: variance. The renderer ran a two-pass that wrote
+    // sigma * (qty - mean_pixel)^2 into sq for this slot, so the
+    // displayable stddev is sqrt(sq/den) with no (mean_sq - mean^2)
+    // cancellation. max() guards against tiny negative residue from
+    // f16 quantization on near-laminar pixels.
+    return sqrt(max(sq / den, 0.0));
 }
 
 fn normalize_value(val: f32, vmin: f32, vmax: f32, log_scale: u32) -> f32 {

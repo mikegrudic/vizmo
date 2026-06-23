@@ -669,7 +669,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
                     renderer.update_weights(w, q)
 
                 renderer._write_camera_uniforms(camera, fb_w, fb_h)
-                renderer._render_accum(camera, fb_w, fb_h, accum_sets[i], encoder=encoder)
+                renderer._render_accum(
+                    camera, fb_w, fb_h, accum_sets[i], encoder=encoder,
+                    variance_pass=(sl["mode"] == "WeightedVariance"),
+                )
             # Reset active slot so non-composite passes use the default path.
             renderer.set_active_subsample_slot(None)
 
@@ -908,6 +911,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
         # snapshots; once the user stops translating, the gate opens
         # and the next frame refreshes once.
         if not translated:
+            # Refresh threshold scales with the scene: camera.speed is
+            # auto-scaled to extent/20, so 0.1*speed ≈ 0.5% of the scene
+            # extent. Without this, the field_ops default of 1.0 world
+            # units never triggers on sub-unit scenes (e.g. gizmo test
+            # boxes with BoxSize~0.15).
             if is_los_stale(
                 _state["_render_mode_name"],
                 _state["_wa_data_field"],
@@ -917,6 +925,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
                 _state["_vector_projection"],
                 _state.get("_los_camera_pos"),
                 camera.position,
+                pos_threshold=max(float(camera.speed) * 0.1, 1e-30),
             ):
                 app_proxy._apply_render_mode(auto_range=True)
                 dirty = True
