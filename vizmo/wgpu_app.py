@@ -107,6 +107,15 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
     # Renderer
     renderer = WGPURenderer(device, canvas_context, present_format)
     renderer._viewport_width = width  # use window size for LOD, not retina framebuffer size
+    # Scale the sink-marker world radius to scene extent so the marker
+    # disk is a small visible dot regardless of box size. The pre-cce3160
+    # fixed default (0.2 world units, implicitly calibrated for ~100 kpc
+    # galaxy boxes) swallows the whole screen on small-scale gizmo runs
+    # (10–100 pc cluster sims). camera.auto_scale set speed = extent/20,
+    # so extent = speed * 20; extent / 500 places the un-mass-scaled
+    # marker at roughly the same on-screen size at the auto-scaled
+    # starting viewpoint across all scales.
+    renderer.star_world_radius = float(camera.speed) * 20.0 / 500.0
     if getattr(data, "is_structured_grid", False):
         # Hsml from these readers is cbrt(cell_volume) — i.e. the cell's
         # half-side. Widening to 2× smooths across cell faces and hides
@@ -185,6 +194,22 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
         data.n_stars = 0
     if data.n_stars > 0:
         renderer.upload_stars(data.star_positions, data.star_masses, luminosity=getattr(data, "star_luminosity", None))
+        # Compensate for the sqrt(L) sizing in the star/marker shader.
+        # The size field's units are convention-dependent: yt clusters
+        # store L = R_phys² (length²), so sqrt(L)=R_phys feeds directly
+        # into r_world = world_radius * sqrt(L) and world_radius=1
+        # gives the physical sphere. Gizmo stores L = StarLuminosity_Solar
+        # (~1e4 for a 10 M☉ ZAMS star); without normalizing, sqrt(L)≈100
+        # multiplies the world_radius set above into a screen-filling
+        # blob. For the non-yt path, divide world_radius by sqrt(L_max)
+        # so the brightest star's marker is sized to the auto-scaled
+        # extent / 500 target instead of extent/5.
+        if not isinstance(data._file, _YtFile):
+            L_arr = renderer._star_luminosity
+            if L_arr is not None and len(L_arr):
+                L_max = float(np.max(L_arr))
+                if L_max > 1.0:
+                    renderer.star_world_radius /= L_max ** 0.5
         if data.n_particles > 0:
             renderer.set_extinction_gas(data.positions, data.masses, data.hsml)
         print(f"  {data.n_stars} star particles loaded")
