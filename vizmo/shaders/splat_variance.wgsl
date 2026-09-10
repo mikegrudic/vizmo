@@ -1,0 +1,144 @@
+// Variance-mode second splat pass. Identical particle / kernel logic
+// to splat_subsample.wgsl's fs_main, but the fragment samples a
+// per-pixel mean texture (computed from the first pass via
+// compute_mean.wgsl) and writes sigma * (qty - mean_pixel)^2 to sq —
+// so resolve can compute variance = sq/den directly with no
+// (mean_sq - mean^2) cancellation. The num/den outputs are zeroed so
+// additive blending with load_op=load leaves the first-pass num/den
+// untouched.
+
+struct SubsampleParams {
+    cam_pos: vec3<f32>,
+    _p0: f32,
+    cam_fwd: vec3<f32>,
+    _p1: f32,
+    cam_right: vec3<f32>,
+    _p2: f32,
+    cam_up: vec3<f32>,
+    _p3: f32,
+    cam_pos_lo: vec3<f32>,
+    _p4: f32,
+    fov_rad: f32,
+    aspect: f32,
+    stride: u32,
+    n_in_chunk: u32,
+    h_scale: f32,
+    mass_scale: f32,
+    level_index: u32,
+    n_levels: u32,
+    full_res_w: f32,
+    n_grid_kernel: f32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var<uniform> sub: SubsampleParams;
+
+@group(1) @binding(0) var<storage, read> s_pos: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read> s_hsml: array<f32>;
+@group(1) @binding(2) var<storage, read> s_mass: array<f32>;
+@group(1) @binding(3) var<storage, read> s_qty: array<f32>;
+@group(1) @binding(4) var<storage, read> s_index: array<u32>;
+@group(1) @binding(5) var<storage, read> s_bases: array<u32>;
+@group(1) @binding(6) var<storage, read> s_pos_lo: array<vec4<f32>>;
+
+@group(2) @binding(0) var t_mean: texture_2d<f32>;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) offset: vec2<f32>,
+    @location(1) mass: f32,
+    @location(2) hsml: f32,
+    @location(3) quantity: f32,
+};
+
+fn degenerate(corner: vec2<f32>) -> VertexOutput {
+    var out: VertexOutput;
+    out.position = vec4<f32>(0.0, 0.0, -2.0, 1.0);
+    out.offset = corner;
+    out.mass = 0.0;
+    out.hsml = 0.0;
+    out.quantity = 0.0;
+    return out;
+}
+
+@vertex
+fn vs_main(
+    @builtin(vertex_index) vi: u32,
+    @builtin(instance_index) ii: u32,
+) -> VertexOutput {
+    let corner = quad_corner(vi);
+
+    // Variance pass is always single-level (full res). Multigrid in the
+    // second pass would require per-level mean textures and the cascade
+    // upsample changes the effective sigma weighting in a way that
+    // breaks (q - mean_pixel)^2's relation to the per-pixel mean. The
+    // host dispatches every particle here regardless of which level the
+    // first pass routed them to, so each particle's true-hsml splat
+    // accumulates its variance contribution at the natural resolution.
+    if (ii >= sub.n_in_chunk) {
+        return degenerate(corner);
+    }
+    let local_idx = ii;
+
+    let pos_hi = s_pos[local_idx].xyz;
+    let pos_lo = s_pos_lo[local_idx].xyz;
+    let rel = (pos_hi - sub.cam_pos) + (pos_lo - sub.cam_pos_lo);
+    let hsml = s_hsml[local_idx] * sub.h_scale;
+
+    let depth = dot(rel, sub.cam_fwd);
+    let right_d = dot(rel, sub.cam_right);
+    let up_d = dot(rel, sub.cam_up);
+    let cell_extent = hsml;
+    let half_tan = tan(sub.fov_rad * 0.5);
+    let front_depth = max(depth + cell_extent, 0.0);
+    let lim_h = front_depth * half_tan * sub.aspect + cell_extent;
+    let lim_v = front_depth * half_tan + cell_extent;
+    let in_front = depth > -cell_extent;
+    if (!in_front || abs(right_d) >= lim_h || abs(up_d) >= lim_v) {
+        return degenerate(corner);
+    }
+
+    let mass = s_mass[local_idx] * sub.mass_scale;
+    let qty = s_qty[local_idx];
+
+    let view_center = camera.view_rot * vec4<f32>(rel, 1.0);
+    let clip_center = camera.proj * view_center;
+
+    var out: VertexOutput;
+    out.position = clip_center;
+    out.position.x += corner.x * hsml * camera.proj[0][0];
+    out.position.y += corner.y * hsml * camera.proj[1][1];
+    out.offset = corner;
+    out.mass = mass;
+    out.hsml = hsml;
+    out.quantity = qty;
+    return out;
+}
+
+struct FragmentOutput {
+    @location(0) numerator: vec4<f32>,
+    @location(1) denominator: vec4<f32>,
+    @location(2) sq: vec4<f32>,
+};
+
+@fragment
+fn fs_main(in: VertexOutput) -> FragmentOutput {
+    let r = length(in.offset);
+    if (r > 1.0) { discard; }
+
+    let w = eval_kernel(r, camera.kernel_id);
+    let sigma = in.mass * w / (in.hsml * in.hsml);
+
+    let mean = textureLoad(t_mean, vec2<i32>(in.position.xy), 0).r;
+    let dq = in.quantity - mean;
+
+    var out: FragmentOutput;
+    // Zero num/den contributions: additive blending with load_op=load
+    // preserves the first-pass values exactly.
+    out.numerator = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    out.denominator = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    out.sq = vec4<f32>(sigma * dq * dq, 0.0, 0.0, 0.0);
+    return out;
+}
