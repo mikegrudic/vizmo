@@ -557,6 +557,77 @@ class _FlashFile:
         pass
 
 
+def _athena_source_from_athinput(path):
+    """Recover the feedback point source of a classic Athena(-TIGRESS) run
+    from its athinput parameter file.
+
+    These runs never write particle data — the source star/cluster exists
+    only as ``<problem>`` block parameters (msp, x*sp, tsp) plus radiation
+    constants. Locate the run root (parent of the ``idN/`` rank dir for
+    MPI layouts), parse the newest ``athinput.*`` there, and synthesize a
+    single PartType5 particle. Returns a field dict or None.
+
+    Caveat: athinput files are often edited between restart legs, so tsp
+    can disagree with when the source actually ignited. Visibility is
+    therefore NOT gated on tsp vs snapshot time — a source marker in
+    pre-ignition snapshots is informative, a missing one is a lie.
+    """
+    d = os.path.dirname(os.path.abspath(path))
+    if re.fullmatch(r"id\d+", os.path.basename(d)):
+        d = os.path.dirname(d)
+    candidates = [f for f in glob.glob(os.path.join(d, "athinput.*")) if os.path.isfile(f)]
+    if not candidates:
+        return None
+    athinput = max(candidates, key=os.path.getmtime)
+
+    params = {}
+    section = ""
+    try:
+        with open(athinput, errors="replace") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                m = re.fullmatch(r"<(\w+)>", line)
+                if m:
+                    section = m.group(1).lower()
+                elif "=" in line:
+                    key, _, val = line.partition("=")
+                    params[(section, key.strip())] = val.strip()
+    except OSError:
+        return None
+
+    def _get(sec, key, default=None):
+        try:
+            return float(params[(sec, key)])
+        except (KeyError, ValueError):
+            return default
+
+    msp = _get("problem", "msp")
+    if msp is None or msp <= 0:
+        return None
+    if _get("problem", "tsp", -1.0) == 0.0:  # tsp=0 means "no creation"
+        return None
+
+    pos = [_get("problem", f"x{i}sp", 0.0) for i in (1, 2, 3)]
+    vel = [_get("problem", f"v{i}sp", 0.0) for i in (1, 2, 3)]
+
+    # Billboard sizing follows the PartType5 cluster convention:
+    # StarLuminosity = R_phys² with R = 10 pc · sqrt(M/1e4 Msun), so the
+    # sprite scales like a cluster of this mass. TIGRESS code_length is
+    # pc, so R is already in coordinate units.
+    R_phys = 10.0 * np.sqrt(msp / 1.0e4)
+
+    print(f"  [athena] source from {os.path.basename(athinput)}: "
+          f"M={msp:g} Msun at ({pos[0]:g},{pos[1]:g},{pos[2]:g})")
+    return {
+        "Coordinates": np.array([pos], dtype=np.float64),
+        "Velocities": np.array([vel], dtype=np.float32),
+        # Msun, not code mass — display-only; the source is not part of
+        # any gas budget and the vtk carries no unit system to convert.
+        "Masses": np.array([msp], dtype=np.float32),
+        "StarLuminosity": np.array([R_phys ** 2], dtype=np.float32),
+    }
+
+
 def _read_yt(path):
     """Last-resort reader: load *path* via yt and flatten into PartType groups.
 
@@ -800,6 +871,18 @@ def _read_yt(path):
         ptype_groups[f"PartType{slot}"] = pgrp
         ptype_labels[slot] = pt
         print(f"  yt: PartType{slot} ({pt}) — {len(pos):,} particles")
+
+    # --- Classic-Athena point source from run metadata -----------------
+    # Legacy Athena snapshots have no particle data; TIGRESS-style
+    # feedback runs describe their source only in the athinput file.
+    if type(ds).__name__ == "AthenaDataset" and 5 not in used:
+        src = _athena_source_from_athinput(path)
+        if src is not None:
+            ptype_groups["PartType5"] = src
+            ptype_labels[5] = "source"
+            # Lets the app pick source-appropriate rendering defaults
+            # (PSF sprite instead of the sink marker disk).
+            header_attrs["AthinputSource"] = 1
 
     if not ptype_groups:
         raise ValueError(

@@ -128,6 +128,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
         # cluster particles, so sqrt(L)·world_radius gives world_radius·R_phys.
         # Default the multiplier to 1 so the physical scaling shows as-is.
         renderer.star_world_radius = 1.0
+    if data.header.get("AthinputSource"):
+        # Metadata-synthesized feedback source: a glowing PSF sprite
+        # reads as "radiation source"; the marker disk reads as data.
+        renderer.sink_marker_mode = False
 
     # Colormap
     rgba = colormap_to_texture_data("magma")

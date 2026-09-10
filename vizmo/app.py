@@ -1,5 +1,6 @@
 """vizmo entry point."""
 
+import sys
 import argparse
 
 
@@ -29,6 +30,27 @@ def main():
 
     from .wgpu_app import run_wgpu_app
 
+    # Any wgpu object that survives to interpreter-shutdown GC gets
+    # native-released after atexit has run glfw.terminate(), which
+    # segfaults. Cycle-trapped objects (frame closures on success, the
+    # traceback's pinned frame on error) only become collectable once
+    # run_wgpu_app's frame is dead and the exception has been handled
+    # and dropped — so collect here, then exit manually on failure.
+    import gc
+    import traceback
+
+    exit_code = 0
+    try:
+        _run(args, run_wgpu_app)
+    except BaseException:
+        traceback.print_exc()
+        exit_code = 1
+    gc.collect()
+    if exit_code:
+        sys.exit(exit_code)
+
+
+def _run(args, run_wgpu_app):
     if args.profile:
         import cProfile
         import pstats
@@ -63,14 +85,6 @@ def main():
             screenshot=args.screenshot,
             no_stars=args.no_stars,
         )
-
-    # Collect closure-cycle-trapped wgpu objects now, while GLFW (and the
-    # window-system connection their native handles depend on) is still
-    # initialized. Leaving them to interpreter-shutdown GC segfaults, as
-    # atexit runs glfw.terminate() first.
-    import gc
-
-    gc.collect()
 
 
 if __name__ == "__main__":
