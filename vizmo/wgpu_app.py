@@ -1,5 +1,6 @@
 """wgpu backend application: GLFW window + WGPURenderer + UI overlays."""
 
+import gc
 import time
 import atexit
 import numpy as np
@@ -1265,7 +1266,23 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=Fa
         dirty = False
         ui_dirty = False
 
-    # Cleanup
+    # Cleanup. Release wgpu objects (surface included) while the window
+    # and display connection are still alive: any that survive into
+    # interpreter-shutdown GC get native-released after atexit has run
+    # glfw.terminate(), which segfaults. Objects trapped in closure
+    # cycles die only after this frame returns, so the caller must
+    # gc.collect() afterwards, before GLFW goes away.
     renderer.release()
     data.close()
+    if gpu_compute is not None:
+        try:
+            gpu_compute.release()
+        except Exception:
+            pass
+    try:
+        canvas_context.unconfigure()
+    except Exception:
+        pass
+    del renderer, gpu_compute, canvas_context, device, adapter
+    gc.collect()
     glfw.destroy_window(window)

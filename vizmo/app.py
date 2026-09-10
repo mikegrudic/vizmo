@@ -64,6 +64,14 @@ def main():
             no_stars=args.no_stars,
         )
 
+    # Collect closure-cycle-trapped wgpu objects now, while GLFW (and the
+    # window-system connection their native handles depend on) is still
+    # initialized. Leaving them to interpreter-shutdown GC segfaults, as
+    # atexit runs glfw.terminate() first.
+    import gc
+
+    gc.collect()
+
 
 if __name__ == "__main__":
     main()
