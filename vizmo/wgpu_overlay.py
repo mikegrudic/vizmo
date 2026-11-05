@@ -25,7 +25,7 @@ class WGPUPanelBackend:
         self._vbo = None
         self._sampler = device.create_sampler(mag_filter="linear", min_filter="linear")
 
-        shader = device.create_shader_module(code=(SHADER_DIR / "text.wgsl").read_text())
+        shader = device.create_shader_module(code=(SHADER_DIR / "text.wgsl").read_text(encoding="utf-8"))
         self._bgl = device.create_bind_group_layout(entries=[
             {"binding": 0, "visibility": wgpu.ShaderStage.FRAGMENT,
              "texture": {"sample_type": "float"}},

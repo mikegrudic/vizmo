@@ -54,11 +54,11 @@ class RenderMode:
         )
 
 
-_COMMON_WGSL = (SHADER_DIR / "common.wgsl").read_text()
+_COMMON_WGSL = (SHADER_DIR / "common.wgsl").read_text(encoding="utf-8")
 
 
 def _load_wgsl(name, include_common=False):
-    src = (SHADER_DIR / name).read_text()
+    src = (SHADER_DIR / name).read_text(encoding="utf-8")
     if include_common:
         src = _COMMON_WGSL + "\n" + src
     return src
